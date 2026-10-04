@@ -1,7 +1,9 @@
 #include "Extension/Console/commands.h"
 #include "Extension/Profile/local_profile_runtime.h"
 #include "ai_skaters.h"
+#include "effect_attach.h"
 #include <format>
+#include <string>
 namespace dingosdk::console {
 void register_movement_commands(Commands &registry) {
     using Debug = overlay::DebugAction;
@@ -163,6 +165,29 @@ void register_movement_commands(Commands &registry) {
         out(saved ? local_profile_controller_bindings().status : "error: Invalid binding or save failed.");
     };
     registry.add(std::move(up_bind));
+
+    // Prototype: spawn a native effect blueprint and keep it on the skater's head.
+    // The blueprint must already be loaded (wear a costume that uses it).
+    auto headfx = action("headfx",
+        "Attach a loaded native effect blueprint to the skater's head; 'headfx off' detaches",
+        Group::movement, {argument("blueprint", Type::text, true), argument("offset", Type::number, true)});
+    headfx.execution = Execution::local;
+    headfx.inspect = [](const Model &) {
+        return State{true, {}, {}, skater::effect_attach_status(), false};
+    };
+    headfx.run = [](const Model &, const Values &args, const Output &out) {
+        if (args.empty()) { out(skater::effect_attach_status()); return; }
+        const auto name = std::get<std::string>(args[0]);
+        if (lower(name) == "off") {
+            skater::request_effect_attach_off();
+            out("Detaching effect...");
+            return;
+        }
+        const float offset = args.size() > 1 ? static_cast<float>(std::get<double>(args[1])) : 0.0f;
+        skater::request_effect_attach(name, offset);
+        out("Attaching " + name + "... (the result appears in the log)");
+    };
+    registry.add(std::move(headfx));
 }
 void register_ai_commands(Commands &registry) {
     const auto ready = [](const Model &m) {
