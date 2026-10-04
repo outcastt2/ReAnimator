@@ -2,6 +2,7 @@
 #include "Extension/Profile/local_profile_runtime.h"
 #include "ai_skaters.h"
 #include "effect_attach.h"
+#include "custom_animation.h"
 #include <format>
 #include <string>
 namespace dingosdk::console {
@@ -196,6 +197,23 @@ void register_movement_commands(Commands &registry) {
         out(skater::asset_loaded_report(std::get<std::string>(args[0])));
     };
     registry.add(std::move(findasset));
+
+    // Route B: overwrite the local skater's pose with a baked custom animation.
+    auto poseanim = action("poseanim",
+        "Play a custom animation on the local skater: poseanim test, poseanim <file>.rska, poseanim off",
+        Group::movement, {argument("clip", Type::text, true)});
+    poseanim.execution = Execution::local;
+    poseanim.inspect = [](const Model &) {
+        return State{true, {}, {}, skater::pose_playback_status(), false};
+    };
+    poseanim.run = [](const Model &, const Values &args, const Output &out) {
+        if (args.empty()) { out(skater::pose_playback_status()); return; }
+        const auto clip = std::get<std::string>(args[0]);
+        if (lower(clip) == "off") { skater::request_pose_playback_stop(); out("Stopping custom animation..."); return; }
+        skater::request_pose_playback(clip);
+        out("Starting custom animation " + clip + "...");
+    };
+    registry.add(std::move(poseanim));
 }
 void register_ai_commands(Commands &registry) {
     const auto ready = [](const Model &m) {
