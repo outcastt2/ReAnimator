@@ -188,6 +188,14 @@ void register_movement_commands(Commands &registry) {
         out("Attaching " + name + "... (the result appears in the log)");
     };
     registry.add(std::move(headfx));
+
+    auto findasset = action("findasset", "Report whether a named asset is loaded (find_asset is find-only)",
+        Group::movement, {argument("name")});
+    findasset.execution = Execution::local;
+    findasset.run = [](const Model &, const Values &args, const Output &out) {
+        out(skater::asset_loaded_report(std::get<std::string>(args[0])));
+    };
+    registry.add(std::move(findasset));
 }
 void register_ai_commands(Commands &registry) {
     const auto ready = [](const Model &m) {

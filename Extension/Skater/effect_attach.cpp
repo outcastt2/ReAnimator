@@ -199,6 +199,24 @@ std::string effect_attach_status() {
     return attached().status;
 }
 
+std::string asset_loaded_report(std::string_view name) {
+    try {
+        const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+        std::uint32_t owners = 0, domains = 0;
+        for (std::uint16_t domain = 0; domain < 0xbbf; ++domain) {
+            std::uintptr_t owner{};
+            if (!memory::read_bytes(base + addr::engine::domain_owners + domain * 8ULL, &owner, 8)) continue;
+            ++domains;
+            if (owner) ++owners;
+        }
+        const auto asset = find_loaded(base, name);
+        return std::string(asset ? "Loaded: " : "Not loaded: ") + std::string(name) +
+               " (domains read " + std::to_string(domains) + ", with owners " + std::to_string(owners) + ")";
+    } catch (const std::exception &e) {
+        return std::string("findasset: ") + e.what();
+    }
+}
+
 void tick_effect_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
     try {
         if (!base || !client) return;

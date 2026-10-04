@@ -17,6 +17,8 @@ void request_effect_attach(std::string blueprint, float offset);
 void request_effect_attach_off();
 // Human-readable state for the console command and the log.
 std::string effect_attach_status();
+// Report whether a named asset is loaded, without spawning anything.
+std::string asset_loaded_report(std::string_view name);
 // Per-frame work, called on the client thread from the runtime tick.
 void tick_effect_attach(std::uintptr_t base, std::uintptr_t client) noexcept;
 
