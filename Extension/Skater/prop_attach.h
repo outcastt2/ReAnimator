@@ -46,6 +46,11 @@ void request_prop_pose(unsigned seconds);
 // of a graph parameter lives next to its asset reference, not in the asset.
 // `extra` is one more asset name to resolve, or empty.
 void request_prop_assets(std::string extra, unsigned seconds);
+// Write test: hold the three layer weights that go to 1.0 during a prop gesture
+// at 1.0 for `seconds`, then restore the original values. The stop call restores
+// immediately.
+void request_prop_poke(unsigned seconds);
+void request_prop_poke_stop();
 std::string prop_status();
 // Per-frame service on the client thread, beside the other skater ticks.
 void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept;

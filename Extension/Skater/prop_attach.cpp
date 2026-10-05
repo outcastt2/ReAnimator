@@ -78,6 +78,15 @@ struct State {
     bool assets_pending{};
     std::string assets_extra;
     unsigned assets_seconds{45};
+    bool poke_pending{};
+    bool poke_stop_pending{};
+    unsigned poke_seconds{12};
+    // A write test: three layer weights, saved and restored.
+    bool poking{};
+    ULONGLONG poke_until{};
+    std::array<Ptr, 3> poke_addresses{};
+    std::array<std::uint32_t, 3> poke_old{};
+    unsigned poke_overwrites{}, poke_rewrites{};
     std::vector<Region> regions;
     std::vector<Word> words;
     std::vector<std::pair<std::string, Ptr>> pending_regions;
@@ -322,6 +331,87 @@ Ptr find_named_asset(Ptr base, const char *name, bool &faulted) noexcept {
 // off against an idle phase.
 // One-off dump: the values we are hunting are small integers or floats, so show
 // both readings for every word.
+bool write_u32(Ptr address, std::uint32_t value) noexcept {
+    MEMORY_BASIC_INFORMATION region{};
+    if (!VirtualQuery(reinterpret_cast<void *>(address), &region, sizeof(region)) || region.State != MEM_COMMIT ||
+        (region.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
+        return false;
+    const auto protection = region.Protect & 0xff;
+    if (protection != PAGE_READWRITE && protection != PAGE_WRITECOPY && protection != PAGE_EXECUTE_READWRITE &&
+        protection != PAGE_EXECUTE_WRITECOPY)
+        return false;
+    __try {
+        std::memcpy(reinterpret_cast<void *>(address), &value, sizeof(value));
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// The write test. Three floats in the animation instance go to exactly 1.0 while
+// a gesture with a prop is pressed; if they are layer weights, holding them at
+// 1.0 should keep the phone out with no gesture. The old values are saved and
+// restored, and every attempt is logged.
+void arm_poke(Ptr base, Ptr client, unsigned seconds) {
+    auto &s = state();
+    Local local;
+    if (!resolve_local(base, client, local) || !local.rig) {
+        set_status("Hand props: the animation instance is not ready to poke.");
+        return;
+    }
+    static constexpr Ptr offsets[3] = {0x3d40, 0x3d68, 0x3d6c};
+    for (std::size_t i = 0; i < 3; ++i) {
+        const auto address = local.rig + offsets[i];
+        std::uint32_t value{};
+        if (!memory::peek_bytes(address, &value, sizeof(value))) {
+            set_status(std::format("Hand props: rig+{:#x} is not readable; nothing written.", offsets[i]));
+            return;
+        }
+        float as_float{};
+        std::memcpy(&as_float, &value, sizeof(as_float));
+        // A layer weight reads as a float in [0, 1]. Anything else means the
+        // instance layout moved, and writing blind is not worth the risk.
+        if (!std::isfinite(as_float) || as_float < -0.001f || as_float > 1.001f) {
+            set_status(std::format("Hand props: rig+{:#x} reads {:#010x} ({:.6g}), not a weight; nothing written.",
+                                   offsets[i], value, as_float));
+            logging::log(logging::Level::warning, logging::Channel::skater,
+                         "Hand props: poke refused: rig+{:#x} is {:#010x} ({:.6g}), not a weight.", offsets[i],
+                         value, as_float);
+            return;
+        }
+        s.poke_addresses[i] = address;
+        s.poke_old[i] = value;
+        logging::log(logging::Level::info, logging::Channel::skater,
+                     "Hand props: poke: rig+{:#x} is {:#010x} (float {:.6g})", offsets[i], value, as_float);
+    }
+    constexpr std::uint32_t one = 0x3f800000; // 1.0f
+    std::size_t written{};
+    for (std::size_t i = 0; i < 3; ++i)
+        if (write_u32(s.poke_addresses[i], one)) ++written;
+    s.poking = written != 0;
+    s.poke_until = GetTickCount64() + (seconds ? seconds : s.poke_seconds) * 1000ULL;
+    s.poke_overwrites = s.poke_rewrites = 0;
+    logging::log(logging::Level::info, logging::Channel::skater,
+                 "Hand props: poke: wrote 1.0 into {} of 3 layer weights; holding {}s. Watch the skater; "
+                 "'prop poke off' restores.",
+                 written, seconds ? seconds : s.poke_seconds);
+    set_status(std::format("Hand props: poked {} weight(s) to 1.0 for {}s.", written, seconds));
+}
+
+void stop_poke(bool restore) {
+    auto &s = state();
+    if (!s.poking) return;
+    if (restore)
+        for (std::size_t i = 0; i < 3; ++i)
+            if (s.poke_addresses[i]) (void)write_u32(s.poke_addresses[i], s.poke_old[i]);
+    logging::log(logging::Level::info, logging::Channel::skater,
+                 "Hand props: poke {}: {} graph overwrite(s), {} rewrite(s).", restore ? "restored" : "released",
+                 s.poke_overwrites, s.poke_rewrites);
+    set_status(std::format("Hand props: poke {}.", restore ? "restored" : "released"));
+    s.poking = false;
+    s.poke_overwrites = s.poke_rewrites = 0;
+}
+
 void dump_region(Ptr address, std::size_t bytes, const std::string &label) {
     for (std::size_t offset = 0; offset + 4 <= bytes; offset += 4) {
         std::uint32_t value{};
@@ -618,6 +708,19 @@ void request_prop_assets(std::string extra, unsigned seconds) {
     s.assets_seconds = seconds;
     s.assets_pending = true;
 }
+void request_prop_poke(unsigned seconds) {
+    auto &s = state();
+    std::lock_guard lock(s.mutex);
+    s.poke_seconds = seconds;
+    s.poke_pending = true;
+    s.poke_stop_pending = false;
+}
+void request_prop_poke_stop() {
+    auto &s = state();
+    std::lock_guard lock(s.mutex);
+    s.poke_stop_pending = true;
+    s.poke_pending = false;
+}
 std::string prop_status() {
     std::lock_guard lock(status_mutex());
     return state().status;
@@ -627,11 +730,12 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
     try {
         auto &s = state();
         std::string filter;
-        bool want_report{}, want_watch{}, want_weight{}, want_pose{}, want_assets{};
+        bool want_report{}, want_watch{}, want_weight{}, want_pose{}, want_assets{}, want_poke{}, want_poke_stop{};
         unsigned seconds{default_seconds};
         unsigned weight_seconds{};
         unsigned pose_seconds{};
         unsigned assets_seconds{};
+        unsigned poke_seconds{};
         std::string assets_extra;
         {
             std::lock_guard lock(s.mutex);
@@ -640,13 +744,39 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
             want_weight = s.weight_pending;
             want_pose = s.pose_pending;
             want_assets = s.assets_pending;
+            want_poke = s.poke_pending;
+            want_poke_stop = s.poke_stop_pending;
             filter = s.filter;
             seconds = s.watch_seconds;
             weight_seconds = s.weight_seconds;
             pose_seconds = s.pose_seconds;
             assets_seconds = s.assets_seconds;
+            poke_seconds = s.poke_seconds;
             assets_extra = s.assets_extra;
             s.report_pending = s.watch_pending = s.weight_pending = s.pose_pending = s.assets_pending = false;
+            s.poke_pending = s.poke_stop_pending = false;
+        }
+        if (want_poke_stop) stop_poke(true);
+        else if (want_poke) arm_poke(base, client, poke_seconds);
+        if (s.poking) {
+            // Hold the weights and count how often the graph puts them back.
+            Local local;
+            if (!resolve_local(base, client, local) || !local.rig) {
+                stop_poke(false);
+            } else {
+                constexpr std::uint32_t one = 0x3f800000;
+                for (const auto address : s.poke_addresses) {
+                    std::uint32_t value{};
+                    if (!address || !memory::peek_bytes(address, &value, sizeof(value)) || value == one) continue;
+                    ++s.poke_overwrites;
+                    if (s.poke_rewrites < 10)
+                        logging::log(logging::Level::info, logging::Channel::skater,
+                                     "Hand props: poke: the graph reset rig+{:#x} to {:#010x}; rewriting.",
+                                     address - local.rig, value);
+                    if (write_u32(address, one)) ++s.poke_rewrites;
+                }
+                if (GetTickCount64() >= s.poke_until) stop_poke(true);
+            }
         }
         if (want_report) report(base, filter);
         if (want_assets) arm_assets(base, client, assets_extra, assets_seconds);

@@ -281,8 +281,20 @@ void register_movement_commands(Commands &registry) {
                 "s; idle ~10s, then do the selfie (or hold the menu phone).");
             return;
         }
+        if (mode == "poke") {
+            if (text_at(1) == "off") {
+                skater::request_prop_poke_stop();
+                out("Hand props: releasing the poke and restoring the original weights.");
+                return;
+            }
+            const auto seconds = number_at(1, 12u);
+            skater::request_prop_poke(seconds);
+            out("Hand props: writing 1.0 into the three layer weights for " + std::to_string(seconds) +
+                "s, then restoring. Watch your skater; 'prop poke off' restores now.");
+            return;
+        }
         out("usage: prop | prop list [name] | prop watch [name] [seconds] | prop mark | prop weight [seconds] | "
-            "prop pose [seconds] | prop assets [asset] [seconds]");
+            "prop pose [seconds] | prop assets [asset] [seconds] | prop poke [seconds|off]");
     };
     registry.add(std::move(prop));
 
