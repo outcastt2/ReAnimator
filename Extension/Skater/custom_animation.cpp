@@ -149,20 +149,16 @@ void on_pose_evaluated(std::uintptr_t component) noexcept {
         };
         const auto elapsed_ms = GetTickCount64() - p.started;
         if (p.test.load(std::memory_order_relaxed)) {
-            // Rotate the head in its own space. Rotation is scale-invariant; a
-            // local translation here would be multiplied by the whole parent
-            // chain when it is composed to world, which flings the head away.
+            // Decisive check: scale the head, the exact operation first person
+            // uses to hide it. If the head visibly shrinks and grows, our write
+            // reaches the renderer and the earlier problem was rotation-specific
+            // (the head is likely driven by a look-at/aim constraint that
+            // overwrites its rotation but not its scale).
             std::array<float, 12> bone{};
             if (!readable(buffer + test_joint * 0x30ULL, bone.data(), sizeof(bone))) return;
             const float phase = static_cast<float>(elapsed_ms) * 0.003f;
-            const float angle = 1.0f * std::sin(phase);
-            const float half = angle * 0.5f, s = std::sin(half), c = std::cos(half);
-            const float qx = bone[4], qy = bone[5], qz = bone[6], qw = bone[7];
-            // q_new = q_old * q_delta, with q_delta a rotation about local +X (up).
-            bone[4] = qw * s + qx * c;
-            bone[5] = qy * c + qz * s;
-            bone[6] = qz * c - qy * s;
-            bone[7] = qw * c - qx * s;
+            const float scale = 0.5f + 0.45f * std::sin(phase);
+            bone[0] = bone[1] = bone[2] = scale;
             (void)nsd::write(buffer + test_joint * 0x30ULL, bone.data(), sizeof(bone));
             note_write();
             return;
