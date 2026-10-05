@@ -171,6 +171,7 @@ add_library(dingosdk_runtime SHARED
     Extension/World/local_atmosphere_controls.cpp
     Extension/Rendering/local_graphics_controls.cpp
     Extension/Objects/local_placements_runtime.cpp
+    Extension/Objects/prop_hand_runtime.cpp
     Extension/Progression/local_progression_runtime.cpp
     Extension/Progression/entitlement_request_hook.cpp
     Extension/Progression/entitlement_request_parse.cpp

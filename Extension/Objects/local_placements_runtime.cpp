@@ -6,6 +6,7 @@
 #include "local_placements_runtime.h"
 #include "Extension/Objects/ParkEditor/park_editor_runtime.h"
 #include "network_object_runtime.h"
+#include "prop_hand_runtime.h"
 #include "Extension/Profile/runtime_internal.h"
 #include "Extension/World/local_world_layers.h"
 #include <algorithm>
@@ -441,6 +442,9 @@ void update_placement_creates() {
 void update_placement_poses() {
     auto& r = placements_runtime();
     if (!placement_session_ready()) return;
+    // Hand-prop follow: the skater tick writes a wrist target; this is the one
+    // place where object transforms are allowed to move, under native_mutex.
+    service_prop_hand();
     update_placement_creates();
     update_park_editor_moves();
     update_network_object_moves();

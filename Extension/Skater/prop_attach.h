@@ -60,6 +60,12 @@ void request_prop_trace_off();
 // mesh blueprint is resident, and report whether it derives the entity
 // factory's Blueprint type. Nothing is created or written.
 void request_prop_derive(unsigned seconds);
+// Hand-prop follow: take the most recently placed object whose item key
+// contains `name` (empty matches any) and hold it at the wrist. `left` picks
+// j049, otherwise j278. The object is moved by the park tick and returns to
+// where it was placed on detach.
+void request_prop_hand_attach(std::string name, bool left);
+void request_prop_hand_detach();
 std::string prop_status();
 // Per-frame service on the client thread, beside the other skater ticks.
 void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept;

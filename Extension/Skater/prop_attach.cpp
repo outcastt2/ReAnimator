@@ -1,6 +1,7 @@
 #include "prop_attach.h"
 #include "Gestures/board_gesture_layout.h"
 #include "Extension/Multiplayer/Remote/native_pose_layout.h"
+#include "Extension/Objects/prop_hand_runtime.h"
 #include "Engine/Core/Hooks/hooks.h"
 #include "Engine/Core/Log/logging.h"
 #include "Engine/Core/Platform/memory.h"
@@ -106,6 +107,16 @@ struct State {
     bool deriving{};
     ULONGLONG derive_until{}, derive_next{};
     bool derive_seen{};
+    // Hand-prop follow: take a placed object and hold it at the wrist. The
+    // request goes to the Objects runtime; here we only compose the wrist and
+    // feed it the target every client tick.
+    bool hand_attach_pending{}, hand_detach_pending{};
+    std::string hand_name;
+    bool hand_left{};
+    bool hand_feeding{};
+    std::uint16_t hand_joint{278};   // right wrist j278; j049 is the left
+    std::uintptr_t hand_definition{};
+    std::vector<std::uint16_t> hand_chain;
     std::vector<Region> regions;
     std::vector<Word> words;
     std::vector<std::pair<std::string, Ptr>> pending_regions;
@@ -617,6 +628,121 @@ void service_derive(Ptr base) {
     }
 }
 
+// Hand-prop follow, skater half: compose the wrist's world transform from the
+// output pose buffer every client tick and hand it to the Objects runtime,
+// which moves the placed object on the park tick. The composition matches
+// effect_attach.cpp's head_joint walk exactly -- same buffer, same math -- so a
+// custom animation drives the prop the same way it drives the skater.
+struct WorldJoint {
+    std::array<float, 4> rotation{0, 0, 0, 1};
+    std::array<float, 3> position{};
+    float scale{1};
+};
+std::array<float, 3> rotate_q(const std::array<float, 4> &q, const std::array<float, 3> &v) {
+    const float tx = 2 * (q[1] * v[2] - q[2] * v[1]), ty = 2 * (q[2] * v[0] - q[0] * v[2]),
+                tz = 2 * (q[0] * v[1] - q[1] * v[0]);
+    return {v[0] + q[3] * tx + (q[1] * tz - q[2] * ty), v[1] + q[3] * ty + (q[2] * tx - q[0] * tz),
+            v[2] + q[3] * tz + (q[0] * ty - q[1] * tx)};
+}
+std::array<float, 4> mul_q(const std::array<float, 4> &q, const float b[4]) {
+    return {q[3] * b[0] + q[0] * b[3] + q[1] * b[2] - q[2] * b[1],
+            q[3] * b[1] - q[0] * b[2] + q[1] * b[3] + q[2] * b[0],
+            q[3] * b[2] + q[0] * b[1] - q[1] * b[0] + q[2] * b[3],
+            q[3] * b[3] - q[0] * b[0] - q[1] * b[1] - q[2] * b[2]};
+}
+// Folds one joint's local transform (scale.xyz, quat.xyzw, pos.xyz) onto the
+// running world joint. False on an unreadable or not-yet-evaluated joint.
+bool compose_child(WorldJoint &joint, Ptr buffer, std::uint16_t index) noexcept {
+    std::array<float, 12> bone{};
+    if (!memory::peek_bytes(buffer + static_cast<Ptr>(index) * 0x30, bone.data(), sizeof(bone))) return false;
+    for (const std::size_t i : {0u, 1u, 2u, 4u, 5u, 6u, 7u, 8u, 9u, 10u})
+        if (!std::isfinite(bone[i])) return false;
+    const auto offset = rotate_q(joint.rotation,
+                                 {bone[8] * joint.scale, bone[9] * joint.scale, bone[10] * joint.scale});
+    for (std::size_t i = 0; i < 3; ++i) joint.position[i] += offset[i];
+    const float local[4] = {bone[4], bone[5], bone[6], bone[7]};
+    joint.rotation = mul_q(joint.rotation, local);
+    joint.scale *= (bone[0] + bone[1] + bone[2]) / 3.0f;
+    return true;
+}
+// Where the prop sits in the wrist's frame. Zero puts the object's origin at
+// the wrist joint; tuned in game once the first screenshots arrive.
+constexpr std::array<float, 3> hand_grip_offset{0.0f, 0.0f, 0.0f};
+constexpr std::array<float, 4> hand_grip_rotation{0.0f, 0.0f, 0.0f, 1.0f};
+
+// The skeleton resource's parent table, walked from the wrist to the root. The
+// pose buffer stores parent-relative transforms, so the chain is what turns the
+// wrist's local transform into a world one.
+bool build_hand_chain(Ptr definition, std::uint16_t joint, std::vector<std::uint16_t> &chain,
+                      std::string &error) {
+    Ptr resource{};
+    if (!definition || !memory::peek(definition + 0x1a0, resource) || !resource) {
+        error = "the skeleton resource is unavailable";
+        return false;
+    }
+    std::uint32_t count{};
+    if (!memory::peek(resource + 0xc, count) || count <= joint || count > 1024) {
+        error = "the skeleton joint count is unavailable";
+        return false;
+    }
+    std::vector<std::uint16_t> up;
+    std::uint32_t index = joint;
+    for (int hop = 0; hop < 64; ++hop) {
+        up.push_back(static_cast<std::uint16_t>(index));
+        if (index == 0) break;
+        std::int32_t parent{};
+        if (!memory::peek(resource + 0x40 + static_cast<Ptr>(index) * 4, parent)) {
+            error = "the skeleton parents are unreadable";
+            return false;
+        }
+        // Parents are strictly lower indices; anything else is a cycle or a
+        // layout this build does not use.
+        if (parent < 0 || static_cast<std::uint32_t>(parent) >= count ||
+            static_cast<std::uint32_t>(parent) >= index) {
+            error = "the skeleton parent chain is invalid";
+            return false;
+        }
+        index = static_cast<std::uint32_t>(parent);
+    }
+    if (up.empty() || up.back() != 0) {
+        error = "the skeleton parent chain has no root";
+        return false;
+    }
+    std::reverse(up.begin(), up.end());
+    chain = std::move(up);
+    return true;
+}
+
+void feed_hand_target(Ptr base, Ptr client) {
+    auto &s = state();
+    Local local;
+    if (!resolve_local(base, client, local) || !local.holder || !local.definition) return;
+    if (s.hand_definition != local.definition || s.hand_chain.size() < 2) {
+        std::string error;
+        if (!build_hand_chain(local.definition, s.hand_joint, s.hand_chain, error)) {
+            static std::string last;
+            if (error != last) {
+                last = error;
+                logging::log(logging::Level::warning, logging::Channel::skater,
+                             "Hand props: cannot follow the wrist: {}.", error);
+            }
+            return;
+        }
+        s.hand_definition = local.definition;
+    }
+    const auto reader = [](Ptr address, void *out, std::size_t size) { return memory::read_bytes(address, out, size); };
+    const auto pose = multiplayer::read_native_pose_layout(reader, base, local.holder, 512);
+    if (!pose.buffer || pose.count <= s.hand_joint) return;
+    WorldJoint joint;
+    for (const auto index : s.hand_chain)
+        if (!compose_child(joint, pose.buffer, index)) return;
+    const auto offset = rotate_q(joint.rotation, hand_grip_offset);
+    const std::array<float, 3> position{joint.position[0] + offset[0], joint.position[1] + offset[1],
+                                        joint.position[2] + offset[2]};
+    const auto rotation = mul_q(joint.rotation, hand_grip_rotation.data());
+    profile_runtime::set_prop_hand_target(position, rotation);
+}
+
 bool write_u32(Ptr address, std::uint32_t value) noexcept {
     MEMORY_BASIC_INFORMATION region{};
     if (!VirtualQuery(reinterpret_cast<void *>(address), &region, sizeof(region)) || region.State != MEM_COMMIT ||
@@ -1030,9 +1156,29 @@ void request_prop_derive(unsigned seconds) {
     s.derive_seconds = seconds;
     s.derive_pending = true;
 }
+void request_prop_hand_attach(std::string name, bool left) {
+    auto &s = state();
+    std::lock_guard lock(s.mutex);
+    s.hand_name = std::move(name);
+    s.hand_left = left;
+    s.hand_attach_pending = true;
+    s.hand_detach_pending = false;
+}
+void request_prop_hand_detach() {
+    auto &s = state();
+    std::lock_guard lock(s.mutex);
+    s.hand_detach_pending = true;
+    s.hand_attach_pending = false;
+}
 std::string prop_status() {
-    std::lock_guard lock(status_mutex());
-    return state().status;
+    std::string text;
+    {
+        std::lock_guard lock(status_mutex());
+        text = state().status;
+    }
+    // The hand follow lives in the objects runtime; show its state beside ours.
+    if (const auto hand = profile_runtime::prop_hand_status(); !hand.empty()) text += "  [hand: " + hand + "]";
+    return text;
 }
 
 void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
@@ -1040,7 +1186,7 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
         auto &s = state();
         std::string filter;
         bool want_report{}, want_watch{}, want_weight{}, want_pose{}, want_assets{}, want_poke{}, want_poke_stop{};
-        bool want_trace{}, want_trace_off{}, want_derive{};
+        bool want_trace{}, want_trace_off{}, want_derive{}, want_hand_attach{}, want_hand_detach{};
         unsigned seconds{default_seconds};
         unsigned weight_seconds{};
         unsigned pose_seconds{};
@@ -1049,6 +1195,8 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
         unsigned trace_seconds{};
         unsigned derive_seconds{};
         std::string assets_extra;
+        std::string hand_name;
+        bool hand_left{};
         {
             std::lock_guard lock(s.mutex);
             want_report = s.report_pending;
@@ -1061,6 +1209,8 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
             want_trace = s.trace_pending;
             want_trace_off = s.trace_off_pending;
             want_derive = s.derive_pending;
+            want_hand_attach = s.hand_attach_pending;
+            want_hand_detach = s.hand_detach_pending;
             filter = s.filter;
             seconds = s.watch_seconds;
             weight_seconds = s.weight_seconds;
@@ -1070,9 +1220,12 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
             trace_seconds = s.trace_seconds;
             derive_seconds = s.derive_seconds;
             assets_extra = s.assets_extra;
+            hand_name = s.hand_name;
+            hand_left = s.hand_left;
             s.report_pending = s.watch_pending = s.weight_pending = s.pose_pending = s.assets_pending = false;
             s.poke_pending = s.poke_stop_pending = false;
             s.trace_pending = s.trace_off_pending = s.derive_pending = false;
+            s.hand_attach_pending = s.hand_detach_pending = false;
         }
         if (want_poke_stop) stop_poke(true);
         else if (want_poke) arm_poke(base, client, poke_seconds);
@@ -1101,6 +1254,28 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
         if (want_trace_off) disarm_trace();
         else if (want_trace) arm_trace(base, trace_seconds);
         if (want_derive) arm_derive(derive_seconds);
+        if (want_hand_detach) {
+            profile_runtime::request_prop_hand_release();
+            s.hand_feeding = false;
+            s.hand_chain.clear();
+            s.hand_definition = 0;
+            set_status("Hand props: releasing the held prop; it returns to where it was placed.");
+        } else if (want_hand_attach) {
+            s.hand_joint = hand_left ? 49 : 278; // j049 = left wrist, j278 = right
+            s.hand_definition = 0;
+            s.hand_chain.clear();
+            s.hand_feeding = true;
+            profile_runtime::request_prop_hand(hand_name);
+            logging::log(logging::Level::info, logging::Channel::skater,
+                         "Hand props: hand follow requested ({} wrist{}).", hand_left ? "left" : "right",
+                         hand_name.empty() ? "" : ", matching \"" + hand_name + "\"");
+            set_status(std::format("Hand props: taking a placed object{} into the {} hand.",
+                                   hand_name.empty() ? "" : " matching \"" + hand_name + "\"",
+                                   hand_left ? "left" : "right"));
+        }
+        // The wrist target is refreshed every client tick while following; the
+        // Objects runtime applies it on the park tick.
+        if (s.hand_feeding) feed_hand_target(base, client);
         // These run every tick: they are inert when idle and must keep working
         // while no watch is armed.
         service_derive(base);

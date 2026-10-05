@@ -219,7 +219,7 @@ void register_movement_commands(Commands &registry) {
     auto prop = action("prop",
         "Hand props: prop | prop list [name] | prop watch [name] [seconds] | prop trace [seconds] - gesture props and their creation",
         Group::movement, {argument("mode", Type::text, true), argument("name", Type::text, true),
-                          argument("seconds", Type::number, true)});
+                          argument("seconds|side", Type::text, true)});
     prop.execution = Execution::local;
     prop.inspect = [](const Model &) { return State{true, {}, {}, skater::prop_status(), false}; };
     prop.run = [](const Model &, const Values &args, const Output &out) {
@@ -313,9 +313,24 @@ void register_movement_commands(Commands &registry) {
                 "s. Close the console and bring the phone out; the derive check is read-only.");
             return;
         }
+        if (mode == "hand") {
+            if (text_at(1) == "off") {
+                skater::request_prop_hand_detach();
+                out("Hand props: releasing the held prop; it goes back to where it was placed.");
+                return;
+            }
+            const auto item = text_at(1);
+            const auto side = text_at(2);
+            skater::request_prop_hand_attach(item, side == "left");
+            out("Hand props: taking the last placed object" +
+                (item.empty() ? std::string{} : " matching \"" + item + "\"") +
+                (side == "left" ? " into the left hand." : " into the right hand.") +
+                " It follows the wrist until 'prop hand off'.");
+            return;
+        }
         out("usage: prop | prop list [name] | prop watch [name] [seconds] | prop mark | prop weight [seconds] | "
             "prop pose [seconds] | prop assets [asset] [seconds] | prop poke [seconds|off] | prop trace [seconds|off] | "
-            "prop derive [seconds]");
+            "prop derive [seconds] | prop hand [name] [left|off]");
     };
     registry.add(std::move(prop));
 
