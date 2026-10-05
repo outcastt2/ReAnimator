@@ -16,4 +16,11 @@ void clear_no_bail() noexcept;
 void update_board_lock(std::uintptr_t client, std::uintptr_t entity, bool locked) noexcept;
 // Stopping flight must not discard the independent manual preference.
 void clear_no_bail_flight() noexcept;
-}
+// Called after the native post-physics skeleton response has run for a rig.
+// The response applies the engine's constraints to the pose, so a pose written
+// in the animation callback is rewritten; this is the point after which a write
+// survives to the renderer. Runs on the physics thread, in the animation update
+// order. Set once; a null listener removes it.
+using SkeletonResponded = void (*)(std::uintptr_t rig) noexcept;
+void set_skeleton_responded_listener(SkeletonResponded listener) noexcept;
+} // namespace dingosdk

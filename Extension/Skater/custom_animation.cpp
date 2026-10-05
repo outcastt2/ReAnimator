@@ -2,6 +2,7 @@
 #include "Extension/Multiplayer/Remote/native_skater_internal.h"
 #include "Extension/Multiplayer/Remote/native_pose_layout.h"
 #include "Extension/Multiplayer/Remote/native_skater.h"
+#include "Extension/Skater/no_bail.h"
 #include "Engine/Core/Platform/memory.h"
 #include "Engine/Core/Log/logging.h"
 #include "Engine/Game/Build/addresses.h"
@@ -114,6 +115,16 @@ PoseLocation pose_location(std::uintptr_t base, std::uintptr_t component) {
     return {pose.buffer, pose.count};
 }
 
+// The animation rig behind a component, which is what the post-physics
+// skeleton response is handed.
+std::uintptr_t rig_for(std::uintptr_t component) {
+    std::uintptr_t holder{};
+    if (!component || !readable(component + 0xa0, &holder, 8) || !holder) return 0;
+    std::uintptr_t rig{};
+    if (!readable(holder + 0x78, &rig, 8)) return 0;
+    return rig;
+}
+
 // The local skater's animation component, or 0.
 std::uintptr_t local_component(std::uintptr_t base, std::uintptr_t client) {
     try {
@@ -158,6 +169,59 @@ void pack_frame(std::uintptr_t buffer, std::uint32_t joints, float *out) noexcep
 }
 } // namespace
 
+// Writes the current frame of whatever is playing. Shared by the animation
+// callback (which the engine's own constraints later rewrite) and the
+// post-physics skeleton response, after which the write survives.
+namespace {
+void write_current(Playback &p, std::uintptr_t buffer) noexcept {
+    if (!p.playing.load(std::memory_order_acquire) || !buffer) return;
+    const auto note_write = [&p] {
+        const auto count = p.writes.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count == 1 || count == 10 || count == 100 || count == 1000 || count == 10000)
+            logging::log(logging::Level::info, logging::Channel::skater,
+                         "Custom animation: pose written ({} times).", count);
+    };
+    const auto elapsed_ms = GetTickCount64() - p.started;
+    if (p.test.load(std::memory_order_relaxed)) {
+        const float phase = static_cast<float>(elapsed_ms) * 0.003f;
+        // Head scale: the operation first person uses to hide the head.
+        std::array<float, 12> head{};
+        if (readable(buffer + test_joint * 0x30ULL, head.data(), sizeof(head))) {
+            const float scale = 0.5f + 0.45f * std::sin(phase);
+            head[0] = head[1] = head[2] = scale;
+            (void)nsd::write(buffer + test_joint * 0x30ULL, head.data(), sizeof(head));
+        }
+        // A rotation on a body joint, to show whether rotations survive.
+        std::array<float, 12> spine{};
+        if (readable(buffer + test_spine_joint * 0x30ULL, spine.data(), sizeof(spine))) {
+            const float angle = 1.0f * std::sin(phase);
+            const float half = angle * 0.5f, s = std::sin(half), c = std::cos(half);
+            const float qx = spine[4], qy = spine[5], qz = spine[6], qw = spine[7];
+            spine[4] = qw * s + qx * c;
+            spine[5] = qy * c + qz * s;
+            spine[6] = qz * c - qy * s;
+            spine[7] = qw * c - qx * s;
+            (void)nsd::write(buffer + test_spine_joint * 0x30ULL, spine.data(), sizeof(spine));
+        }
+        note_write();
+        return;
+    }
+    std::lock_guard lock(p.mutex);
+    if (p.clip.frames == 0 || p.clip.data.empty() || p.clip.joints <= 2) return;
+    const auto frame = static_cast<std::uint32_t>(
+        (static_cast<double>(elapsed_ms) * p.clip.fps / 1000.0)) % p.clip.frames;
+    // Joints 0 and 1 are not pose: joint 1 carries the skater's world
+    // placement, and the game drives it from the board and physics. Leaving it
+    // alone is what keeps the skater on the board, the way a gesture animates
+    // in place while the player keeps moving.
+    write_frame(buffer + 2 * 0x30ULL,
+                p.clip.data.data() + static_cast<std::size_t>(frame) * p.clip.joints * floats_per_joint +
+                    2 * floats_per_joint,
+                p.clip.joints - 2);
+    note_write();
+}
+} // namespace
+
 void on_pose_evaluated(std::uintptr_t component) noexcept {
     try {
         auto &p = playback();
@@ -176,57 +240,21 @@ void on_pose_evaluated(std::uintptr_t component) noexcept {
         }
         if (!p.playing.load(std::memory_order_acquire)) return;
         const auto pose = pose_location(p.base, component);
-        const auto buffer = pose.buffer;
-        if (!buffer) return;
-        // Confirm once per playback that the write is actually happening.
-        const auto note_write = [&p] {
-            const auto count = p.writes.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (count == 1 || count == 10 || count == 100 || count == 1000 || count == 10000)
-                logging::log(logging::Level::info, logging::Channel::skater,
-                             "Custom animation: pose written ({} times).", count);
-        };
-        const auto elapsed_ms = GetTickCount64() - p.started;
-        if (p.test.load(std::memory_order_relaxed)) {
-            const float phase = static_cast<float>(elapsed_ms) * 0.003f;
-            // 1) Head scale: the operation first person uses to hide the head,
-            //    already proven to reach the renderer.
-            std::array<float, 12> head{};
-            if (readable(buffer + test_joint * 0x30ULL, head.data(), sizeof(head))) {
-                const float scale = 0.5f + 0.45f * std::sin(phase);
-                head[0] = head[1] = head[2] = scale;
-                (void)nsd::write(buffer + test_joint * 0x30ULL, head.data(), sizeof(head));
-            }
-            // 2) A rotation on a body joint. If the body twists, rotations land
-            //    for everything but the head; if it does not, the engine's
-            //    post-physics skeleton response is rewriting the whole pose's
-            //    rotations after this write.
-            std::array<float, 12> spine{};
-            if (readable(buffer + test_spine_joint * 0x30ULL, spine.data(), sizeof(spine))) {
-                const float angle = 1.0f * std::sin(phase);
-                const float half = angle * 0.5f, s = std::sin(half), c = std::cos(half);
-                const float qx = spine[4], qy = spine[5], qz = spine[6], qw = spine[7];
-                spine[4] = qw * s + qx * c;
-                spine[5] = qy * c + qz * s;
-                spine[6] = qz * c - qy * s;
-                spine[7] = qw * c - qx * s;
-                (void)nsd::write(buffer + test_spine_joint * 0x30ULL, spine.data(), sizeof(spine));
-            }
-            note_write();
-            return;
-        }
-        std::lock_guard lock(p.mutex);
-        if (p.clip.frames == 0 || p.clip.data.empty() || p.clip.joints <= 2) return;
-        const auto frame = static_cast<std::uint32_t>(
-            (static_cast<double>(elapsed_ms) * p.clip.fps / 1000.0)) % p.clip.frames;
-        // Joints 0 and 1 are not pose: joint 1 carries the skater's world
-        // placement, and the game drives it from the board and physics. Leaving
-        // it alone is what keeps the skater on the board, the way a gesture
-        // animates in place while the player keeps moving.
-        write_frame(buffer + 2 * 0x30ULL,
-                    p.clip.data.data() + static_cast<std::size_t>(frame) * p.clip.joints * floats_per_joint +
-                        2 * floats_per_joint,
-                    p.clip.joints - 2);
-        note_write();
+        write_current(p, pose.buffer);
+    } catch (...) {
+    }
+}
+
+// Runs after the engine's own post-physics constraints, on the same update
+// order. This is the write that survives to the renderer.
+void on_skeleton_responded(std::uintptr_t rig) noexcept {
+    try {
+        auto &p = playback();
+        if (!p.playing.load(std::memory_order_acquire) || !rig) return;
+        const auto component = p.component.load(std::memory_order_acquire);
+        if (rig_for(component) != rig) return;
+        const auto pose = pose_location(p.base, component);
+        write_current(p, pose.buffer);
     } catch (...) {
     }
 }
@@ -253,6 +281,11 @@ std::string pose_playback_status() {
 void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
     try {
         auto &p = playback();
+        // The post-physics skeleton response is where a pose write survives;
+        // No Bail installs that hook at startup on the supported build.
+        static std::atomic<bool> armed{};
+        if (!armed.exchange(true, std::memory_order_acq_rel))
+            dingosdk::set_skeleton_responded_listener(&on_skeleton_responded);
         std::string pending_clip;
         bool pending{}, stop{}, pending_test{};
         {
@@ -319,6 +352,13 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
             set_status("Custom animation: the local skater's animation component is unavailable.");
             return;
         }
+        // The write that survives is the one after the engine's post-physics
+        // response. That hook belongs to No Bail, which installs it at startup;
+        // if it is missing, say so rather than playing invisibly.
+        if (!dingosdk::no_bail_available())
+            logging::log(logging::Level::warning, logging::Channel::skater,
+                         "Custom animation: the post-physics skeleton hook is not installed, so the engine "
+                         "will overwrite the pose. The clipped animation will not be visible.");
         if (pending_clip == "record") {
             std::string detail;
             if (!multiplayer::install_entity_hooks(base, detail)) {

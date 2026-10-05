@@ -191,11 +191,17 @@ std::uint32_t choose_state(std::uintptr_t selector, std::uint32_t current) {
     LastError error;
     return filtered && next == wipeout_physics_state && protected_owner(selector, &Owner::selector) ? current : next;
 }
+// Set once by a consumer that needs to write a pose after the engine's own
+// constraints; read on every skeleton response.
+std::atomic<SkeletonResponded> skeleton_responded_listener{};
 void skeleton_response(std::uintptr_t rig, float seconds, bool wipeout) {
     // The state post-update can raise another request after the selector ran.
     // Filter at this consumer, then let native constraints and recovery run.
     if (filter_requests(rig, &Owner::rig)) wipeout = false;
     protection().skeleton_original(rig, seconds, wipeout);
+    // After the engine's own constraints, so a pose written here is last.
+    if (const auto listener = skeleton_responded_listener.load(std::memory_order_acquire))
+        listener(rig);
 }
 bool clear_contact_output(std::uintptr_t contacts) noexcept {
     if (contacts < 0x10000 || contacts > highest - body_contact_output_offset) return false;
@@ -377,5 +383,8 @@ void clear_no_bail_flight() noexcept {
     AcquireSRWLockExclusive(&p.lock);
     p.lease.flight_until = 0;
     ReleaseSRWLockExclusive(&p.lock);
+}
+void set_skeleton_responded_listener(SkeletonResponded listener) noexcept {
+    skeleton_responded_listener.store(listener, std::memory_order_release);
 }
 }
