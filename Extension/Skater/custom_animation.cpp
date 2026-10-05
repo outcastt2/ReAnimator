@@ -258,15 +258,15 @@ void pack_frame(std::uintptr_t buffer, std::uint32_t joints, float *out) noexcep
 // callback (which the engine's own constraints later rewrite) and the
 // post-physics skeleton response, after which the write survives.
 namespace {
-// A joint's position relative to another, in the pose's own space. Used to put
-// the kept legs in the log: a normal ride holds the ankles about 0.86 m below
-// joint 1, so one line says whether the pose being kept is a real stance.
-bool pose_offset(std::uintptr_t buffer, std::uint32_t joint, std::uint32_t reference, float out[3]) noexcept {
-    float a[3]{}, b[3]{};
-    if (!buffer) return false;
-    if (!readable(buffer + joint * layers::pose_stride + 0x20, a, sizeof(a))) return false;
-    if (!readable(buffer + reference * layers::pose_stride + 0x20, b, sizeof(b))) return false;
-    for (int c = 0; c < 3; ++c) out[c] = a[c] - b[c];
+// A joint's world position relative to joint 1, composed the way the engine
+// composes a pose. A normal ride holds the ankles about 0.86 m below joint 1, so
+// one log line says whether the pose being kept is a real stance.
+bool pose_offset(std::uintptr_t buffer, const std::uint32_t *chain, std::size_t count, float out[3]) noexcept {
+    float origin[3]{}, world[3]{};
+    const std::uint32_t root[] = {1};
+    if (!layers::world_position(buffer, root, 1, origin)) return false;
+    if (!layers::world_position(buffer, chain, count, world)) return false;
+    for (int c = 0; c < 3; ++c) out[c] = world[c] - origin[c];
     return true;
 }
 
@@ -312,17 +312,20 @@ void sample_motion(Playback &p, const PoseLocation &pose, std::uintptr_t compone
     // see what the layer decided and where the legs it kept actually are.
     if (now >= p.summary_at + 2000 && pose.buffer) {
         p.summary_at = now;
+        const std::uint32_t pelvis_chain[] = {1, 7};
+        const std::uint32_t left_chain[] = {1, 7, 8, 9, 10};
+        const std::uint32_t right_chain[] = {1, 7, 341, 342, 343};
         float pelvis[3]{}, left[3]{}, right[3]{};
-        const bool has_pelvis = pose_offset(pose.buffer, 7, 1, pelvis);
-        const bool has_left = pose_offset(pose.buffer, 10, 1, left);
-        const bool has_right = pose_offset(pose.buffer, 343, 1, right);
+        const bool has_pelvis = pose_offset(pose.buffer, pelvis_chain, 2, pelvis);
+        const bool has_left = pose_offset(pose.buffer, left_chain, 5, left);
+        const bool has_right = pose_offset(pose.buffer, right_chain, 5, right);
         logging::log(logging::Level::info, logging::Channel::skater,
                      "Custom animation: layer: state={} on_board={} moving={} speed={:.2f} m/s mask={:.2f} "
-                     "pelvis_yz=({:.3f},{:.3f}) ankles_yz=({:.3f},{:.3f})/({:.3f},{:.3f})",
+                     "pelvis=({:.3f},{:.3f},{:.3f}) L_ankle=({:.3f},{:.3f},{:.3f}) R_ankle=({:.3f},{:.3f},{:.3f})",
                      p.physics_state, p.on_board, p.moving, p.speed, p.mask_weight,
-                     has_pelvis ? pelvis[1] : 0.0f, has_pelvis ? pelvis[2] : 0.0f,
-                     has_left ? left[1] : 0.0f, has_left ? left[2] : 0.0f,
-                     has_right ? right[1] : 0.0f, has_right ? right[2] : 0.0f);
+                     has_pelvis ? pelvis[0] : 0.0f, has_pelvis ? pelvis[1] : 0.0f, has_pelvis ? pelvis[2] : 0.0f,
+                     has_left ? left[0] : 0.0f, has_left ? left[1] : 0.0f, has_left ? left[2] : 0.0f,
+                     has_right ? right[0] : 0.0f, has_right ? right[1] : 0.0f, has_right ? right[2] : 0.0f);
     }
 }
 

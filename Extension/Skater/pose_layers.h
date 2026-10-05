@@ -15,10 +15,27 @@ namespace dingosdk::skater::layers {
 inline constexpr std::size_t pose_stride = 0x30;  // bytes per joint in the pose
 inline constexpr std::size_t clip_stride = 10;    // floats per joint in a clip
 
-// The joints the game keeps when a clip is layered: the pelvis and both legs,
-// which this skeleton lays out contiguously (hips 7, left leg 8..41, right leg
-// 341..374, with 42 starting the spine).
+// The clip drives the body above the pelvis, and the engine keeps everything
+// else.
+//
+// The spine at joint 42 owns joints 42..340: torso, neck, head and both arms.
+// Everything outside that -- the world placement at 1, the helper clusters the
+// engine hangs off it (2..6 and 375..394), the pelvis and both legs -- belongs
+// to the game. Writing the clip over a helper cluster is what floated the
+// skater above the board: those joints track the board and the physics, and the
+// clip holds them wherever they were when it was authored.
+inline constexpr std::uint32_t clip_first_joint = 42;
+inline constexpr std::uint32_t clip_last_joint = 340;
 bool joint_masked(std::uint32_t joint) noexcept;
+
+// Compose a joint's world position from the pose, walking a chain of ancestors
+// root first -- {1, 7, 8, 9, 10} reaches the left ankle. The first joint's own
+// translation is taken as already world; each step then applies its parent's
+// rotation and average scale, exactly as the engine composes a pose. For
+// diagnostics: the buffer is parent-local, so a raw offset between two joints is
+// meaningless without this.
+bool world_position(std::uintptr_t buffer, const std::uint32_t *chain, std::size_t count,
+                    float out[3]) noexcept;
 
 // Ramp a 0..1 weight toward `target`, moving at most 1/ramp_ms per elapsed ms.
 float ramp_weight(float weight, float target, std::uint64_t elapsed_ms, std::uint64_t ramp_ms) noexcept;

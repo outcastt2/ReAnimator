@@ -4,8 +4,10 @@
 // the mapping is checked joint by joint, including the two reserved joints at
 // the front and the spare floats that must never be touched.
 #include "Extension/Skater/pose_layers.h"
+#include <array>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -19,6 +21,17 @@ constexpr std::size_t pose_bytes = pose_joints * pose_stride;
 
 void check(bool value, const std::string &message) {
     if (!value) throw std::runtime_error(message);
+}
+
+// A joint's world position relative to joint 1, the same way the runtime
+// diagnostic does it.
+bool pose_offset_for_test(std::uintptr_t buffer, const std::uint32_t *chain, std::size_t count, float out[3]) {
+    const std::uint32_t root[] = {1};
+    float origin[3]{}, world[3]{};
+    if (!world_position(buffer, root, 1, origin)) return false;
+    if (!world_position(buffer, chain, count, world)) return false;
+    for (int c = 0; c < 3; ++c) out[c] = world[c] - origin[c];
+    return true;
 }
 
 float field(std::uintptr_t buffer, std::uint32_t joint, std::size_t offset) {
@@ -65,12 +78,48 @@ void check_clip_written(const std::vector<std::byte> &pose, std::uint32_t joint,
 }
 
 void test_masked_ranges() {
-    check(!joint_masked(0) && !joint_masked(1) && !joint_masked(2), "joints 0..2 are not masked");
-    check(joint_masked(7), "the pelvis is masked");
-    check(joint_masked(8) && joint_masked(41), "the whole left leg is masked");
-    check(!joint_masked(42) && !joint_masked(340), "neither the spine nor the last torso helper is masked");
-    check(joint_masked(341) && joint_masked(374), "the whole right leg is masked");
-    check(!joint_masked(375) && !joint_masked(394), "the helper tail is not masked");
+    // The clip owns the body above the pelvis: the spine at joint 42 and
+    // everything it parents, 42..340.
+    check(!joint_masked(42) && !joint_masked(100) && !joint_masked(340), "the clip owns 42..340");
+    // The engine keeps the world placement, its helper clusters, the pelvis and
+    // both legs.
+    check(joint_masked(1), "the world placement is the game's");
+    check(joint_masked(2) && joint_masked(6), "the root helper cluster is the game's");
+    check(joint_masked(7), "the pelvis is the game's");
+    check(joint_masked(8) && joint_masked(41), "the whole left leg is the game's");
+    check(joint_masked(341) && joint_masked(374), "the whole right leg is the game's");
+    check(joint_masked(375) && joint_masked(394), "the tail helper cluster is the game's");
+}
+
+void test_world_position() {
+    // A tiny pose: joint 1 at the origin, joint 7 two units down, joint 8 one
+    // unit further along the pelvis's own frame, which is rotated 90 degrees
+    // about x so its local +y points along world -z.
+    auto pose = sentinel_pose();
+    const auto address = reinterpret_cast<std::uintptr_t>(pose.data());
+    const auto put = [&](std::uint32_t joint, float x, float y, float z, float qx, float qy, float qz,
+                         float qw, float scale) {
+        const float position[3] = {x, y, z};
+        const float quat[4] = {qx, qy, qz, qw};
+        const float scales[3] = {scale, scale, scale};
+        auto *at = reinterpret_cast<void *>(address + joint * pose_stride);
+        std::memcpy(at, scales, sizeof(scales));
+        std::memcpy(reinterpret_cast<void *>(address + joint * pose_stride + 0x10), quat, sizeof(quat));
+        std::memcpy(reinterpret_cast<void *>(address + joint * pose_stride + 0x20), position, sizeof(position));
+    };
+    // 90 degrees about x: (x, y, z) -> (x, -z, y).
+    const float half = 0.70710678f;
+    put(1, 5.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f);
+    put(7, 0.0f, -2.0f, 0.0f, half, 0.0f, 0.0f, half, 1.0f);
+    put(8, 0.0f, -1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f);
+    const std::uint32_t chain[] = {1, 7, 8};
+    float out[3]{};
+    check(world_position(address, chain, 3, out), "the chain composes");
+    check(std::abs(out[0] - 5.0f) < 1e-3f, "composed x follows the root");
+    // joint 7 sits 2 below the root; joint 8's own -1 along y is rotated by the
+    // pelvis frame to world -z.
+    check(std::abs(out[1] - (-2.0f)) < 1e-3f, "composed y is the pelvis offset");
+    check(std::abs(out[2] - (-1.0f)) < 1e-3f, "composed z is the rotated chain");
 }
 
 void test_whole_body() {
@@ -139,11 +188,58 @@ void test_blend() {
     check(ramp_weight(0.9f, 1.0f, 100, 200) == 1.0f, "ramp clamps at one");
     check(ramp_weight(0.1f, 0.0f, 500, 200) == 0.0f, "ramp clamps at zero");
 }
+void test_against_a_real_clip() {
+    // The composition has to agree with the add-on's verified composer, or the
+    // live diagnostic lies. stance.rska is the game's own standing pose on the
+    // board: its left ankle sits about 0.86 m below the world placement joint.
+    constexpr const char *path = R"(D:\Games\reSkate\Skate\CustomAnimations\stance.rska)";
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        std::cout << "     (no stance.rska; skipped)\n";
+        return;
+    }
+    std::array<char, 20> header{};
+    in.read(header.data(), header.size());
+    if (in.gcount() != static_cast<std::streamsize>(header.size()) || std::memcmp(header.data(), "RSKA", 4) != 0)
+        throw std::runtime_error("stance.rska header");
+    std::uint32_t joints = 0, frames = 0;
+    std::memcpy(&joints, header.data() + 8, 4);
+    std::memcpy(&frames, header.data() + 12, 4);
+    check(joints == pose_joints && frames > 0, "stance.rska shape");
+    std::vector<float> values(static_cast<std::size_t>(frames) * joints * clip_stride);
+    in.read(reinterpret_cast<char *>(values.data()),
+            static_cast<std::streamsize>(values.size() * sizeof(float)));
+    if (in.gcount() != static_cast<std::streamsize>(values.size() * sizeof(float)))
+        throw std::runtime_error("stance.rska body");
+
+    // Re-pack the clip into a pose buffer: the layout is already the pose's.
+    std::vector<std::byte> pose(pose_bytes);
+    const auto address = reinterpret_cast<std::uintptr_t>(pose.data());
+    for (std::uint32_t joint = 0; joint < joints; ++joint) {
+        const float *src = values.data() + static_cast<std::size_t>(joint) * clip_stride;
+        auto *dst = reinterpret_cast<void *>(address + joint * pose_stride);
+        std::memcpy(dst, src + 0, 12);
+        std::memcpy(reinterpret_cast<void *>(address + joint * pose_stride + 0x10), src + 3, 16);
+        std::memcpy(reinterpret_cast<void *>(address + joint * pose_stride + 0x20), src + 7, 12);
+    }
+    const std::uint32_t pelvis_chain[] = {1, 7};
+    const std::uint32_t left_chain[] = {1, 7, 8, 9, 10};
+    float pelvis[3]{}, left[3]{};
+    check(pose_offset_for_test(address, pelvis_chain, 2, pelvis), "pelvis composes");
+    check(pose_offset_for_test(address, left_chain, 5, left), "ankle composes");
+    std::cout << "     pose: pelvis_y=" << pelvis[1] << " L_ankle=(" << left[0] << ", " << left[1] << ", "
+              << left[2] << ")   reference: pelvis_y=-0.031 L_ankle=(-0.076, -0.860, -0.147)\n";
+    check(std::abs(pelvis[1] - (-0.031f)) < 0.02f, "pelvis height matches the reference");
+    check(std::abs(left[1] - (-0.860f)) < 0.02f, "ankle height matches the reference");
+    check(std::abs(left[2] - (-0.147f)) < 0.02f, "ankle side matches the reference");
+}
 } // namespace
 
 int main() {
     try {
         test_masked_ranges();
+        test_world_position();
+        test_against_a_real_clip();
         test_whole_body();
         test_masked_body();
         test_blend();
