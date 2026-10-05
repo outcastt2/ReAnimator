@@ -254,6 +254,42 @@ std::uintptr_t local_component(std::uintptr_t base, std::uintptr_t client) {
     }
 }
 
+// The silent side of local_component: which link in the chain broke, each step
+// checked against its expected vtable. Silence here was the one failure the
+// logs could not name, and it is the first suspect when playback stops
+// responding to the console.
+std::string local_component_debug(std::uintptr_t base, std::uintptr_t client) noexcept {
+    const auto mark = [](bool match) { return match ? "ok" : "MISMATCH"; };
+    try {
+        const auto client_vtable = ptr(client);
+        const auto context = ptr(client, 8);
+        const auto offset = read<std::uint32_t>(base, addr::engine::context_player_manager_offset);
+        const auto manager = context && offset <= 0x1000000 ? ptr(context, offset) : 0;
+        const auto manager_vtable = manager ? ptr(manager) : 0;
+        const auto begin = manager ? ptr(manager, 0x4c8) : 0;
+        const auto end = manager ? ptr(manager, 0x4d0) : 0;
+        const auto player = begin ? ptr(begin) : 0;
+        const auto player_vtable = player ? ptr(player) : 0;
+        const auto entity = player ? ptr(player, 0xb8) : 0;
+        const auto entity_vtable = entity ? ptr(entity) : 0;
+        const auto component = entity ? ptr(entity, 0x628) : 0;
+        const auto component_vtable = component ? ptr(component) : 0;
+        return std::format(
+            "client={:#x} vtable={} context={:#x} manager={:#x} vtable={} begin={:#x} end={:#x} span={} "
+            "player={:#x} vtable={} entity={:#x} vtable={} component={:#x} vtable={}",
+            client, mark(client_vtable == base + addr::engine::client_vtable), context, manager,
+            mark(manager_vtable == base + addr::engine::local_player_manager_vtable), begin, end,
+            mark(end >= begin && end - begin == 8), player,
+            mark(player_vtable == base + addr::engine::local_player_vtable), entity,
+            mark(entity_vtable == base + addr::engine::skater_entity_vtable), component,
+            mark(component_vtable == base + addr::engine::skater_component_vtable));
+    } catch (const std::exception &e) {
+        return std::string("chain read failed: ") + e.what();
+    } catch (...) {
+        return "chain read failed";
+    }
+}
+
 // How much of the game's own pose to keep for the masked joints, ramped so a
 // layer switch is a blend rather than a cut.
 float mask_weight(Playback &p, ULONGLONG now) noexcept {
@@ -627,6 +663,9 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
             pending_clip = p.pending_clip;
             p.pending = p.stop = false;
         }
+        if (pending)
+            logging::log(logging::Level::info, logging::Channel::skater, "Custom animation: request \"{}\".",
+                         pending_clip);
         if (stop) {
             if (p.recording.load(std::memory_order_acquire)) {
                 const auto frames = p.record_frames.load(std::memory_order_acquire);
@@ -685,6 +724,9 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
         }
         const auto component = local_component(base, client);
         if (!component) {
+            logging::log(logging::Level::warning, logging::Channel::skater,
+                         "Custom animation: the local skater's animation component is unavailable ({}).",
+                         local_component_debug(base, client));
             set_status("Custom animation: the local skater's animation component is unavailable.");
             return;
         }
@@ -711,6 +753,8 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
         if (pending_clip == "record") {
             std::string detail;
             if (!multiplayer::install_entity_hooks(base, detail)) {
+                logging::log(logging::Level::warning, logging::Channel::skater,
+                             "Custom animation: the animation hook is unavailable: {}.", detail);
                 set_status("Custom animation: the animation hook is unavailable: " + detail);
                 return;
             }
@@ -743,6 +787,8 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
             }
             std::string detail;
             if (!multiplayer::install_entity_hooks(base, detail)) {
+                logging::log(logging::Level::warning, logging::Channel::skater,
+                             "Custom animation: the animation hook is unavailable: {}.", detail);
                 set_status("Custom animation: the animation hook is unavailable: " + detail);
                 return;
             }
@@ -800,6 +846,8 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
         }
         std::string detail;
         if (!multiplayer::install_entity_hooks(base, detail)) {
+            logging::log(logging::Level::warning, logging::Channel::skater,
+                         "Custom animation: the animation hook is unavailable: {}.", detail);
             set_status("Custom animation: the animation hook is unavailable: " + detail);
             return;
         }
@@ -822,8 +870,11 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
                      "Custom animation: playing {} on component {:#x} (mask {}).", p.clip_name, component,
                      pose_mask_name());
     } catch (const std::exception &e) {
+        logging::log(logging::Level::warning, logging::Channel::skater, "Custom animation: {}.", e.what());
         set_status(std::string("Custom animation: ") + e.what());
     } catch (...) {
+        logging::log(logging::Level::warning, logging::Channel::skater,
+                     "Custom animation: unknown failure in the playback tick.");
         set_status("Custom animation: unknown failure.");
     }
 }
