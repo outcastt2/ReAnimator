@@ -17,14 +17,15 @@ namespace {
 using Ptr = std::uintptr_t;
 namespace engine = game::build::v20260929::engine;
 
-// Field-watch cadence: a gesture press lasts a couple of seconds, so five
-// samples a second is twenty chances to catch the transition, and the cost is a
-// couple of thousand peeks a second against state that is already hot.
-constexpr unsigned watch_hz = 5;
+// Watch every client frame: a gesture request may be written and consumed
+// inside one frame, which a five-per-second sample would simply miss. The
+// change log keeps only small-integer transitions -- a gesture id is 0..254 --
+// because context floats otherwise drown everything.
 constexpr unsigned item_scan_bytes = 0x60;  // each gesture item's interesting head
 constexpr unsigned max_watch_items = 64;    // sampled items, not a hard limit on discovery
 constexpr unsigned max_changes = 400;       // the log is a finding, not a trace
 constexpr unsigned default_seconds = 30;
+constexpr std::uint32_t id_ceiling = 254;   // gesture ids are uint8
 
 struct Item {
     std::string name;
@@ -34,7 +35,7 @@ struct Item {
     std::uint8_t layered{}, stationary{};
 };
 struct Local {
-    Ptr context{}, manager{}, player{}, entity{}, component{}, holder{}, rig{};
+    Ptr context{}, manager{}, player{}, entity{}, component{}, holder{}, rig{}, definition{};
 };
 struct Region {
     std::string name;
@@ -56,6 +57,7 @@ struct State {
     ULONGLONG watch_until{};
     ULONGLONG next_sample{};
     ULONGLONG next_heartbeat{};
+    unsigned filtered{};
     std::vector<Region> regions;
     std::vector<Word> words;
     unsigned changes{}, lines{};
@@ -152,6 +154,7 @@ bool resolve_local(Ptr base, Ptr client, Local &out) {
     if (!out.component || pointer(out.component) != base + engine::skater_component_vtable) return false;
     out.holder = pointer(out.component + 0xa0);
     out.rig = out.holder ? pointer(out.holder + 0x78) : 0;
+    out.definition = out.rig ? pointer(out.rig + 0x18) : 0;
     return true;
 }
 
@@ -200,7 +203,10 @@ void arm(Ptr base, Ptr client, const std::string &filter, unsigned seconds) {
     add_region(s, "skater", local.entity, 0x120);
     add_region(s, "anim", local.component, 0x120);
     add_region(s, "holder", local.holder, 0x80);
-    add_region(s, "rig", local.rig, 0x100);
+    // The whole animation instance: a gesture request is graph state, and the
+    // graph lives in the rig far past the few fields the pose resolver uses.
+    add_region(s, "rig", local.rig, 0x2000);
+    add_region(s, "definition", local.definition, 0x200);
     // The skater's other components: a gesture request is as likely to live in
     // an emote or expression component as in the animation one.
     const auto collection = pointer(local.component + 0x70);
@@ -235,7 +241,12 @@ void sample() {
         std::uint32_t value{};
         if (!memory::peek(word.address, value) || value == word.value) continue;
         ++s.changes;
-        if (s.lines < max_changes) {
+        // A gesture id is a small integer. Everything else is a float that
+        // churns every frame, and logging it would bury the one line that
+        // matters.
+        if (word.value > id_ceiling || value > id_ceiling) {
+            ++s.filtered;
+        } else if (s.lines < max_changes) {
             ++s.lines;
             logging::log(logging::Level::info, logging::Channel::skater,
                          "Hand props: change {} +{:#x} {} -> {} ({}s left)", s.regions[word.region].name,
@@ -249,15 +260,16 @@ void sample() {
     if (now >= s.next_heartbeat && now < s.watch_until) {
         s.next_heartbeat = now + 5000;
         logging::log(logging::Level::info, logging::Channel::skater,
-                     "Hand props: watching, {} change(s) so far, {}s left.", s.changes,
+                     "Hand props: watching, {} integer change(s) ({} filtered), {}s left.", s.lines, s.filtered,
                      static_cast<unsigned>((s.watch_until - now) / 1000));
     }
     if (now >= s.watch_until) {
         s.watching = false;
         logging::log(logging::Level::info, logging::Channel::skater,
-                     "Hand props: watch finished with {} change(s){}; look for a field that became a gesture id.",
-                     s.changes, s.lines < s.changes ? " (some not logged)" : "");
-        set_status(std::format("Hand props: watch finished with {} change(s); see the log.", s.changes));
+                     "Hand props: watch finished: {} integer change(s), {} filtered out, {} words sampled; "
+                     "look for a field that became a gesture id.",
+                     s.lines, s.filtered, s.words.size());
+        set_status(std::format("Hand props: watch finished with {} integer change(s); see the log.", s.lines));
     }
 }
 } // namespace
@@ -307,9 +319,8 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
             set_status("Hand props: watch stopped (the skater went away).");
             return;
         }
-        const auto now = GetTickCount64();
-        if (now < s.next_sample) return;
-        s.next_sample = now + 1000 / watch_hz;
+        // Every frame: a request written and consumed inside one frame is only
+        // visible if the sampling keeps up with the client tick.
         sample();
     } catch (const std::exception &e) {
         set_status(std::string("Hand props: ") + e.what());
