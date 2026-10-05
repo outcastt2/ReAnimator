@@ -185,6 +185,13 @@ void hold_off_board(std::uintptr_t selector, std::uint32_t current) noexcept {
     if (!resolve(board.owner.client, board.owner.entity, current_owner) || current_owner != board.owner) return;
     (void)cancel_request(current_owner.context, animation_request_offset, mount_request_mask);
 }
+// The physics state the selector last chose. Written by the selector hook, which
+// the engine calls as it steps the skater's state machine, and read by the custom
+// animation layer to tell riding from walking.
+std::atomic<std::uint32_t> &observed_state() {
+    static std::atomic<std::uint32_t> value{UINT32_MAX};
+    return value;
+}
 std::uint32_t choose_state(std::uintptr_t selector, std::uint32_t current) {
     {
         LastError error;
@@ -208,13 +215,24 @@ std::uint32_t choose_state(std::uintptr_t selector, std::uint32_t current) {
             if (chosen == wipeout_physics_state) w.wipeouts.fetch_add(1, std::memory_order_relaxed);
         }
     }
+    // What the physics thinks the skater is doing, for consumers outside this
+    // file: walking (504) and a ground wipeout (300) are on foot, everything
+    // else is riding. The watch above is the trainer's windowed view of the same
+    // thing; this one is always current, which is what the animation layer needs.
+    observed_state().store(chosen, std::memory_order_relaxed);
     return chosen;
 }
+// Set once by a consumer that needs to write a pose after the engine's own
+// constraints; read on every skeleton response.
+std::atomic<SkeletonResponded> skeleton_responded_listener{};
 void skeleton_response(std::uintptr_t rig, float seconds, bool wipeout) {
     // The state post-update can raise another request after the selector ran.
     // Filter at this consumer, then let native constraints and recovery run.
     if (filter_requests(rig, &Owner::rig)) wipeout = false;
     protection().skeleton_original(rig, seconds, wipeout);
+    // After the engine's own constraints, so a pose written here is last.
+    if (const auto listener = skeleton_responded_listener.load(std::memory_order_acquire))
+        listener(rig);
 }
 bool clear_contact_output(std::uintptr_t contacts) noexcept {
     if (contacts < 0x10000 || contacts > highest - body_contact_output_offset) return false;
@@ -279,7 +297,10 @@ bool compatible(std::uintptr_t base) noexcept {
     }
     return true;
 }
-}
+} // namespace
+
+std::uint32_t observed_physics_state() noexcept { return observed_state().load(std::memory_order_relaxed); }
+
 bool start_no_bail(std::uintptr_t base) noexcept {
     LastError error;
     try {
@@ -417,5 +438,8 @@ void clear_no_bail_flight() noexcept {
     AcquireSRWLockExclusive(&p.lock);
     p.lease.flight_until = 0;
     ReleaseSRWLockExclusive(&p.lock);
+}
+void set_skeleton_responded_listener(SkeletonResponded listener) noexcept {
+    skeleton_responded_listener.store(listener, std::memory_order_release);
 }
 }

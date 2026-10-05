@@ -23,6 +23,8 @@
 #include "Extension/Settings/gameplay_settings_override.h"
 #include "Extension/Settings/named_settings.h"
 #include "Extension/Skater/ai_skaters.h"
+#include "Extension/Skater/effect_attach.h"
+#include "Extension/Skater/custom_animation.h"
 #include "Extension/Skater/client_source_spawn.h"
 #include "Extension/Skater/skater_slot_override.h"
 #include "Extension/Throwdowns/native_throwdowns.h"
@@ -255,6 +257,10 @@ void update_model(std::uintptr_t client, TickState& frame) {
     frame.valid = true;
     frame.state = state;
     frame.game_type = game_type;
+    // Prototype effect attach: keep a spawned effect on the skater's head.
+    if (state == 13 || state == 21) dingosdk::skater::tick_effect_attach(r.base, client);
+    // Route B: custom animation playback on the local skater.
+    if (state == 13 || state == 21) dingosdk::skater::tick_pose_playback(r.base, client);
     // Some two dozen native reads: one result serves the whole tick.
     const auto native_context_ready = [&] {
         if (!frame.context) frame.context = native_context(r.base, client, game_type);

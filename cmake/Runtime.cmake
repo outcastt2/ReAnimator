@@ -109,6 +109,9 @@ add_library(dingosdk_runtime SHARED
     Extension/Skater/client_first_person.cpp
     Extension/Skater/client_debug.cpp
     Extension/Skater/ai_skaters.cpp
+    Extension/Skater/effect_attach.cpp
+    Extension/Skater/custom_animation.cpp
+    Extension/Skater/pose_layers.cpp
     Extension/Skater/no_bail.cpp
     Extension/Skater/physics_tuning.cpp
     Extension/Multiplayer/Remote/remote_collision.cpp
@@ -237,3 +240,9 @@ add_executable(boardgesture_guard_tests Extension/Skater/Gestures/board_gesture_
     Extension/Skater/Gestures/board_gesture_route_tests.cpp)
 target_include_directories(boardgesture_guard_tests PRIVATE "${PROJECT_SOURCE_DIR}")
 target_link_libraries(boardgesture_guard_tests PRIVATE dingosdk_logging)
+
+# The animation layer's write mapping: an off-by-one there scrambles every joint
+# of the skater, so it is checked on the host, joint by joint.
+add_executable(dingosdk_pose_layer_tests Extension/Skater/Test/pose_layer_tests.cpp
+    Extension/Skater/pose_layers.cpp)
+target_include_directories(dingosdk_pose_layer_tests PRIVATE "${PROJECT_SOURCE_DIR}")

@@ -383,6 +383,8 @@ void animation_hook(std::uintptr_t component, std::uintptr_t update) {
     player_skitch::animation_evaluated(component);
     if (const auto listener = shared().evaluated_listener.load(std::memory_order_acquire))
         listener(component);
+    if (const auto playback = shared().pose_listener.load(std::memory_order_acquire))
+        playback(component);
 }
 void destroy_hook(std::uintptr_t entity, std::uintptr_t owner) {
     // Other SDK-created actors share this hook; they must forget the entity
@@ -602,5 +604,8 @@ void set_render_pose_listener(RenderPosePublished listener) noexcept {
 }
 void set_animation_evaluated_listener(AnimationEvaluated listener) noexcept {
     shared().evaluated_listener.store(listener, std::memory_order_release);
+}
+void set_pose_playback_listener(PoseOverride listener) noexcept {
+    shared().pose_listener.store(listener, std::memory_order_release);
 }
 } // namespace dingosdk::multiplayer
