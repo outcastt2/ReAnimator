@@ -42,6 +42,7 @@ struct Local {
 struct Region {
     std::string name;
     Ptr address{};
+    bool asset_image{};   // an asset's own bytes: +0x28 is its runtime data pointer
 };
 struct Word {
     Ptr address{};
@@ -79,6 +80,7 @@ struct State {
     unsigned assets_seconds{45};
     std::vector<Region> regions;
     std::vector<Word> words;
+    std::vector<std::pair<std::string, Ptr>> pending_regions;
     unsigned changes{}, lines{};
 };
 State &state() {
@@ -177,9 +179,9 @@ bool resolve_local(Ptr base, Ptr client, Local &out) {
     return true;
 }
 
-void add_region(State &s, std::string name, Ptr address, std::size_t bytes) {
+void add_region(State &s, std::string name, Ptr address, std::size_t bytes, bool asset_image = false) {
     if (!address) return;
-    s.regions.push_back({std::move(name), address});
+    s.regions.push_back({std::move(name), address, asset_image});
     const auto region = static_cast<unsigned>(s.regions.size() - 1);
     for (std::size_t offset = 0; offset + 4 <= bytes; offset += 4) {
         std::uint32_t value{};
@@ -336,6 +338,7 @@ void arm_assets(Ptr base, Ptr client, const std::string &extra, unsigned seconds
     };
     std::vector<Spot> spots;
     std::vector<Spot> assets;
+    std::vector<Spot> datas;
     bool faulted{};
     // Studio's browser shows a tree, but the engine names an asset by its full
     // path (the vfx catalog spells them "effects/gestures/effectblueprints/
@@ -364,6 +367,9 @@ void arm_assets(Ptr base, Ptr client, const std::string &extra, unsigned seconds
         // into the asset, so the asset's own bytes are the live value. Watch
         // them as well as any instance reference.
         assets.push_back({name + " asset", asset});
+        std::uint32_t data{};
+        if (memory::read_bytes(asset + 0x28, &data, sizeof(data)) && data != 0)
+            datas.push_back({name + " data", static_cast<Ptr>(data) & ~Ptr{7}});
         struct Scan {
             const char *region;
             Ptr address;
@@ -402,7 +408,12 @@ void arm_assets(Ptr base, Ptr client, const std::string &extra, unsigned seconds
     s.pose_mode = false;
     // The asset's own bytes first: a global switch lives there, and the whole
     // asset header plus payload fits in a small window.
-    for (const auto &asset : assets) add_region(s, asset.label, asset.address, 0x80);
+    for (const auto &asset : assets) add_region(s, asset.label, asset.address, 0x80, true);
+    for (const auto &data : datas) {
+        logging::log(logging::Level::info, logging::Channel::skater,
+                     "Hand props: {} is already instantiated at {:#x}.", data.label, data.address);
+        add_region(s, data.label, data.address, 0x40);
+    }
     for (const auto &spot : spots) add_region(s, spot.label, spot.address, 0x20);
     if (s.words.empty()) {
         set_status("Hand props: none of the phone assets are loaded to reference.");
@@ -477,6 +488,13 @@ void sample() {
         std::uint32_t value{};
         if (!memory::peek(word.address, value) || value == word.value) continue;
         ++s.changes;
+        {
+            // An asset image's +0x28 is its runtime data pointer. When it
+            // appears, that object is where the live value is, so follow it.
+            const auto &region = s.regions[word.region];
+            if (region.asset_image && word.address == region.address + 0x28 && value != 0)
+                s.pending_regions.emplace_back(region.name + " data", static_cast<Ptr>(value) & ~Ptr{7});
+        }
         if (!word.logged) {
             // One line per address, tagged with the phase it first changed in.
             // The value is not filtered: a request may be a pointer rather than
@@ -518,6 +536,17 @@ void sample() {
         }
         word.value = value;
     }
+    // Anything the loop discovered: the asset's data object, now worth reading.
+    for (auto &[name, address] : s.pending_regions) {
+        std::array<std::uint32_t, 8> words{};
+        if (memory::read_bytes(address, words.data(), sizeof(words)))
+            logging::log(logging::Level::info, logging::Channel::skater,
+                         "Hand props: following {} at {:#x}: words {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
+                         name, address, words[0], words[1], words[2], words[3], words[4], words[5], words[6],
+                         words[7]);
+        add_region(s, name, address, 0x40);
+    }
+    s.pending_regions.clear();
     // A heartbeat, so a quiet window is provably a quiet window and the press
     // can be placed on the timeline from the log alone.
     if (now >= s.next_heartbeat && now < s.watch_until) {
