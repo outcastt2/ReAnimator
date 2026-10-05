@@ -34,6 +34,10 @@ void request_prop_watch(std::string filter, unsigned seconds);
 // Bump the watch phase: the log tags each changed address with the phase it
 // first changed in, so an idle phase and a pressing phase can be diffed.
 void request_prop_mark();
+// Watch the animation layer cluster every frame and keep the whole timeline.
+// Layer weights are floats; 1.0 means a layer is fully active, which is what a
+// gesture (and its prop) looks like from the outside.
+void request_prop_weight(unsigned seconds);
 std::string prop_status();
 // Per-frame service on the client thread, beside the other skater ticks.
 void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept;

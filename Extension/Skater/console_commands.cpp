@@ -242,7 +242,14 @@ void register_movement_commands(Commands &registry) {
             out("Hand props: phase marked; presses from now on are tagged with it.");
             return;
         }
-        out("usage: prop | prop list [name] | prop watch [name] [seconds] | prop mark");
+        if (mode == "weight") {
+            const auto seconds = args.size() > 1 ? static_cast<unsigned>(std::get<double>(args[1])) : 45u;
+            skater::request_prop_weight(seconds);
+            out("Hand props: watching the layer area for " + std::to_string(seconds) +
+                "s; press the gesture a few times, letting each finish.");
+            return;
+        }
+        out("usage: prop | prop list [name] | prop watch [name] [seconds] | prop mark | prop weight [seconds]");
     };
     registry.add(std::move(prop));
 

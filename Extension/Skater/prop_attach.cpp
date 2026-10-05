@@ -65,7 +65,10 @@ struct State {
     ULONGLONG next_heartbeat{};
     unsigned repeats{};
     unsigned phase{};
+    bool log_every{};   // narrow watches keep the whole timeline, not just the first change
     bool mark_pending{};
+    bool weight_pending{};
+    unsigned weight_seconds{45};
     std::vector<Region> regions;
     std::vector<Word> words;
     unsigned changes{}, lines{};
@@ -246,12 +249,43 @@ void arm(Ptr base, Ptr client, const std::string &filter, unsigned seconds) {
                            s.words.size(), window, idle_seconds));
 }
 
+void arm_weight(Ptr base, Ptr client, unsigned seconds) {
+    auto &s = state();
+    Local local;
+    if (!resolve_local(base, client, local)) {
+        set_status("Hand props: the local skater is not ready to watch.");
+        return;
+    }
+    const auto window = seconds ? seconds : s.weight_seconds;
+    s.regions.clear();
+    s.words.clear();
+    s.changes = s.lines = s.repeats = 0;
+    s.phase = 1;
+    s.log_every = true;
+    // The animation layer cluster: the first phased run put the gesture's work
+    // between rig+0x3b00 and rig+0x3e00, weights included.
+    add_region(s, "layer", local.rig + 0x3b00, 0x600);
+    if (s.words.empty()) {
+        set_status("Hand props: no rig state to watch yet; load a map first.");
+        return;
+    }
+    s.watching = true;
+    s.watch_start = GetTickCount64();
+    s.watch_until = s.watch_start + window * 1000ULL;
+    s.next_heartbeat = s.watch_start + 5000;
+    logging::log(logging::Level::info, logging::Channel::skater,
+                 "Hand props: watching the layer area ({} words at rig+0x3b00) for {}s, every change. "
+                 "Press the gesture a few times and let each one finish.",
+                 s.words.size(), window);
+    set_status(std::format("Hand props: watching the layer weights for {}s; press the gesture a few times.", window));
+}
+
 void sample() {
     auto &s = state();
     const auto now = GetTickCount64();
     // The idle phase ends by itself, so the press needs no console visit in the
     // middle of the window (opening it steals input focus).
-    if (s.phase == 0 && now >= s.watch_start + idle_seconds * 1000ULL && now < s.watch_until) {
+    if (s.phase == 0 && !s.log_every && now >= s.watch_start + idle_seconds * 1000ULL && now < s.watch_until) {
         ++s.phase;
         s.next_heartbeat = 0;
         logging::log(logging::Level::info, logging::Channel::skater,
@@ -276,6 +310,20 @@ void sample() {
                              static_cast<unsigned>(word.address - s.regions[word.region].address), word.value, value,
                              word.value, value,
                              s.watch_until > now ? static_cast<unsigned>((s.watch_until - now) / 1000) : 0);
+            }
+        } else if (s.log_every) {
+            // Narrow watch: the timeline is the finding, so every transition is
+            // logged, with the value read as a float as well -- layer weights
+            // are floats, and 1.0 shows up as 1065353216.
+            ++s.lines;
+            if (s.lines < max_changes) {
+                float as_float{};
+                std::memcpy(&as_float, &value, sizeof(as_float));
+                logging::log(logging::Level::info, logging::Channel::skater,
+                             "Hand props: {} +{:#x} {} -> {} (float {:.4f})",
+                             s.regions[word.region].name,
+                             static_cast<unsigned>(word.address - s.regions[word.region].address), word.value, value,
+                             as_float);
             }
         } else {
             ++s.repeats;
@@ -320,6 +368,12 @@ void request_prop_mark() {
     std::lock_guard lock(s.mutex);
     s.mark_pending = true;
 }
+void request_prop_weight(unsigned seconds) {
+    auto &s = state();
+    std::lock_guard lock(s.mutex);
+    s.weight_seconds = seconds;
+    s.weight_pending = true;
+}
 std::string prop_status() {
     std::lock_guard lock(status_mutex());
     return state().status;
@@ -329,18 +383,22 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
     try {
         auto &s = state();
         std::string filter;
-        bool want_report{}, want_watch{};
+        bool want_report{}, want_watch{}, want_weight{};
         unsigned seconds{default_seconds};
+        unsigned weight_seconds{};
         {
             std::lock_guard lock(s.mutex);
             want_report = s.report_pending;
             want_watch = s.watch_pending;
+            want_weight = s.weight_pending;
             filter = s.filter;
             seconds = s.watch_seconds;
-            s.report_pending = s.watch_pending = false;
+            weight_seconds = s.weight_seconds;
+            s.report_pending = s.watch_pending = s.weight_pending = false;
         }
         if (want_report) report(base, filter);
-        if (want_watch) arm(base, client, filter, seconds);
+        if (want_weight) arm_weight(base, client, weight_seconds);
+        else if (want_watch) arm(base, client, filter, seconds);
         if (!s.watching) return;
         // A level change invalidates every address the watch holds; stop rather
         // than keep reading a freed context.
