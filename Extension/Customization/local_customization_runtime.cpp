@@ -145,11 +145,14 @@ bool refresh_cosmetic_catalog() {
         (info.build_kit ? (held ? reserved_objects : objects) : (held ? reserved_keys : keys)).push_back(key);
     }
     if (!c.ownership_unavailable) {
-        // The unlock options already default to true and are named for unlocking the whole
-        // catalogue, so seed reserved items alongside the open ones. reconcile_inventory()
-        // leaves them owned for the same reason.
-        keys.insert(keys.end(), reserved_keys.begin(), reserved_keys.end());
-        objects.insert(objects.end(), reserved_objects.begin(), reserved_objects.end());
+        // The unlock options are named for unlocking the whole catalogue, but
+        // only when the reserved-item unlocker is on: it decides whether the
+        // items behind Skate Pass, influence, events and ranks are seeded as
+        // owned too, and whether reconcile_inventory revokes them again.
+        if (profile::unlock_reserved_items) {
+            keys.insert(keys.end(), reserved_keys.begin(), reserved_keys.end());
+            objects.insert(objects.end(), reserved_objects.begin(), reserved_objects.end());
+        }
         s.store->seed_cosmetic_inventory(keys);
         s.store->seed_object_inventory(objects);
         s.store->reconcile_inventory(reserved_keys, reserved_objects);

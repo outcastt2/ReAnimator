@@ -1,5 +1,6 @@
 #include "Extension/Profile/local_profile.h"
 #include <Windows.h>
+#include <filesystem>
 #include <iostream>
 #include <stdexcept>
 using namespace dingosdk;
@@ -17,21 +18,31 @@ int main() {
             store.seed_object_inventory({"Own_TestObjectReserved"});
             store.reconcile_inventory({"Own_TestReserved"},{"Own_TestObjectReserved"});
             auto at=store.snapshot();
-            require(at.customization.at("inventory").at("Own_TestReserved").get<bool>());
-            require(at.extensions.at("object_dropper").at("inventory").at("Own_TestObjectReserved").get<bool>());
+            const bool cosmetic=at.customization.at("inventory").at("Own_TestReserved").get<bool>();
+            const bool object=at.extensions.at("object_dropper").at("inventory").at("Own_TestObjectReserved").get<bool>();
+            // With the reserved-item unlocker off, one reconcile refresh revokes a
+            // seeded reserved item again even though both unlock options are on.
+            require(cosmetic==profile::unlock_reserved_items);
+            require(object==profile::unlock_reserved_items);
         }
         {
             profile::Store store(save);
             store.reconcile_inventory({"Own_TestReserved"},{"Own_TestObjectReserved"});
-            require(store.snapshot().customization.at("inventory").at("Own_TestReserved").get<bool>());
-            store.set_bool_option(profile::unlock_cosmetics_option,false);
-            store.reconcile_inventory({"Own_TestReserved"},{"Own_TestObjectReserved"});
-            auto at=store.snapshot();
-            require(!at.customization.at("inventory").at("Own_TestReserved").get<bool>());
-            require(at.extensions.at("object_dropper").at("inventory").at("Own_TestObjectReserved").get<bool>());
+            if (profile::unlock_reserved_items) {
+                require(store.snapshot().customization.at("inventory").at("Own_TestReserved").get<bool>());
+                store.set_bool_option(profile::unlock_cosmetics_option,false);
+                store.reconcile_inventory({"Own_TestReserved"},{"Own_TestObjectReserved"});
+                auto at=store.snapshot();
+                require(!at.customization.at("inventory").at("Own_TestReserved").get<bool>());
+                require(at.extensions.at("object_dropper").at("inventory").at("Own_TestObjectReserved").get<bool>());
+            } else {
+                auto at=store.snapshot();
+                require(!at.customization.at("inventory").at("Own_TestReserved").get<bool>());
+                require(!at.extensions.at("object_dropper").at("inventory").at("Own_TestObjectReserved").get<bool>());
+            }
         }
         for(const auto suffix : {"","-wal","-shm"}) std::filesystem::remove(std::filesystem::path(save.string()+suffix));
-        std::cout<<"Reserved cosmetics/objects stay owned across refresh and restart; explicit unlock disable still works.\n";
+        std::cout<<"Reserved inventory reconcile matches the unlocker switch; explicit option disable still works.\n";
         return 0;
     } catch(const std::exception& e) { std::cerr<<e.what()<<'\n'; return 1; }
 }

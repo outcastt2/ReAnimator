@@ -76,12 +76,13 @@ void Store::seed_object_inventory(const std::vector<std::string>& keys) {
 }
 void Store::reconcile_inventory(const std::vector<std::string>& cosmetics, const std::vector<std::string>& objects) {
     std::lock_guard lock(mutex_);
-    // An enabled unlock option means every installed item is meant to stay owned, so the
-    // reserved items behind Skate Pass, influence, events and neighbourhood ranks are left
-    // alone instead of being forced back to unowned on every catalog refresh.
+    // The reserved-item unlocker alone decides whether reserved items stay
+    // owned. With it off they are forced back to unowned on every catalog
+    // refresh, even when the unlock options are enabled -- the upstream
+    // behaviour before SkateSkitch extended the unlock to reserved items.
     const auto granted = [&](std::string_view option) {
         const auto found = value_.bool_options.find(option);
-        return found != value_.bool_options.end() && found->second;
+        return unlock_reserved_items && found != value_.bool_options.end() && found->second;
     };
     const bool cosmetics_granted = granted(unlock_cosmetics_option);
     const bool objects_granted = granted(unlock_objects_option);
