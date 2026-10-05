@@ -25,6 +25,7 @@ using nsd::readable;
 
 constexpr std::size_t skater_joint_bound = 512;
 constexpr std::uint16_t test_joint = 103; // head
+constexpr std::uint16_t test_spine_joint = 7; // a body joint in the head chain's ancestry
 constexpr std::size_t floats_per_joint = 10; // scale.xyz, quat.xyzw, pos.xyz
 constexpr std::uint32_t expected_skater_joints = 395;
 constexpr std::uint32_t max_record_frames = 1800; // 30 s at 60 Hz
@@ -186,17 +187,30 @@ void on_pose_evaluated(std::uintptr_t component) noexcept {
         };
         const auto elapsed_ms = GetTickCount64() - p.started;
         if (p.test.load(std::memory_order_relaxed)) {
-            // Decisive check: scale the head, the exact operation first person
-            // uses to hide it. If the head visibly shrinks and grows, our write
-            // reaches the renderer and the earlier problem was rotation-specific
-            // (the head is likely driven by a look-at/aim constraint that
-            // overwrites its rotation but not its scale).
-            std::array<float, 12> bone{};
-            if (!readable(buffer + test_joint * 0x30ULL, bone.data(), sizeof(bone))) return;
             const float phase = static_cast<float>(elapsed_ms) * 0.003f;
-            const float scale = 0.5f + 0.45f * std::sin(phase);
-            bone[0] = bone[1] = bone[2] = scale;
-            (void)nsd::write(buffer + test_joint * 0x30ULL, bone.data(), sizeof(bone));
+            // 1) Head scale: the operation first person uses to hide the head,
+            //    already proven to reach the renderer.
+            std::array<float, 12> head{};
+            if (readable(buffer + test_joint * 0x30ULL, head.data(), sizeof(head))) {
+                const float scale = 0.5f + 0.45f * std::sin(phase);
+                head[0] = head[1] = head[2] = scale;
+                (void)nsd::write(buffer + test_joint * 0x30ULL, head.data(), sizeof(head));
+            }
+            // 2) A rotation on a body joint. If the body twists, rotations land
+            //    for everything but the head; if it does not, the engine's
+            //    post-physics skeleton response is rewriting the whole pose's
+            //    rotations after this write.
+            std::array<float, 12> spine{};
+            if (readable(buffer + test_spine_joint * 0x30ULL, spine.data(), sizeof(spine))) {
+                const float angle = 1.0f * std::sin(phase);
+                const float half = angle * 0.5f, s = std::sin(half), c = std::cos(half);
+                const float qx = spine[4], qy = spine[5], qz = spine[6], qw = spine[7];
+                spine[4] = qw * s + qx * c;
+                spine[5] = qy * c + qz * s;
+                spine[6] = qz * c - qy * s;
+                spine[7] = qw * c - qx * s;
+                (void)nsd::write(buffer + test_spine_joint * 0x30ULL, spine.data(), sizeof(spine));
+            }
             note_write();
             return;
         }
