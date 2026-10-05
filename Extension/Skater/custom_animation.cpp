@@ -115,14 +115,13 @@ PoseLocation pose_location(std::uintptr_t base, std::uintptr_t component) {
     return {pose.buffer, pose.count};
 }
 
-// The animation rig behind a component, which is what the post-physics
-// skeleton response is handed.
-std::uintptr_t rig_for(std::uintptr_t component) {
-    std::uintptr_t holder{};
-    if (!component || !readable(component + 0xa0, &holder, 8) || !holder) return 0;
-    std::uintptr_t rig{};
-    if (!readable(holder + 0x78, &rig, 8)) return 0;
-    return rig;
+// The rig handed to the post-physics response is the physics rig, not the
+// animation rig: no_bail's own resolution reads core = *(component + 0x70),
+// rig = *(core + 0x438), and verifies *(rig + 0x4630) == core.
+bool rig_is_local(std::uintptr_t rig, std::uintptr_t component) {
+    if (!rig || !component) return false;
+    const auto core = ptr(component, 0x70);
+    return core && ptr(rig, 0x4630) == core;
 }
 
 // The local skater's animation component, or 0.
@@ -240,7 +239,7 @@ void on_skeleton_responded(std::uintptr_t rig) noexcept {
         auto &p = playback();
         if (!rig) return;
         const auto component = p.component.load(std::memory_order_acquire);
-        if (rig_for(component) != rig) return;
+        if (!rig_is_local(rig, component)) return;
         const auto pose = pose_location(p.base, component);
         if (!pose.buffer) return;
         if (p.recording.load(std::memory_order_acquire)) {
