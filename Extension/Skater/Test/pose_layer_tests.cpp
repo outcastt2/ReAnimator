@@ -233,6 +233,39 @@ void test_against_a_real_clip() {
     check(std::abs(left[1] - (-0.860f)) < 0.02f, "ankle height matches the reference");
     check(std::abs(left[2] - (-0.147f)) < 0.02f, "ankle side matches the reference");
 }
+void test_interpolation() {
+    // Two clip frames and a quarter of the way between them: the pose must be
+    // the blend, not either frame, and a rotation must travel the short arc.
+    const float quarter = 0.25f;
+    std::vector<float> a(static_cast<std::size_t>(pose_joints) * clip_stride, 0.0f);
+    std::vector<float> b(static_cast<std::size_t>(pose_joints) * clip_stride, 0.0f);
+    for (std::uint32_t joint = 0; joint < pose_joints; ++joint) {
+        float *x = a.data() + static_cast<std::size_t>(joint) * clip_stride;
+        float *y = b.data() + static_cast<std::size_t>(joint) * clip_stride;
+        x[0] = x[1] = x[2] = 2.0f;
+        x[6] = 1.0f; // identity rotation
+        y[0] = y[1] = y[2] = 4.0f;
+        y[5] = 0.70710678f; // 90 degrees about z
+        y[6] = 0.70710678f;
+        y[7] = y[8] = y[9] = 10.0f;
+    }
+    auto pose = sentinel_pose();
+    const auto address = reinterpret_cast<std::uintptr_t>(pose.data());
+    write_pose_interpolated(address + 2 * pose_stride, a.data() + 2 * clip_stride, b.data() + 2 * clip_stride,
+                            quarter, 2, pose_joints - 2, 0.0f);
+    check(std::abs(field(address, 42, 0x00) - 2.5f) < 1e-3f, "interpolated scale");
+    check(std::abs(field(address, 42, 0x20) - 2.5f) < 1e-3f, "interpolated position");
+    // A quarter of 90 degrees about z is 22.5: z = sin(11.25), w = cos(11.25).
+    check(std::abs(field(address, 42, 0x18) - 0.19509f) < 1e-3f, "interpolated rotation");
+    check(std::abs(field(address, 42, 0x1c) - 0.98079f) < 1e-3f, "interpolated rotation w");
+    // The mask still applies: at full keep the game's pose survives untouched.
+    auto kept = game_pose();
+    const auto kept_address = reinterpret_cast<std::uintptr_t>(kept.data());
+    write_pose_interpolated(kept_address + 2 * pose_stride, a.data() + 2 * clip_stride, b.data() + 2 * clip_stride,
+                            quarter, 2, pose_joints - 2, 1.0f);
+    check(std::abs(field(kept_address, 7, 0x00) - 4.0f) < 1e-3f, "a masked joint keeps the game's pose");
+    check(std::abs(field(kept_address, 42, 0x00) - 2.5f) < 1e-3f, "an unmasked joint still interpolates");
+}
 } // namespace
 
 int main() {
@@ -243,6 +276,7 @@ int main() {
         test_whole_body();
         test_masked_body();
         test_blend();
+        test_interpolation();
         std::cout << "pose layer tests passed\n";
         return 0;
     } catch (const std::exception &error) {

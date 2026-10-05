@@ -407,8 +407,15 @@ void write_current(Playback &p, std::uintptr_t buffer, std::uint32_t available_j
     auto clip_joints = p.clip.joints;
     if (available_joints && clip_joints > available_joints) clip_joints = available_joints;
     if (clip_joints <= 2) return;
-    const auto frame = static_cast<std::uint32_t>(
-        (static_cast<double>(elapsed_ms) * p.clip.fps / 1000.0)) % p.clip.frames;
+    // Where the clip is now, as a fraction of a frame. A clip is authored at its
+    // own rate (24 fps is normal for these) and the game runs at 60 Hz, so the
+    // two frames around this point are interpolated rather than snapped to --
+    // and when the point is the last frame of the clip, the pair wraps to the
+    // first, which closes the loop without a jump.
+    const double position = static_cast<double>(elapsed_ms) * p.clip.fps / 1000.0;
+    const auto frame = static_cast<std::uint32_t>(std::fmod(position, static_cast<double>(p.clip.frames)));
+    const auto next = (frame + 1) % p.clip.frames;
+    const auto alpha = static_cast<float>(position - std::floor(position));
     // Joints 0 and 1 are not pose: joint 1 carries the skater's world
     // placement, and the game drives it from the board and physics. Leaving it
     // alone is what keeps the skater on the board, the way a gesture animates
@@ -418,10 +425,13 @@ void write_current(Playback &p, std::uintptr_t buffer, std::uint32_t available_j
     // engine's own pose for them stays, so the feet keep the board and the walk
     // keeps walking.
     const auto keep = mask_weight(p, GetTickCount64());
-    layers::write_pose(buffer + 2 * layers::pose_stride,
-                       p.clip.data.data() + static_cast<std::size_t>(frame) * p.clip.joints * floats_per_joint +
-                           2 * layers::clip_stride,
-                       2, clip_joints - 2, keep);
+    const auto *frames = p.clip.data.data();
+    layers::write_pose_interpolated(buffer + 2 * layers::pose_stride,
+                                    frames + static_cast<std::size_t>(frame) * p.clip.joints * floats_per_joint +
+                                        2 * floats_per_joint,
+                                    frames + static_cast<std::size_t>(next) * p.clip.joints * floats_per_joint +
+                                        2 * floats_per_joint,
+                                    alpha, 2, clip_joints - 2, keep);
     note_write();
 }
 } // namespace

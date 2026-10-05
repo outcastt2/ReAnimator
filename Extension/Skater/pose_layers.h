@@ -51,4 +51,11 @@ float ramp_weight(float weight, float target, std::uint64_t elapsed_ms, std::uin
 void write_pose(std::uintptr_t buffer, const float *frame, std::uint32_t first, std::uint32_t count,
                 float keep) noexcept;
 
+// The same write, interpolating between two clip frames: a clip authored at
+// 24 fps played back at 60 Hz snaps between frames otherwise, which reads as a
+// stutter. Pass the last frame and the first frame as the pair and the loop
+// closes without a jump.
+void write_pose_interpolated(std::uintptr_t buffer, const float *frame_a, const float *frame_b, float alpha,
+                             std::uint32_t first, std::uint32_t count, float keep) noexcept;
+
 } // namespace dingosdk::skater::layers

@@ -108,34 +108,62 @@ float ramp_weight(float weight, float target, std::uint64_t elapsed_ms, std::uin
     return weight;
 }
 
+namespace {
+// One joint: the clip's fields (or an interpolation of two clip frames) written
+// over the pose, honouring the mask and the layer ramp.
+void write_one(std::uintptr_t destination, const float *fields, bool masked, float keep) noexcept {
+    if (!masked || keep <= 0.0f) {
+        write_fields(destination, fields);
+        return;
+    }
+    if (keep >= 1.0f) return; // the game keeps this joint outright
+    // Mid-ramp: blend the buffer's own value -- the game's, written this frame --
+    // toward the clip.
+    auto *dst = reinterpret_cast<std::uint8_t *>(destination);
+    float game_scale[3], game_quat[4], game_pos[3];
+    std::memcpy(game_scale, dst + offset_scale, sizeof(game_scale));
+    std::memcpy(game_quat, dst + offset_quat, sizeof(game_quat));
+    std::memcpy(game_pos, dst + offset_pos, sizeof(game_pos));
+    const float weight = 1.0f - keep;
+    // Built in clip layout (scale, quat, pos) so it can go straight through the
+    // same writer as an untouched joint.
+    float value[clip_stride];
+    for (int c = 0; c < 3; ++c) {
+        value[c] = game_scale[c] * keep + fields[c] * weight;
+        value[7 + c] = game_pos[c] * keep + fields[7 + c] * weight;
+    }
+    blend_quat(game_quat, fields + 3, weight, value + 3);
+    write_fields(destination, value);
+}
+} // namespace
+
 void write_pose(std::uintptr_t buffer, const float *frame, std::uint32_t first, std::uint32_t count,
                 float keep) noexcept {
     for (std::uint32_t i = 0; i < count; ++i) {
         const auto joint = first + i;
-        const auto *src = frame + static_cast<std::size_t>(i) * clip_stride;
-        const auto destination = buffer + static_cast<std::size_t>(i) * pose_stride;
-        if (!joint_masked(joint) || keep <= 0.0f) {
-            write_fields(destination, src);
-            continue;
-        }
-        if (keep >= 1.0f) continue; // the game keeps this joint outright
-        // Mid-ramp: blend the buffer's own value -- the game's, written this
-        // frame -- toward the clip.
-        auto *dst = reinterpret_cast<std::uint8_t *>(destination);
-        float game_scale[3], game_quat[4], game_pos[3];
-        std::memcpy(game_scale, dst + offset_scale, sizeof(game_scale));
-        std::memcpy(game_quat, dst + offset_quat, sizeof(game_quat));
-        std::memcpy(game_pos, dst + offset_pos, sizeof(game_pos));
-        const float weight = 1.0f - keep;
-        // Built in clip layout (scale, quat, pos) so it can go straight through
-        // the same writer as an untouched joint.
-        float value[clip_stride];
+        write_one(buffer + static_cast<std::size_t>(i) * pose_stride,
+                  frame + static_cast<std::size_t>(i) * clip_stride, joint_masked(joint), keep);
+    }
+}
+
+void write_pose_interpolated(std::uintptr_t buffer, const float *frame_a, const float *frame_b, float alpha,
+                             std::uint32_t first, std::uint32_t count, float keep) noexcept {
+    const float t = alpha < 0.0f ? 0.0f : (alpha > 1.0f ? 1.0f : alpha);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const auto joint = first + i;
+        const auto *a = frame_a + static_cast<std::size_t>(i) * clip_stride;
+        const auto *b = frame_b + static_cast<std::size_t>(i) * clip_stride;
+        // A clip is authored at its own rate and the game runs at 60 Hz, so a
+        // whole-frame snap reads as a stutter. Interpolate, and let the caller
+        // pass the last frame and the first frame as the pair: that closes the
+        // loop without a jump.
+        float fields[clip_stride];
         for (int c = 0; c < 3; ++c) {
-            value[c] = game_scale[c] * keep + src[c] * weight;
-            value[7 + c] = game_pos[c] * keep + src[7 + c] * weight;
+            fields[c] = a[c] + (b[c] - a[c]) * t;
+            fields[7 + c] = a[7 + c] + (b[7 + c] - a[7 + c]) * t;
         }
-        blend_quat(game_quat, src + 3, weight, value + 3);
-        write_fields(destination, value);
+        blend_quat(a + 3, b + 3, t, fields + 3);
+        write_one(buffer + static_cast<std::size_t>(i) * pose_stride, fields, joint_masked(joint), keep);
     }
 }
 
