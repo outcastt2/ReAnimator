@@ -1,14 +1,20 @@
 #include "prop_attach.h"
 #include "Gestures/board_gesture_layout.h"
 #include "Extension/Multiplayer/Remote/native_pose_layout.h"
+#include "Engine/Core/Hooks/hooks.h"
 #include "Engine/Core/Log/logging.h"
 #include "Engine/Core/Platform/memory.h"
 #include "Engine/Game/Abi/native_data.h"
 #include "Engine/Game/Build/addresses.h"
+#include "Engine/Game/Build/supported_build.h"
 #include "Engine/Game/Build/20260929/engine.h"
+#include "Engine/Game/Build/20260929/skater_entities.h"
 #include <Windows.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cmath>
+#include <cstring>
 #include <format>
 #include <mutex>
 #include <string>
@@ -18,6 +24,7 @@ namespace dingosdk::skater {
 namespace {
 using Ptr = std::uintptr_t;
 namespace engine = game::build::v20260929::engine;
+namespace entities = addr::skater_entities;
 
 // Watch every client frame: a gesture request may be written and consumed
 // inside one frame, which a five-per-second sample would simply miss. The
@@ -87,6 +94,18 @@ struct State {
     std::array<Ptr, 3> poke_addresses{};
     std::array<std::uint32_t, 3> poke_old{};
     unsigned poke_overwrites{}, poke_rewrites{};
+    Ptr poke_rig{};
+    // The passive creation trace: hook the entity factory for a short window and
+    // keep blueprint, entity, thread and caller stack for every creation.
+    bool trace_pending{}, trace_off_pending{};
+    unsigned trace_seconds{90};
+    // The phone-blueprint resolve scan: the asset may only be resident while the
+    // phone is out, so check every second instead of only when the command runs.
+    bool derive_pending{};
+    unsigned derive_seconds{90};
+    bool deriving{};
+    ULONGLONG derive_until{}, derive_next{};
+    bool derive_seen{};
     std::vector<Region> regions;
     std::vector<Word> words;
     std::vector<std::pair<std::string, Ptr>> pending_regions;
@@ -108,6 +127,179 @@ Ptr pointer(Ptr address) noexcept {
     Ptr value{};
     memory::peek(address, value);
     return value;
+}
+
+// The creation trace. The native attachment owner cannot be found by scanning
+// resident state, so the game's own factory is watched instead: while a bounded
+// window is armed, every create_entity call records its blueprint, the returned
+// entity, the calling thread and a module-relative caller stack. The hook does
+// no logging and no allocation -- records go into a fixed ring and are drained
+// by the client tick -- and it always forwards the original ABI untouched.
+struct TraceRecord {
+    Ptr blueprint{}, entity{}, type{};
+    std::uint32_t thread{};
+    unsigned frames{};
+    void *stack[16]{};
+    char name[128]{};
+};
+constexpr unsigned trace_capacity = 256;
+constexpr unsigned trace_frames = 14;
+struct Trace {
+    std::mutex mutex;   // the hook only ever try_locks; the tick drain locks
+    std::array<TraceRecord, trace_capacity> records{};
+    unsigned write{}, read{};
+    std::atomic<unsigned> dropped{};
+    std::atomic<bool> armed{};
+    ULONGLONG until{};
+    void *target{};
+    void *original{};
+    bool prepared{}, installed{};
+};
+Trace &trace() {
+    static auto *value = new Trace;
+    return *value;
+}
+
+void *create_trace_hook(void *result, void *descriptor, std::uintptr_t blueprint, std::uintptr_t first,
+                        std::uintptr_t second) {
+    auto &t = trace();
+    using Create = void *(*)(void *, void *, std::uintptr_t, std::uintptr_t, std::uintptr_t);
+    auto *const value = reinterpret_cast<Create>(t.original)(result, descriptor, blueprint, first, second);
+    if (!t.armed.load(std::memory_order_relaxed)) return value;
+    TraceRecord record{};
+    record.blueprint = blueprint;
+    if (result) record.entity = *static_cast<std::uintptr_t *>(result);
+    if (blueprint) {
+        memory::peek(blueprint + 8, record.type);
+        Ptr text{};
+        // A failed name lookup must not erase the evidence: the blueprint
+        // pointer, its type and the stack are recorded either way.
+        if (memory::peek(blueprint + 0x18, text) && text) (void)memory::peek_cstring(text, record.name, sizeof(record.name));
+    }
+    record.thread = GetCurrentThreadId();
+    // Frame 0 is this hook's caller -- the game call site into create_entity.
+    record.frames = static_cast<unsigned>(CaptureStackBackTrace(1, trace_frames, record.stack, nullptr));
+    if (t.mutex.try_lock()) {
+        t.records[t.write % trace_capacity] = record;
+        ++t.write;
+        t.mutex.unlock();
+    } else {
+        t.dropped.fetch_add(1, std::memory_order_relaxed);
+    }
+    return value;
+}
+
+void log_trace_record(Ptr base, const TraceRecord &record) {
+    std::string type;
+    if (record.type) {
+        const bool in_game = base && record.type >= base && record.type - base < supported_build::game_image_size;
+        type = in_game ? std::format(" type=Skate+{:#x}", record.type - base)
+                       : std::format(" type={:#x}", record.type);
+    }
+    logging::log(logging::Level::info, logging::Channel::skater,
+                 "Hand props: trace: entity={:#x} blueprint={:#x}{} name=\"{}\" thread={}", record.entity,
+                 record.blueprint, type, record.name, record.thread);
+    std::string frames;
+    for (unsigned i = 0; i < record.frames; ++i) {
+        const auto address = reinterpret_cast<Ptr>(record.stack[i]);
+        if (base && address >= base && address - base < supported_build::game_image_size)
+            frames += std::format(" Skate+{:#x}", address - base);
+        else
+            frames += std::format(" {:#x}", address);
+    }
+    logging::log(logging::Level::info, logging::Channel::skater, "Hand props: trace:   callers:{}", frames);
+}
+
+void arm_trace(Ptr base, unsigned seconds) {
+    auto &t = trace();
+    auto *const target = reinterpret_cast<void *>(base + entities::create_entity);
+    if (!t.prepared) {
+        // Hook the exact function the build pins, after checking its bytes.
+        std::array<unsigned char, entities::create_entity_prefix.size()> actual{};
+        if (!memory::read_bytes(base + entities::create_entity, actual.data(), actual.size()) ||
+            actual != entities::create_entity_prefix) {
+            logging::log(logging::Level::warning, logging::Channel::skater,
+                         "Hand props: create_entity fingerprint changed; the trace was not installed.");
+            set_status("Hand props: create_entity fingerprint changed; trace not installed.");
+            return;
+        }
+        void *original{};
+        const auto status = hook_prepare(target, reinterpret_cast<void *>(&create_trace_hook), &original);
+        if (status != HookOk || !original) {
+            logging::log(logging::Level::warning, logging::Channel::skater,
+                         "Hand props: cannot prepare the creation trace ({}).", hook_status_string(status));
+            set_status(std::format("Hand props: cannot prepare the creation trace ({}).",
+                                   hook_status_string(status)));
+            return;
+        }
+        t.target = target;
+        t.original = original;
+        t.prepared = true;
+    }
+    if (!t.installed) {
+        const auto queued = hook_queue_enable(t.target);
+        if (queued != HookOk || hook_apply_queued() != HookOk) {
+            if (queued == HookOk) (void)hook_disable(t.target);
+            logging::log(logging::Level::warning, logging::Channel::skater,
+                         "Hand props: cannot enable the creation trace ({}).", hook_status_string(queued));
+            set_status(std::format("Hand props: cannot enable the creation trace ({}).",
+                                   hook_status_string(queued)));
+            return;
+        }
+        t.installed = true;
+    }
+    const auto window = seconds ? seconds : 90u;
+    {
+        std::lock_guard lock(t.mutex);
+        t.write = t.read = 0;
+        t.until = GetTickCount64() + window * 1000ULL;
+    }
+    t.dropped.store(0, std::memory_order_relaxed);
+    t.armed.store(true, std::memory_order_release);
+    logging::log(logging::Level::info, logging::Channel::skater,
+                 "Hand props: creation trace armed for {}s (create_entity is hooked; every creation is captured "
+                 "with its caller stack).", window);
+    set_status(std::format("Hand props: creation trace armed for {}s.", window));
+}
+
+void disarm_trace() {
+    auto &t = trace();
+    if (!t.armed.exchange(false)) {
+        set_status("Hand props: the creation trace is not armed.");
+        return;
+    }
+    logging::log(logging::Level::info, logging::Channel::skater,
+                 "Hand props: creation trace disarmed; captured records keep draining to the log.");
+    set_status("Hand props: creation trace disarmed.");
+}
+
+void drain_trace(Ptr base) {
+    auto &t = trace();
+    const auto now = GetTickCount64();
+    bool finished{};
+    if (t.armed.load(std::memory_order_acquire) && now >= t.until) {
+        t.armed.store(false, std::memory_order_release);
+        finished = true;
+    }
+    std::array<TraceRecord, 12> batch{};
+    std::size_t count{};
+    unsigned pending{};
+    {
+        std::lock_guard lock(t.mutex);
+        pending = t.write - t.read;
+        while (count < batch.size() && t.read != t.write) {
+            batch[count++] = t.records[t.read % trace_capacity];
+            ++t.read;
+        }
+    }
+    for (std::size_t i = 0; i < count; ++i) log_trace_record(base, batch[i]);
+    if (finished) {
+        const auto dropped = t.dropped.load(std::memory_order_relaxed);
+        logging::log(logging::Level::info, logging::Channel::skater,
+                     "Hand props: creation trace window over: {} record(s) captured{}.", pending,
+                     dropped ? std::format(", {} dropped (ring full)", dropped) : "");
+        set_status(std::format("Hand props: creation trace over; {} record(s) in the log.", pending));
+    }
 }
 
 // A gesture item, the way the board gesture pass reads it: cosmetics manager
@@ -331,6 +523,100 @@ Ptr find_named_asset(Ptr base, const char *name, bool &faulted) noexcept {
 // off against an idle phase.
 // One-off dump: the values we are hunting are small integers or floats, so show
 // both readings for every word.
+
+// The entity factory's type contract, the same walk ai_skaters uses before it
+// creates anything: object+8 is the object's TypeInfo, and +0x20 chains to the
+// base types. The phone is a plain mesh ObjectBlueprint, so unlike the build-kit
+// ECS prefab it may pass this check -- which is the precondition for ever
+// handing it to create_entity.
+Ptr object_type(Ptr object) noexcept {
+    Ptr type{};
+    memory::peek(object + 8, type);
+    return type;
+}
+bool derives(Ptr object, Ptr expected) {
+    auto type = object_type(object);
+    for (int depth = 0; depth < 16 && type; ++depth) {
+        if (type == expected) return true;
+        Ptr next{};
+        if (!memory::peek(type + 0x20, next)) return false;
+        type = next;
+    }
+    return false;
+}
+
+void report_derive(Ptr base, const char *queried, Ptr asset) {
+    std::array<char, 160> text{};
+    Ptr key{};
+    std::string name;
+    if (memory::peek(asset + 0x18, key) && key && memory::peek_cstring(key, text.data(), text.size()) >= 0)
+        name = text.data();
+    const bool is_blueprint = derives(asset, base + entities::blueprint_type);
+    logging::log(logging::Level::info, logging::Channel::skater,
+                 "Hand props: phone blueprint \"{}\" = {:#x} name=\"{}\" derives Blueprint: {}", queried, asset, name,
+                 is_blueprint ? "yes" : "no");
+    // The ancestry, so a no is as informative as a yes.
+    auto type = object_type(asset);
+    for (int depth = 0; depth < 10 && type; ++depth) {
+        if (type >= base && type - base < supported_build::game_image_size)
+            logging::log(logging::Level::info, logging::Channel::skater, "Hand props:   type[{}] Skate+{:#x}", depth,
+                         type - base);
+        else
+            logging::log(logging::Level::info, logging::Channel::skater, "Hand props:   type[{}] {:#x}", depth, type);
+        Ptr next{};
+        if (!memory::peek(type + 0x20, next)) break;
+        type = next;
+    }
+    set_status(std::format("Hand props: phone blueprint resident; derives Blueprint: {}.",
+                           is_blueprint ? "yes" : "no"));
+}
+
+void arm_derive(unsigned seconds) {
+    auto &s = state();
+    const auto window = seconds ? seconds : 90u;
+    s.deriving = true;
+    s.derive_seen = false;
+    s.derive_next = 0;
+    s.derive_until = GetTickCount64() + window * 1000ULL;
+    logging::log(logging::Level::info, logging::Channel::skater,
+                 "Hand props: resolving the phone blueprint every second for {}s; it may only be resident while the "
+                 "phone is out. Nothing is created or written.", window);
+    set_status(std::format("Hand props: phone blueprint scan armed for {}s.", window));
+}
+
+void service_derive(Ptr base) {
+    auto &s = state();
+    if (!s.deriving) return;
+    const auto now = GetTickCount64();
+    if (now >= s.derive_until) {
+        s.deriving = false;
+        if (!s.derive_seen) {
+            logging::log(logging::Level::info, logging::Channel::skater,
+                         "Hand props: the phone blueprint never resolved; it is not resident, even while the phone "
+                         "is out.");
+            set_status("Hand props: phone blueprint never resolved during the scan window.");
+        }
+        return;
+    }
+    if (s.derive_next && now < s.derive_next) return;
+    s.derive_next = now + 1000;
+    // Full path, both spellings: the engine names assets by path, and the short
+    // characters/props/phone/basicsmartphone form does not resolve.
+    static constexpr const char *names[] = {
+        "characters/props/phone/basicsmartphone/basicsmartphone",
+        "Characters/Props/Phone/basicSmartphone/basicSmartphone",
+    };
+    bool faulted{};
+    for (const char *name : names) {
+        if (const auto asset = find_named_asset(base, name, faulted)) {
+            s.derive_seen = true;
+            s.deriving = false;
+            report_derive(base, name, asset);
+            return;
+        }
+    }
+}
+
 bool write_u32(Ptr address, std::uint32_t value) noexcept {
     MEMORY_BASIC_INFORMATION region{};
     if (!VirtualQuery(reinterpret_cast<void *>(address), &region, sizeof(region)) || region.State != MEM_COMMIT ||
@@ -360,6 +646,7 @@ void arm_poke(Ptr base, Ptr client, unsigned seconds) {
         return;
     }
     static constexpr Ptr offsets[3] = {0x3d40, 0x3d68, 0x3d6c};
+    s.poke_rig = local.rig;
     for (std::size_t i = 0; i < 3; ++i) {
         const auto address = local.rig + offsets[i];
         std::uint32_t value{};
@@ -369,9 +656,12 @@ void arm_poke(Ptr base, Ptr client, unsigned seconds) {
         }
         float as_float{};
         std::memcpy(&as_float, &value, sizeof(as_float));
-        // A layer weight reads as a float in [0, 1]. Anything else means the
-        // instance layout moved, and writing blind is not worth the risk.
-        if (!std::isfinite(as_float) || as_float < -0.001f || as_float > 1.001f) {
+        // A layer weight reads as a normal float in [0, 1]. A subnormal also
+        // falls in the numeric range (0x0000f002), which is exactly the hole
+        // Codex flagged: it is a possible integer/flag word, not a weight, so
+        // the guard must reject it before any write.
+        if (!std::isfinite(as_float) || std::fpclassify(as_float) == FP_SUBNORMAL || as_float < 0.0f ||
+            as_float > 1.0f) {
             set_status(std::format("Hand props: rig+{:#x} reads {:#010x} ({:.6g}), not a weight; nothing written.",
                                    offsets[i], value, as_float));
             logging::log(logging::Level::warning, logging::Channel::skater,
@@ -721,6 +1011,25 @@ void request_prop_poke_stop() {
     s.poke_stop_pending = true;
     s.poke_pending = false;
 }
+void request_prop_trace(unsigned seconds) {
+    auto &s = state();
+    std::lock_guard lock(s.mutex);
+    s.trace_seconds = seconds;
+    s.trace_pending = true;
+    s.trace_off_pending = false;
+}
+void request_prop_trace_off() {
+    auto &s = state();
+    std::lock_guard lock(s.mutex);
+    s.trace_off_pending = true;
+    s.trace_pending = false;
+}
+void request_prop_derive(unsigned seconds) {
+    auto &s = state();
+    std::lock_guard lock(s.mutex);
+    s.derive_seconds = seconds;
+    s.derive_pending = true;
+}
 std::string prop_status() {
     std::lock_guard lock(status_mutex());
     return state().status;
@@ -731,11 +1040,14 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
         auto &s = state();
         std::string filter;
         bool want_report{}, want_watch{}, want_weight{}, want_pose{}, want_assets{}, want_poke{}, want_poke_stop{};
+        bool want_trace{}, want_trace_off{}, want_derive{};
         unsigned seconds{default_seconds};
         unsigned weight_seconds{};
         unsigned pose_seconds{};
         unsigned assets_seconds{};
         unsigned poke_seconds{};
+        unsigned trace_seconds{};
+        unsigned derive_seconds{};
         std::string assets_extra;
         {
             std::lock_guard lock(s.mutex);
@@ -746,22 +1058,30 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
             want_assets = s.assets_pending;
             want_poke = s.poke_pending;
             want_poke_stop = s.poke_stop_pending;
+            want_trace = s.trace_pending;
+            want_trace_off = s.trace_off_pending;
+            want_derive = s.derive_pending;
             filter = s.filter;
             seconds = s.watch_seconds;
             weight_seconds = s.weight_seconds;
             pose_seconds = s.pose_seconds;
             assets_seconds = s.assets_seconds;
             poke_seconds = s.poke_seconds;
+            trace_seconds = s.trace_seconds;
+            derive_seconds = s.derive_seconds;
             assets_extra = s.assets_extra;
             s.report_pending = s.watch_pending = s.weight_pending = s.pose_pending = s.assets_pending = false;
             s.poke_pending = s.poke_stop_pending = false;
+            s.trace_pending = s.trace_off_pending = s.derive_pending = false;
         }
         if (want_poke_stop) stop_poke(true);
         else if (want_poke) arm_poke(base, client, poke_seconds);
         if (s.poking) {
             // Hold the weights and count how often the graph puts them back.
             Local local;
-            if (!resolve_local(base, client, local) || !local.rig) {
+            if (!resolve_local(base, client, local) || !local.rig || local.rig != s.poke_rig) {
+                // A different rig means the saved addresses belong to a dead
+                // instance; restore is pointless, so release without writing.
                 stop_poke(false);
             } else {
                 constexpr std::uint32_t one = 0x3f800000;
@@ -778,6 +1098,13 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
                 if (GetTickCount64() >= s.poke_until) stop_poke(true);
             }
         }
+        if (want_trace_off) disarm_trace();
+        else if (want_trace) arm_trace(base, trace_seconds);
+        if (want_derive) arm_derive(derive_seconds);
+        // These run every tick: they are inert when idle and must keep working
+        // while no watch is armed.
+        service_derive(base);
+        drain_trace(base);
         if (want_report) report(base, filter);
         if (want_assets) arm_assets(base, client, assets_extra, assets_seconds);
         else if (want_pose) arm_pose(base, client, pose_seconds);

@@ -51,6 +51,15 @@ void request_prop_assets(std::string extra, unsigned seconds);
 // immediately.
 void request_prop_poke(unsigned seconds);
 void request_prop_poke_stop();
+// Passive creation trace: hook create_entity for `seconds` and record every
+// creation (blueprint, entity, thread, module-relative caller stack) in the log.
+// Nothing is created, modified or called by the trace. The off call disarms.
+void request_prop_trace(unsigned seconds);
+void request_prop_trace_off();
+// Passive resolve scan: check every second for `seconds` whether the phone's
+// mesh blueprint is resident, and report whether it derives the entity
+// factory's Blueprint type. Nothing is created or written.
+void request_prop_derive(unsigned seconds);
 std::string prop_status();
 // Per-frame service on the client thread, beside the other skater ticks.
 void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept;

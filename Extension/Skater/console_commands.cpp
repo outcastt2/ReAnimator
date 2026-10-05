@@ -217,7 +217,7 @@ void register_movement_commands(Commands &registry) {
     // Hand props: the game's own gesture props follow a custom animation, so the
     // trigger is what has to be found before anything is written.
     auto prop = action("prop",
-        "Hand props: prop | prop list [name] | prop watch [name] [seconds] | prop mark - gesture props that follow a custom pose",
+        "Hand props: prop | prop list [name] | prop watch [name] [seconds] | prop trace [seconds] - gesture props and their creation",
         Group::movement, {argument("mode", Type::text, true), argument("name", Type::text, true),
                           argument("seconds", Type::number, true)});
     prop.execution = Execution::local;
@@ -293,8 +293,29 @@ void register_movement_commands(Commands &registry) {
                 "s, then restoring. Watch your skater; 'prop poke off' restores now.");
             return;
         }
+        if (mode == "trace") {
+            if (text_at(1) == "off") {
+                skater::request_prop_trace_off();
+                out("Hand props: disarming the creation trace; captured records still drain to the log.");
+                return;
+            }
+            const auto seconds = number_at(1, 90u);
+            skater::request_prop_trace(seconds);
+            out("Hand props: arming the creation trace for " + std::to_string(seconds) +
+                "s. Idle a few seconds, then play the selfie (and the menu phone); every entity creation lands in "
+                "the log with its caller stack.");
+            return;
+        }
+        if (mode == "derive") {
+            const auto seconds = number_at(1, 90u);
+            skater::request_prop_derive(seconds);
+            out("Hand props: scanning for the phone blueprint every second for " + std::to_string(seconds) +
+                "s. Close the console and bring the phone out; the derive check is read-only.");
+            return;
+        }
         out("usage: prop | prop list [name] | prop watch [name] [seconds] | prop mark | prop weight [seconds] | "
-            "prop pose [seconds] | prop assets [asset] [seconds] | prop poke [seconds|off]");
+            "prop pose [seconds] | prop assets [asset] [seconds] | prop poke [seconds|off] | prop trace [seconds|off] | "
+            "prop derive [seconds]");
     };
     registry.add(std::move(prop));
 
