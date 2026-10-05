@@ -200,7 +200,7 @@ void register_movement_commands(Commands &registry) {
 
     // Route B: overwrite the local skater's pose with a baked custom animation.
     auto poseanim = action("poseanim",
-        "Play a custom animation on the local skater: poseanim test, poseanim <file>.rska, poseanim off",
+        "Custom animation: poseanim test | record | off | play | <file>.rska",
         Group::movement, {argument("clip", Type::text, true)});
     poseanim.execution = Execution::local;
     poseanim.inspect = [](const Model &) {

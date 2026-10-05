@@ -15,6 +15,9 @@ namespace dingosdk::skater {
 // else is a path to a .rska clip file.
 void request_pose_playback(std::string clip);
 void request_pose_playback_stop();
+// Record the live pose as it is evaluated, then play it back with "play".
+void request_pose_record();
+void request_pose_record_playback();
 std::string pose_playback_status();
 // Per-frame housekeeping on the client thread (start/stop, local component).
 void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept;

@@ -26,6 +26,8 @@ using nsd::readable;
 constexpr std::size_t skater_joint_bound = 512;
 constexpr std::uint16_t test_joint = 103; // head
 constexpr std::size_t floats_per_joint = 10; // scale.xyz, quat.xyzw, pos.xyz
+constexpr std::uint32_t expected_skater_joints = 395;
+constexpr std::uint32_t max_record_frames = 1800; // 30 s at 60 Hz
 
 // A clip is frames * joints * 10 floats.
 struct Clip {
@@ -49,6 +51,12 @@ struct Playback {
     // into an idle graph's output buffer does not outlive the animation.
     std::vector<std::byte> saved_pose;
     std::uint32_t saved_joints{};
+    // Recording: the live pose is captured as it is evaluated.
+    std::atomic<bool> recording{};
+    std::vector<float> record_data;
+    std::atomic<std::uint32_t> record_frames{};
+    std::uint32_t record_capacity{};
+    ULONGLONG record_started{};
 };
 Playback &playback() { static Playback p; return p; }
 std::mutex &status_mutex() { static std::mutex m; return m; }
@@ -132,11 +140,39 @@ void write_frame(std::uintptr_t buffer, const float *frame, std::uint32_t joints
 }
 } // namespace
 
+// Packs one evaluated pose into the clip format: scale.xyz, quat.xyzw, pos.xyz.
+namespace {
+void pack_frame(std::uintptr_t buffer, std::uint32_t joints, float *out) noexcept {
+    std::array<std::byte, expected_skater_joints * 0x30> raw{};
+    const auto bytes = static_cast<std::size_t>(joints) * 0x30;
+    if (bytes > raw.size() || !readable(buffer, raw.data(), bytes)) return;
+    for (std::uint32_t j = 0; j < joints; ++j) {
+        const auto *bone = reinterpret_cast<const float *>(raw.data() + static_cast<std::size_t>(j) * 0x30);
+        float *dst = out + static_cast<std::size_t>(j) * floats_per_joint;
+        dst[0] = bone[0]; dst[1] = bone[1]; dst[2] = bone[2];
+        dst[3] = bone[4]; dst[4] = bone[5]; dst[5] = bone[6]; dst[6] = bone[7];
+        dst[7] = bone[8]; dst[8] = bone[9]; dst[9] = bone[10];
+    }
+}
+} // namespace
+
 void on_pose_evaluated(std::uintptr_t component) noexcept {
     try {
         auto &p = playback();
-        if (!p.playing.load(std::memory_order_acquire)) return;
         if (component != p.component.load(std::memory_order_acquire)) return;
+        if (p.recording.load(std::memory_order_acquire)) {
+            const auto rec = pose_location(p.base, component);
+            if (!rec.buffer || !rec.joints) return;
+            const auto frame = p.record_frames.load(std::memory_order_relaxed);
+            if (frame >= p.record_capacity) return;
+            auto *dst = p.record_data.data() + static_cast<std::size_t>(frame) * rec.joints * floats_per_joint;
+            pack_frame(rec.buffer, rec.joints, dst);
+            p.record_frames.store(frame + 1, std::memory_order_release);
+            if (frame == 0)
+                logging::log(logging::Level::info, logging::Channel::skater, "Custom animation: recording.");
+            return; // Never overwrite the pose while recording it.
+        }
+        if (!p.playing.load(std::memory_order_acquire)) return;
         const auto pose = pose_location(p.base, component);
         const auto buffer = pose.buffer;
         if (!buffer) return;
@@ -186,6 +222,8 @@ void request_pose_playback_stop() {
     playback().stop = true;
     playback().pending = false;
 }
+void request_pose_record() { request_pose_playback("record"); }
+void request_pose_record_playback() { request_pose_playback("play"); }
 std::string pose_playback_status() {
     std::lock_guard lock(status_mutex());
     return playback().status;
@@ -205,6 +243,15 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
             p.pending = p.stop = false;
         }
         if (stop) {
+            if (p.recording.load(std::memory_order_acquire)) {
+                const auto frames = p.record_frames.load(std::memory_order_acquire);
+                p.recording.store(false, std::memory_order_release);
+                p.component.store(0, std::memory_order_release);
+                set_status("Recording stopped (" + std::to_string(frames) + " frames). Run poseanim play.");
+                logging::log(logging::Level::info, logging::Channel::skater,
+                             "Custom animation: recording stopped after {} frames.", frames);
+                return;
+            }
             p.playing.store(false, std::memory_order_release);
             // Put the pose captured at start back over the output buffer. Joint
             // 1 carries world placement, so it is left alone: restoring it would
@@ -244,6 +291,79 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
         const auto component = local_component(base, client);
         if (!component) {
             set_status("Custom animation: the local skater's animation component is unavailable.");
+            return;
+        }
+        if (pending_clip == "record") {
+            std::string detail;
+            if (!multiplayer::install_entity_hooks(base, detail)) {
+                set_status("Custom animation: the animation hook is unavailable: " + detail);
+                return;
+            }
+            multiplayer::set_pose_playback_listener(&on_pose_evaluated);
+            p.base = base;
+            p.component.store(component, std::memory_order_release);
+            p.playing.store(false, std::memory_order_release);
+            p.recording.store(false, std::memory_order_release);
+            {
+                std::lock_guard lock(p.mutex);
+                p.clip = {};
+            }
+            p.record_data.assign(
+                static_cast<std::size_t>(max_record_frames) * expected_skater_joints * floats_per_joint, 0.0f);
+            p.record_capacity = max_record_frames;
+            p.record_frames.store(0, std::memory_order_release);
+            p.record_started = GetTickCount64();
+            p.saved_pose.clear();
+            p.saved_joints = 0;
+            p.recording.store(true, std::memory_order_release);
+            set_status("Recording the pose; run poseanim off to stop.");
+            logging::log(logging::Level::info, logging::Channel::skater, "Custom animation: recording started.");
+            return;
+        }
+        if (pending_clip == "play") {
+            const auto frames = p.record_frames.load(std::memory_order_acquire);
+            if (frames < 2) {
+                set_status("Custom animation: nothing has been recorded yet.");
+                return;
+            }
+            std::string detail;
+            if (!multiplayer::install_entity_hooks(base, detail)) {
+                set_status("Custom animation: the animation hook is unavailable: " + detail);
+                return;
+            }
+            multiplayer::set_pose_playback_listener(&on_pose_evaluated);
+            p.base = base;
+            p.component.store(component, std::memory_order_release);
+            p.recording.store(false, std::memory_order_release);
+            Clip clip;
+            clip.joints = expected_skater_joints;
+            clip.frames = frames;
+            const auto elapsed = GetTickCount64() - p.record_started;
+            clip.fps = elapsed > 0
+                ? static_cast<float>(static_cast<double>(frames) * 1000.0 / static_cast<double>(elapsed)) : 60.0f;
+            if (clip.fps < 1.0f || clip.fps > 240.0f) clip.fps = 60.0f;
+            clip.data.assign(p.record_data.begin(),
+                             p.record_data.begin() + static_cast<std::size_t>(frames) * clip.joints * floats_per_joint);
+            const auto fps = clip.fps;
+            {
+                std::lock_guard lock(p.mutex);
+                p.clip = std::move(clip);
+            }
+            p.test.store(false, std::memory_order_relaxed);
+            p.clip_name = "recorded";
+            p.saved_pose.clear();
+            p.saved_joints = 0;
+            if (const auto pose = pose_location(base, component); pose.buffer && pose.joints > 2) {
+                p.saved_pose.resize(static_cast<std::size_t>(pose.joints) * 0x30);
+                if (readable(pose.buffer, p.saved_pose.data(), p.saved_pose.size())) p.saved_joints = pose.joints;
+                else p.saved_pose.clear();
+            }
+            p.writes.store(0, std::memory_order_release);
+            p.started = GetTickCount64();
+            p.playing.store(true, std::memory_order_release);
+            set_status("Playing the recorded pose (" + std::to_string(frames) + " frames).");
+            logging::log(logging::Level::info, logging::Channel::skater,
+                         "Custom animation: playing the recorded pose ({} frames, {:.1f} fps).", frames, fps);
             return;
         }
         if (pending_test) {
