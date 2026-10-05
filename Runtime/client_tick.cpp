@@ -26,6 +26,7 @@
 #include "Extension/Skater/ai_skaters.h"
 #include "Extension/Skater/effect_attach.h"
 #include "Extension/Skater/custom_animation.h"
+#include "Extension/Skater/prop_attach.h"
 #include "Extension/Skater/client_source_spawn.h"
 #include "Extension/Skater/skater_slot_override.h"
 #include "Extension/Throwdowns/native_throwdowns.h"
@@ -264,6 +265,8 @@ void update_model(std::uintptr_t client, TickState& frame) {
     frame.game_type = game_type;
     // Prototype effect attach: keep a spawned effect on the skater's head.
     if (state == 13 || state == 21) dingosdk::skater::tick_effect_attach(r.base, client);
+    // Hand props: find the gesture items whose props follow a custom pose.
+    if (state == 13 || state == 21) dingosdk::skater::tick_prop_attach(r.base, client);
     // Route B: custom animation playback on the local skater.
     if (state == 13 || state == 21) dingosdk::skater::tick_pose_playback(r.base, client);
     // Some two dozen native reads: one result serves the whole tick.

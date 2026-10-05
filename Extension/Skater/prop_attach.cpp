@@ -1,0 +1,296 @@
+#include "prop_attach.h"
+#include "Gestures/board_gesture_layout.h"
+#include "Engine/Core/Log/logging.h"
+#include "Engine/Core/Platform/memory.h"
+#include "Engine/Game/Build/addresses.h"
+#include "Engine/Game/Build/20260929/engine.h"
+#include <Windows.h>
+#include <algorithm>
+#include <array>
+#include <format>
+#include <mutex>
+#include <string>
+#include <vector>
+
+namespace dingosdk::skater {
+namespace {
+using Ptr = std::uintptr_t;
+namespace engine = game::build::v20260929::engine;
+
+// Field-watch cadence: a gesture press lasts a couple of seconds, so five
+// samples a second is twenty chances to catch the transition, and the cost is a
+// couple of thousand peeks a second against state that is already hot.
+constexpr unsigned watch_hz = 5;
+constexpr unsigned item_scan_bytes = 0x60;  // each gesture item's interesting head
+constexpr unsigned max_watch_items = 64;    // sampled items, not a hard limit on discovery
+constexpr unsigned max_changes = 400;       // the log is a finding, not a trace
+constexpr unsigned default_seconds = 15;
+
+struct Item {
+    std::string name;
+    std::uint32_t hash{};
+    Ptr asset{}, data{};
+    std::int32_t id{-1};
+    std::uint8_t layered{}, stationary{};
+};
+struct Local {
+    Ptr player{}, entity{}, component{}, holder{}, rig{};
+};
+struct Region {
+    std::string name;
+    Ptr address{};
+};
+struct Word {
+    Ptr address{};
+    std::uint32_t value{};
+    unsigned region{};
+};
+struct State {
+    std::mutex mutex;
+    std::string status{"Hand props: nothing requested yet."};
+    bool report_pending{}, watch_pending{};
+    std::string filter;
+    unsigned watch_seconds{default_seconds};
+    // Live watch: touched only from the client tick.
+    bool watching{};
+    ULONGLONG watch_until{};
+    ULONGLONG next_sample{};
+    std::vector<Region> regions;
+    std::vector<Word> words;
+    unsigned changes{}, lines{};
+};
+State &state() {
+    static auto *value = new State;
+    return *value;
+}
+std::mutex &status_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+void set_status(const std::string &text) {
+    std::lock_guard lock(status_mutex());
+    state().status = text;
+}
+Ptr pointer(Ptr address) noexcept {
+    Ptr value{};
+    memory::peek(address, value);
+    return value;
+}
+
+// A gesture item, the way the board gesture pass reads it: cosmetics manager
+// hash table -> node {hash, asset, next} -> asset {key +0x38, hash +0x48,
+// data +0x28} -> data {vtable, type, game state +0x18, id +0x20, layered +0x24,
+// stationary +0x25}. `filter` only decides which loaded items are interesting.
+bool item_from_asset(Ptr base, Ptr asset, std::uint32_t hash, const std::string &filter, Item &out) {
+    Ptr key{}, data{}, vtable{}, type{};
+    std::uint32_t stored{};
+    std::array<char, 128> text{};
+    if (!memory::peek(asset + 0x38, key) || !memory::peek(asset + 0x48, stored) || stored != hash) return false;
+    if (memory::peek_cstring(key, text.data(), text.size()) < 0 || text[0] == '\0') return false;
+    std::string name(text.data());
+    if (!name.starts_with("own_rctn_gesture_all_")) return false;
+    if (!filter.empty() && name.find(filter) == std::string::npos) return false;
+    if (!memory::peek(asset + 0x28, data) || !(data &= ~Ptr{4})) return false;
+    if (!memory::peek(data, vtable) || vtable != base + board_gesture::layout::item_vtable) return false;
+    if (!memory::peek(data + 8, type) || type != base + board_gesture::layout::item_type) return false;
+    out.name = std::move(name);
+    out.hash = hash;
+    out.asset = asset;
+    out.data = data;
+    memory::peek(data + 0x20, out.id);
+    memory::peek(data + 0x24, out.layered);
+    memory::peek(data + 0x25, out.stationary);
+    return true;
+}
+std::vector<Item> discover(Ptr base, const std::string &filter) {
+    std::vector<Item> result;
+    Ptr manager{}, buckets{};
+    std::uint32_t bucket_count{}, item_count{};
+    std::uint8_t ready{};
+    if (!memory::peek(base + engine::cosmetics_manager, manager) || !manager) return result;
+    Ptr vtable{};
+    if (!memory::peek(manager, vtable) || vtable != base + engine::cosmetics_manager_vtable) return result;
+    if (!memory::peek(manager + 0xa8, ready) || ready != 1) return result;
+    if (!memory::peek(manager + 0x30, buckets) || !buckets) return result;
+    if (!memory::peek(manager + 0x38, bucket_count) || !bucket_count || bucket_count > 16384) return result;
+    if (!memory::peek(manager + 0x3c, item_count) || !item_count || item_count > 8192) return result;
+    std::uint32_t visited = 0;
+    for (std::uint32_t bucket = 0; bucket < bucket_count; ++bucket) {
+        Ptr node{};
+        if (!memory::peek(buckets + std::uintptr_t{bucket} * 8, node)) return result;
+        while (node) {
+            if (++visited > item_count) return result;
+            std::uint32_t hash{};
+            Ptr asset{}, next{};
+            if (!memory::peek(node, hash) || !memory::peek(node + 8, asset) || !memory::peek(node + 0x10, next)) return result;
+            Item item;
+            if (item_from_asset(base, asset & ~Ptr{4}, hash, filter, item)) result.push_back(std::move(item));
+            node = next;
+        }
+    }
+    return result;
+}
+
+bool resolve_local(Ptr base, Ptr client, Local &out) {
+    std::uint32_t offset{};
+    if (!client || pointer(client) != base + engine::client_vtable) return false;
+    const auto context = pointer(client + 8);
+    if (!context || !memory::peek(base + engine::context_player_manager_offset, offset) || offset > 0x1000000)
+        return false;
+    const auto manager = pointer(context + offset);
+    if (!manager || pointer(manager) != base + engine::local_player_manager_vtable) return false;
+    const auto begin = pointer(manager + 0x4c8), end = pointer(manager + 0x4d0);
+    if (!begin || end != begin + 8) return false;
+    out.player = pointer(begin);
+    if (!out.player || pointer(out.player) != base + engine::local_player_vtable) return false;
+    out.entity = pointer(out.player + 0xb8);
+    if (!out.entity || pointer(out.entity) != base + engine::skater_entity_vtable) return false;
+    out.component = pointer(out.entity + 0x628);
+    if (!out.component || pointer(out.component) != base + engine::skater_component_vtable) return false;
+    out.holder = pointer(out.component + 0xa0);
+    out.rig = out.holder ? pointer(out.holder + 0x78) : 0;
+    return true;
+}
+
+void add_region(State &s, std::string name, Ptr address, std::size_t bytes) {
+    if (!address) return;
+    s.regions.push_back({std::move(name), address});
+    const auto region = static_cast<unsigned>(s.regions.size() - 1);
+    for (std::size_t offset = 0; offset + 4 <= bytes; offset += 4) {
+        std::uint32_t value{};
+        if (!memory::peek(address + offset, value)) continue;
+        s.words.push_back({address + offset, value, region});
+    }
+}
+
+void report(Ptr base, const std::string &filter) {
+    const auto items = discover(base, filter);
+    logging::log(logging::Level::info, logging::Channel::skater,
+                 "Hand props: {} gesture item(s) loaded{}.", items.size(),
+                 filter.empty() ? "" : " matching \"" + filter + "\"");
+    for (const auto &item : items) {
+        logging::log(logging::Level::info, logging::Channel::skater,
+                     "Hand props: {} id={} layered={} stationary={} data={:#x} hash={}",
+                     item.name, item.id, item.layered, item.stationary, item.data, item.hash);
+    }
+    set_status(std::format("Hand props: {} gesture item(s){}; ids in the log.", items.size(),
+                           filter.empty() ? "" : " matching \"" + filter + "\""));
+}
+
+void arm(Ptr base, Ptr client, const std::string &filter, unsigned seconds) {
+    auto &s = state();
+    Local local;
+    if (!resolve_local(base, client, local)) {
+        set_status("Hand props: the local skater is not ready to watch.");
+        return;
+    }
+    s.regions.clear();
+    s.words.clear();
+    s.changes = s.lines = 0;
+    const auto items = discover(base, filter);
+    for (const auto &item : items)
+        add_region(s, "item " + item.name.substr(std::string("own_rctn_gesture_all_").size()), item.data,
+                   item_scan_bytes);
+    add_region(s, "player", local.player, 0x200);
+    add_region(s, "skater", local.entity, 0x120);
+    add_region(s, "anim", local.component, 0x120);
+    add_region(s, "holder", local.holder, 0x80);
+    add_region(s, "rig", local.rig, 0x100);
+    if (s.words.empty()) {
+        set_status("Hand props: no state to watch yet; load a map first.");
+        return;
+    }
+    const auto window = seconds ? seconds : default_seconds;
+    s.watching = true;
+    s.watch_until = GetTickCount64() + window * 1000ULL;
+    s.next_sample = 0;
+    logging::log(logging::Level::info, logging::Channel::skater,
+                 "Hand props: watching {} words over {} region(s) for {}s{}. Press the gesture now.",
+                 s.words.size(), s.regions.size(), window, filter.empty() ? "" : " (filter \"" + filter + "\")");
+    set_status(std::format("Hand props: watching {} words for {}s{}; press the gesture now.", s.words.size(),
+                           window, filter.empty() ? "" : ", filtered to " + filter));
+}
+
+void sample() {
+    auto &s = state();
+    const auto now = GetTickCount64();
+    for (auto &word : s.words) {
+        std::uint32_t value{};
+        if (!memory::peek(word.address, value) || value == word.value) continue;
+        ++s.changes;
+        if (s.lines < max_changes) {
+            ++s.lines;
+            logging::log(logging::Level::info, logging::Channel::skater,
+                         "Hand props: change {} +{:#x} {} -> {} ({}s left)", s.regions[word.region].name,
+                         static_cast<unsigned>(word.address - s.regions[word.region].address), word.value, value,
+                         s.watch_until > now ? static_cast<unsigned>((s.watch_until - now) / 1000) : 0);
+        }
+        word.value = value;
+    }
+    if (now >= s.watch_until) {
+        s.watching = false;
+        logging::log(logging::Level::info, logging::Channel::skater,
+                     "Hand props: watch finished with {} change(s){}; look for a field that became a gesture id.",
+                     s.changes, s.lines < s.changes ? " (some not logged)" : "");
+        set_status(std::format("Hand props: watch finished with {} change(s); see the log.", s.changes));
+    }
+}
+} // namespace
+
+void request_prop_report(std::string filter) {
+    auto &s = state();
+    std::lock_guard lock(s.mutex);
+    s.filter = std::move(filter);
+    s.report_pending = true;
+}
+void request_prop_watch(std::string filter, unsigned seconds) {
+    auto &s = state();
+    std::lock_guard lock(s.mutex);
+    s.filter = std::move(filter);
+    s.watch_seconds = seconds;
+    s.watch_pending = true;
+}
+std::string prop_status() {
+    std::lock_guard lock(status_mutex());
+    return state().status;
+}
+
+void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
+    try {
+        auto &s = state();
+        std::string filter;
+        bool want_report{}, want_watch{};
+        unsigned seconds{default_seconds};
+        {
+            std::lock_guard lock(s.mutex);
+            want_report = s.report_pending;
+            want_watch = s.watch_pending;
+            filter = s.filter;
+            seconds = s.watch_seconds;
+            s.report_pending = s.watch_pending = false;
+        }
+        if (want_report) report(base, filter);
+        if (want_watch) arm(base, client, filter, seconds);
+        if (!s.watching) return;
+        // A level change invalidates every address the watch holds; stop rather
+        // than keep reading a freed context.
+        Local local;
+        if (!resolve_local(base, client, local)) {
+            s.watching = false;
+            logging::log(logging::Level::info, logging::Channel::skater,
+                         "Hand props: watch stopped, the local skater went away.");
+            set_status("Hand props: watch stopped (the skater went away).");
+            return;
+        }
+        const auto now = GetTickCount64();
+        if (now < s.next_sample) return;
+        s.next_sample = now + 1000 / watch_hz;
+        sample();
+    } catch (const std::exception &e) {
+        set_status(std::string("Hand props: ") + e.what());
+    } catch (...) {
+        set_status("Hand props: unknown failure.");
+    }
+}
+
+} // namespace dingosdk::skater

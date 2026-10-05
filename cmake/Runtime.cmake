@@ -114,6 +114,7 @@ add_library(dingosdk_runtime SHARED
     Extension/Skater/effect_attach.cpp
     Extension/Skater/custom_animation.cpp
     Extension/Skater/pose_layers.cpp
+    Extension/Skater/prop_attach.cpp
     Extension/Skater/no_bail.cpp
     Extension/Skater/physics_tuning.cpp
     Extension/Multiplayer/Remote/remote_collision.cpp

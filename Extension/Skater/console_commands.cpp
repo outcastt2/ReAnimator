@@ -5,6 +5,7 @@
 #include "Skitch/player_skitch.h"
 #include "effect_attach.h"
 #include "custom_animation.h"
+#include "prop_attach.h"
 #include <format>
 #include <string>
 namespace dingosdk::console {
@@ -212,6 +213,33 @@ void register_movement_commands(Commands &registry) {
         out(skater::asset_loaded_report(std::get<std::string>(args[0])));
     };
     registry.add(std::move(findasset));
+
+    // Hand props: the game's own gesture props follow a custom animation, so the
+    // trigger is what has to be found before anything is written.
+    auto prop = action("prop",
+        "Hand props: prop | prop list [name] | prop watch [name] [seconds] - the gesture props that follow a custom pose",
+        Group::movement, {argument("mode", Type::text, true), argument("name", Type::text, true),
+                          argument("seconds", Type::number, true)});
+    prop.execution = Execution::local;
+    prop.inspect = [](const Model &) { return State{true, {}, {}, skater::prop_status(), false}; };
+    prop.run = [](const Model &, const Values &args, const Output &out) {
+        const auto mode = args.empty() ? std::string{} : lower(std::get<std::string>(args[0]));
+        const auto name = args.size() > 1 ? lower(std::get<std::string>(args[1])) : std::string{};
+        if (mode.empty() || mode == "list") {
+            skater::request_prop_report(name);
+            out("Hand props: listing the loaded gesture items in the log...");
+            return;
+        }
+        if (mode == "watch") {
+            const auto seconds = args.size() > 2 ? static_cast<unsigned>(std::get<double>(args[2])) : 15u;
+            skater::request_prop_watch(name, seconds);
+            out("Hand props: watching engine state for " + std::to_string(seconds) +
+                "s; press the gesture now and read the log.");
+            return;
+        }
+        out("usage: prop | prop list [name] | prop watch [name] [seconds]");
+    };
+    registry.add(std::move(prop));
 
     // Route B: overwrite the local skater's pose with a baked custom animation.
     auto poseanim = action("poseanim",
