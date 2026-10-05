@@ -101,6 +101,11 @@ add_library(dingosdk_runtime SHARED
     Extension/Skater/client_source_spawn.cpp
     Extension/Skater/source_spawn_camera.cpp
     Extension/Skater/client_noclip.cpp
+    Extension/Skater/Gestures/board_gesture.cpp
+    Extension/Skater/Gestures/board_gesture_routes.cpp
+    Extension/Skater/Skitch/player_skitch.cpp
+    Extension/Skater/Skitch/hip_targets.cpp
+    Extension/Skater/Skitch/tow_controller.cpp
     Extension/Skater/client_first_person.cpp
     Extension/Skater/client_debug.cpp
     Extension/Skater/ai_skaters.cpp
@@ -180,6 +185,8 @@ target_link_libraries(dingosdk_custom_level_manifest PUBLIC dingosdk_json)
 target_link_libraries(dingosdk_runtime PRIVATE dingosdk_custom_level_manifest)
 
 set_target_properties(dingosdk_runtime PROPERTIES OUTPUT_NAME "ReSkate" PREFIX "")
+add_executable(skateskitch_cosmetic_tests Extension/Skater/Skitch/cosmetic_inventory_tests.cpp)
+target_link_libraries(skateskitch_cosmetic_tests PRIVATE dingosdk_local_profile)
 dingosdk_version_info(dingosdk_runtime "ReSkate mod runtime" "ReSkate.dll" VFT_DLL)
 target_include_directories(dingosdk_runtime SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/External/steam_networking")
 target_link_libraries(dingosdk_runtime PRIVATE dingosdk_lz4 dingosdk_zstd)
@@ -224,3 +231,9 @@ if(EXISTS "${dingosdk_startup_art}")
         "STARTUP_SPLASH RCDATA \"${dingosdk_startup_art_native}\"\n")
     target_sources(dingosdk_runtime PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated/startup_art.rc")
 endif()
+
+add_executable(boardgesture_guard_tests Extension/Skater/Gestures/board_gesture_tests.cpp
+    Extension/Skater/Gestures/board_gesture.cpp Extension/Skater/Gestures/board_gesture_routes.cpp
+    Extension/Skater/Gestures/board_gesture_route_tests.cpp)
+target_include_directories(boardgesture_guard_tests PRIVATE "${PROJECT_SOURCE_DIR}")
+target_link_libraries(boardgesture_guard_tests PRIVATE dingosdk_logging)

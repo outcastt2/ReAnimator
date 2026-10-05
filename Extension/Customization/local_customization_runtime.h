@@ -24,6 +24,10 @@ struct CosmeticRuntime {
     // saves keep the original item unless the player changes that slot.
     struct HeldSlot { std::size_t recipe{}; profile::CosmeticSlot saved; std::string fallback; };
     std::map<std::string, std::vector<HeldSlot>, std::less<>> held_slots;
+    // Cosmetic slot hash to slot name, read from the character's recipe template on
+    // load. The recipes carry hashes only, so this is the sole way to name a slot for
+    // a command or for a hidden-slot policy entry.
+    std::map<std::uint32_t, std::string> slot_names;
     std::set<std::string> diagnostics;
     DWORD update_thread{};
     // Bumped whenever `items` is rebuilt (a live mod apply changes what is
@@ -87,6 +91,16 @@ template<class T> struct CosmeticBorrowedArray {
 };
 
 bool cosmetic_slot_categories(std::uintptr_t resource, std::map<std::uint32_t, std::uint32_t>& result);
+
+// Cosmetic slots the character wears nothing in, whatever preset is saved. The
+// names are only known once a character's recipe has been read, so all three
+// return empty or false until a level has loaded.
+std::vector<std::string> cosmetic_slot_names();
+std::vector<std::string> hidden_cosmetic_slots();
+// Accepts the slot's own name ("cust_shoes") or an unambiguous short form
+// ("shoes"). Returns false, without touching the profile, if the slot is unknown
+// or the short form matches more than one slot.
+bool set_cosmetic_slot_hidden(std::string_view slot, bool hidden);
 
 struct StarterTemplate {
     const char* name;

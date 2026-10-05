@@ -1,4 +1,6 @@
 #include "session_internal.h"
+#include "Extension/Skater/Skitch/player_skitch.h"
+#include "Extension/Skater/Skitch/reskate_pose_bridge.h"
 #include "Extension/Multiplayer/Hud/native_player_ui.h"
 #include "Extension/Multiplayer/Hud/native_indicators.h"
 #include "Extension/Multiplayer/Hud/native_party.h"
@@ -374,7 +376,9 @@ std::uint64_t far_sample_interval(const Peer &p, float distance) {
     return 0;
 }
 void render(Session &s, std::uintptr_t client, const NativeFrame &local, std::uint64_t now) {
-    if (!world_playing(s, local)) return;
+    if (!world_playing(s, local)) { player_skitch::suspend(); return; }
+    std::vector<skateskitch::TowCandidate> skitch_candidates;
+    const skateskitch::WorldKey skitch_world{s.secret, s.map, s.world};
     const auto view = latest_game_view();
     // ReSkate's nametags: every shown player, placed above their head each frame.
     std::vector<NametagPlayer> nametags;
@@ -487,6 +491,10 @@ void render(Session &s, std::uintptr_t client, const NativeFrame &local, std::ui
                     }
                     apply_cosmetics(p, spawning);
                 } else if (p.visible) {
+                    if (const auto target = skateskitch::remote_sample(p.render_pose,
+                        {p.member.id,p.member.epoch,remote_skater_generation()}, skitch_world,
+                        p.pose_arrival,p.visible,p.handshaken && p.world_ready,hidden || spot.has_value(),s.mode==Mode::echo))
+                        skitch_candidates.push_back({*target,p.render_pose.root.rotation});
                     present_audio(p);
                     apply_cosmetics(p, spawning);
                     // The spectate camera follows this every frame; the map and
@@ -526,6 +534,7 @@ void render(Session &s, std::uintptr_t client, const NativeFrame &local, std::ui
             }
         }
     });
+    player_skitch::tick(s.base,client,local,skitch_world,s.transport.status().local_id,now,skitch_candidates);
     if (labels)
         publish_custom_nametags(s.base, std::move(nametags),
                                 local.ready ? std::optional(local.pose.root.position) : std::nullopt);
@@ -683,6 +692,7 @@ void tick(std::uintptr_t base, std::uintptr_t client, bool ready, std::string_vi
             erase_password(s.lobby_password);
         expire_remote_collision(base, now_us());
         if (s.mode == Mode::off) {
+            player_skitch::suspend();
             physics_tuning::release(base); // the player's own tuning again after a session
             set_session_tuning_enforced(false);
             relay_throwdowns(s, ready);
@@ -821,9 +831,11 @@ void tick(std::uintptr_t base, std::uintptr_t client, bool ready, std::string_vi
             }
             s.client_timing.record(ClientTiming::publish, diagnostics_at, now_us());
         } else {
+            player_skitch::suspend();
             publish(s, &local);
         }
     } catch (const std::exception &e) {
+        player_skitch::suspend();
         stop(s, std::string("Multiplayer stopped: ") + e.what());
         publish(s);
     }

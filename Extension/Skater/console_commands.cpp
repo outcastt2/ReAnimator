@@ -1,9 +1,24 @@
+#include "Gestures/board_gesture.h"
 #include "Extension/Console/commands.h"
 #include "Extension/Profile/local_profile_runtime.h"
 #include "ai_skaters.h"
+#include "Skitch/player_skitch.h"
 #include <format>
 namespace dingosdk::console {
 void register_movement_commands(Commands &registry) {
+    auto skitch = variable("skitch", "Player hip towing: hold V or LB+RB nearby", Group::movement, argument("0|1", Type::boolean));
+    skitch.inspect = [](const Model&) { return boolean_state(true,player_skitch::enabled(),{},player_skitch::status()); };
+    skitch.run = [](const Model&,const Values& args,const Output&) { player_skitch::set_enabled(std::get<bool>(args[0])); };
+    skitch.reset = [](const Model&,const Output&) { player_skitch::set_enabled(false); };
+    registry.add(std::move(skitch));
+    auto gesture = action("boardgesture", "Show automatic board gesture status; 0 disables, 1 enables", Group::movement, {argument("0|1", Type::boolean,true)});
+    gesture.inspect = [](const Model&) { return boolean_state(true,board_gesture::enabled(),{},board_gesture::status()); };
+    gesture.run = [](const Model&,const Values& args,const Output& out) {
+        if(!args.empty()) board_gesture::set_enabled(std::get<bool>(args[0]));
+        out(std::string("Board gesture ")+(board_gesture::enabled() ? "enabled: " : "disabled: ")+board_gesture::status());
+    };
+    gesture.reset = [](const Model&,const Output&) { board_gesture::set_enabled(false); };
+    registry.add(std::move(gesture));
     using Debug = overlay::DebugAction;
     struct Setting {
         const char *name;

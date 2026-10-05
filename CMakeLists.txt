@@ -147,6 +147,7 @@ if(DINGOSDK_BUILD_MULTIPLAYER_TESTS AND WIN32)
     target_link_libraries(dingosdk_multiplayer_lobby_tests PRIVATE dingosdk_word_filter)
     add_test(NAME multiplayer_lobbies COMMAND dingosdk_multiplayer_lobby_tests)
     add_executable(dingosdk_multiplayer_mesh_tests
+        Extension/Skater/Skitch/hip_targets.cpp Extension/Skater/Skitch/mesh_test_stubs.cpp
         Extension/Multiplayer/Test/mesh_tests.cpp Extension/Multiplayer/Net/protocol.cpp Extension/Multiplayer/Remote/playback_buffers.cpp
         Extension/Multiplayer/Net/wire_codec.cpp Extension/Multiplayer/Net/delta_codec.cpp
         Extension/Multiplayer/Session/password.cpp Extension/Multiplayer/Session/party_book.cpp

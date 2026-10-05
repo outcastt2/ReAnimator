@@ -7,6 +7,7 @@
 #include "Engine/Game/Build/20260929/no_bail.h"
 #include "Engine/Game/Build/20260929/offboard_flight.h"
 #include "free_flight.h"
+#include "Skitch/player_skitch.h"
 #include <cmath>
 
 namespace dingosdk::client_source::detail {
@@ -28,7 +29,7 @@ bool body_writable(std::size_t index, std::uintptr_t body) {
         cache.until = now + 1000;
     }
     if (cache.bodies[index] == body) return true;
-    if (!source_writable(body + 0x60, 0x20)) return false;
+    if (!source_writable(body + 0x20, 0x60)) return false;
     cache.bodies[index] = body;
     return true;
 }
@@ -47,6 +48,13 @@ template<class T> void body_write(std::uintptr_t address, const T& value) {
     source_require(source_range(address, sizeof(T)) && copy_to(address, &value, sizeof(T)), "Debug setting write failed.");
     T written{};
     source_require(memory::peek(address, written) && written == value, "Debug setting write could not be verified.");
+}
+void body_transform_write(std::uintptr_t body,const std::array<float,16>& value) {
+    source_require(copy_to(body+0x20,value.data(),sizeof(value)),"Skitch turn write failed.");
+    std::array<float,16> written{};
+    // Compare bytes: native SIMD metadata lanes may contain NaN sentinels.
+    source_require(memory::peek(body+0x20,written) && std::memcmp(written.data(),value.data(),sizeof(value))==0,
+        "Skitch turn write could not be verified.");
 }
 }
 void debug_stop_noclip(InteractiveDebug& debug) noexcept {
@@ -137,6 +145,53 @@ void noclip_apply_velocity(std::uintptr_t core) noexcept {
         } catch (const SourceGuard& issue) { boost.valid = false; debug.status = issue.message; }
           catch (...) { boost.valid = false; debug.status = "Velocity boost failed during the physics update."; }
     };
+    if (const auto skitch = player_skitch::request(); skitch && skitch->core == core) {
+        try {
+            const auto bodies = debug_noclip_bodies(state.trial.base, skitch->client, skitch->entity);
+            source_require(bodies.core == core && !bodies.offboard && !debug.noclip && !debug.park_editor &&
+                !debug.camera_owned && !debug.forward_velocity.valid && !debug.up_velocity.valid,
+                "Skitch physics changed.");
+            SourceReader reader;
+            source_require(reader.value<std::uint8_t>(skitch->entity, 0x7e0) == 0 &&
+                !(reader.value<std::uint32_t>(bodies.context, 0x13c4) & 0x8000u) &&
+                !(reader.value<std::uint32_t>(bodies.context, 0x13d4) & 0x08000000u), "Skitch released for bail or teleport.");
+            const auto current = reader.value<std::array<float,3>>(bodies.parts[0], 0x70);
+            if (bodies.seconds > 0) {
+                const auto delta = skateskitch::tow_velocity_delta(bodies.root, current, skitch->plan, bodies.seconds);
+                source_require(delta.has_value(), "Skitch correction exceeded bounds.");
+                std::array<std::array<float,3>,32> velocities{};
+                std::array<std::uint32_t,32> flags{};
+                std::array<std::array<float,16>,32> transforms{};
+                for (std::size_t i = 0; i < bodies.parts.size(); ++i) {
+                    velocities[i] = reader.value<std::array<float,3>>(bodies.parts[i], 0x70);
+                    velocities[i][0] += (*delta)[0]; velocities[i][2] += (*delta)[2];
+                    flags[i] = reader.value<std::uint32_t>(bodies.parts[i], 0x60);
+                    source_require(reader.raw(bodies.parts[i]+0x20,transforms[i].data(),sizeof(transforms[i])),
+                        "Skitch body transform unreadable.");
+                }
+                // Native board root getters select body 8. Turn from its actual
+                // physical heading, not a graph input that never runs on board.
+                auto facing=transforms[8];
+                facing[3]=facing[7]=facing[11]=0; facing[15]=1;
+                const auto angle=skateskitch::tow_yaw_step(facing,skitch->plan,bodies.seconds);
+                source_require(angle.has_value(),"Skitch turn heading invalid.");
+                const skateskitch::Vec3 pivot{facing[12],facing[13],facing[14]};
+                for(auto& transform:transforms) source_require(skateskitch::rotate_body_yaw(transform,pivot,*angle),
+                    "Skitch assembly shape changed.");
+                reader.verify();
+                for (std::size_t i = 0; i < bodies.parts.size(); ++i) {
+                    body_transform_write(bodies.parts[i],transforms[i]);
+                    body_write(bodies.parts[i] + 0x70, velocities[i]);
+                    // Supported native transform setter at RVA 47e5330 writes
+                    // +20..+5f and marks bit 1. Linear velocity uses bit 8.
+                    body_write(bodies.parts[i] + 0x60, flags[i] | 9u);
+                }
+                player_skitch::note_turn_step();
+                player_skitch::note_physics_step();
+            }
+        } catch (const SourceGuard& issue) { player_skitch::fault(issue.message); }
+          catch (...) { player_skitch::fault(); }
+    }
     apply_boost(debug.forward_velocity, debug.forward_velocity_updates, false);
     apply_boost(debug.up_velocity, debug.up_velocity_updates, true);
     const auto& request = debug.noclip_velocity;

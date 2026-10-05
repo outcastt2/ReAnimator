@@ -1,3 +1,5 @@
+#include "Extension/Skater/Gestures/board_gesture.h"
+#include "Extension/Skater/Gestures/board_gesture_routes.h"
 #include "runtime_internal.h"
 #include "Extension/Customization/developer_hoodie.h"
 #include "Extension/Customization/developer_board.h"
@@ -987,6 +989,9 @@ void tick(std::uintptr_t client, std::uintptr_t update) {
             DINGO_PROFILE_ZONE("tick/multiplayer");
             dingosdk::multiplayer::tick(r.base,client,multiplayer_ready,r.multiplayer_map,load_multiplayer_map);
         }
+        const bool gesture_mounted=multiplayer_ready && dingosdk::board_gesture::mounted(r.base,client);
+        dingosdk::board_gesture::tick(r.base,gesture_mounted);
+        dingosdk::board_gesture::routes::tick(r.base,dingosdk::board_gesture::enabled(),gesture_mounted);
         dingosdk::tick_local_developer_hoodie(r.base, client, multiplayer_ready);
         dingosdk::tick_local_developer_board(r.base, client, multiplayer_ready);
         // The session spawns and places skaters and can teleport: check the camera again.
