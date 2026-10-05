@@ -336,8 +336,24 @@ void arm_assets(Ptr base, Ptr client, const std::string &extra, unsigned seconds
     };
     std::vector<Spot> spots;
     bool faulted{};
-    const auto note = [&](const char *name) {
-        const auto asset = find_named_asset(base, name, faulted);
+    // Studio's browser shows a tree, but the engine names an asset by its full
+    // path (the vfx catalog spells them "effects/gestures/effectblueprints/
+    // ebp_gesture_saxophone"), so try the path and the bare leaf. The skeleton is
+    // the control: if that does not resolve, the lookup or its naming is wrong,
+    // not the asset.
+    const auto lookup = [&](const std::string &name) -> Ptr {
+        if (const auto asset = find_named_asset(base, ("animation/dingo/" + name).c_str(), faulted)) return asset;
+        return find_named_asset(base, name.c_str(), faulted);
+    };
+    {
+        const auto control = find_named_asset(base, "Animation/Dingo/AnimBase_Default_Skeleton", faulted);
+        logging::log(logging::Level::info, logging::Channel::skater,
+                     "Hand props: control asset Animation/Dingo/AnimBase_Default_Skeleton {}.", control
+                         ? std::format("= {:#x}", control)
+                         : std::string("did not resolve (the lookup, not the phone assets, is the problem)"));
+    }
+    const auto note = [&](const std::string &name) {
+        const auto asset = lookup(name);
         if (!asset) {
             logging::log(logging::Level::info, logging::Channel::skater, "Hand props: {} is not loaded.", name);
             return;
@@ -368,7 +384,7 @@ void arm_assets(Ptr base, Ptr client, const std::string &extra, unsigned seconds
         }
     };
     for (const char *name : names) note(name);
-    if (!extra.empty()) note(extra.c_str());
+    if (!extra.empty()) note(extra);
     logging::log(logging::Level::info, logging::Channel::skater,
                  "Hand props: {} reference(s) found for the phone assets{}.", spots.size(),
                  faulted ? " (the asset sweep faulted at least once)" : "");
