@@ -226,18 +226,6 @@ void on_pose_evaluated(std::uintptr_t component) noexcept {
     try {
         auto &p = playback();
         if (component != p.component.load(std::memory_order_acquire)) return;
-        if (p.recording.load(std::memory_order_acquire)) {
-            const auto rec = pose_location(p.base, component);
-            if (!rec.buffer || !rec.joints) return;
-            const auto frame = p.record_frames.load(std::memory_order_relaxed);
-            if (frame >= p.record_capacity) return;
-            auto *dst = p.record_data.data() + static_cast<std::size_t>(frame) * rec.joints * floats_per_joint;
-            pack_frame(rec.buffer, rec.joints, dst);
-            p.record_frames.store(frame + 1, std::memory_order_release);
-            if (frame == 0)
-                logging::log(logging::Level::info, logging::Channel::skater, "Custom animation: recording.");
-            return; // Never overwrite the pose while recording it.
-        }
         if (!p.playing.load(std::memory_order_acquire)) return;
         const auto pose = pose_location(p.base, component);
         write_current(p, pose.buffer);
@@ -250,10 +238,24 @@ void on_pose_evaluated(std::uintptr_t component) noexcept {
 void on_skeleton_responded(std::uintptr_t rig) noexcept {
     try {
         auto &p = playback();
-        if (!p.playing.load(std::memory_order_acquire) || !rig) return;
+        if (!rig) return;
         const auto component = p.component.load(std::memory_order_acquire);
         if (rig_for(component) != rig) return;
         const auto pose = pose_location(p.base, component);
+        if (!pose.buffer) return;
+        if (p.recording.load(std::memory_order_acquire)) {
+            // Record AFTER the engine's constraints, so a replay reproduces the
+            // pose that was actually rendered (feet on the board and all).
+            const auto frame = p.record_frames.load(std::memory_order_relaxed);
+            if (frame < p.record_capacity && pose.joints) {
+                auto *dst = p.record_data.data() + static_cast<std::size_t>(frame) * pose.joints * floats_per_joint;
+                pack_frame(pose.buffer, pose.joints, dst);
+                p.record_frames.store(frame + 1, std::memory_order_release);
+                if (frame == 0)
+                    logging::log(logging::Level::info, logging::Channel::skater, "Custom animation: recording.");
+            }
+            return;
+        }
         write_current(p, pose.buffer);
     } catch (...) {
     }
