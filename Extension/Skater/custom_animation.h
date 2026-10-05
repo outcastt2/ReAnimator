@@ -15,6 +15,15 @@ namespace dingosdk::skater {
 // else is a path to a .rska clip file.
 void request_pose_playback(std::string clip);
 void request_pose_playback_stop();
+// Which joints a custom animation is allowed to drive. The game can keep the
+// pelvis and both legs, so a clip layers on top of walking or a board stance
+// the way the game's own moving gestures do.
+//   automatic -- hand the legs back while riding or moving (the default)
+//   full      -- the clip drives the whole body, as before
+//   legs      -- always keep the game's legs and pelvis
+enum class PoseMask { automatic, full, legs };
+void set_pose_mask(PoseMask mask) noexcept;
+std::string pose_mask_name();
 // Record the live pose as it is evaluated, then play it back with "play".
 void request_pose_record();
 void request_pose_record_playback();

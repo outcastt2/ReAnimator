@@ -6,6 +6,7 @@
 #include "Engine/Core/Platform/memory.h"
 #include "Engine/Core/Log/logging.h"
 #include "Engine/Game/Build/addresses.h"
+#include "Engine/Game/Build/20260929/offboard_flight.h"
 #include <Windows.h>
 #include <array>
 #include <atomic>
@@ -31,6 +32,70 @@ constexpr std::uint16_t test_spine_joint = 7; // a body joint in the head chain'
 constexpr std::size_t floats_per_joint = 10; // scale.xyz, quat.xyzw, pos.xyz
 constexpr std::uint32_t expected_skater_joints = 395;
 constexpr std::uint32_t max_record_frames = 1800; // 30 s at 60 Hz
+
+// ---------------------------------------------------------------------------
+// Masking: which joints the game keeps when a custom animation layers on top of
+// locomotion.
+//
+// The skeleton lays the legs out contiguously -- pelvis at 7, the left leg
+// 8..41, the right leg 341..374 -- which is straight out of the parent table
+// (the parent table is in the community docs; joint 42 starts the spine and 340
+// is the last torso helper). Handing those back is what keeps the feet on the
+// board, and lets the game walk the legs while a gesture plays above them.
+// ---------------------------------------------------------------------------
+constexpr std::uint32_t hip_joint = 7;
+constexpr std::uint32_t left_leg_first = 8, left_leg_last = 41;
+constexpr std::uint32_t right_leg_first = 341, right_leg_last = 374;
+// A layer switch is ramped rather than cut, so starting to walk mid-gesture does
+// not snap the legs.
+constexpr ULONGLONG mask_ramp_ms = 200;
+// Above this the automatic mask decides the skater is walking or riding.
+constexpr float walking_speed = 0.6f;
+
+bool joint_masked(std::uint32_t joint) noexcept {
+    return joint == hip_joint ||
+           (joint >= left_leg_first && joint <= left_leg_last) ||
+           (joint >= right_leg_first && joint <= right_leg_last);
+}
+
+// The skater is on foot exactly when their motion state (core+0x3b0) is the
+// offboard flight state, which owns walking, sliding and falling. While riding,
+// that slot holds a different object with a different vtable -- the same check
+// the noclip code makes. A read that fails counts as "on the board": riding is
+// the common case, and masking is the safe way to be wrong there.
+bool skater_off_board(std::uintptr_t base, std::uintptr_t component) noexcept {
+    if (!base || !component) return false;
+    try {
+        const auto core = ptr(component, 0x70);
+        if (!core) return false;
+        const auto motion = ptr(core, 0x3b0);
+        return motion != 0 && ptr(motion) == base + addr::offboard_flight::offboard_flight_vtable;
+    } catch (...) {
+        return false;
+    }
+}
+
+// Shortest-arc spherical blend from `from` (weight 0) to `to` (weight 1).
+void blend_quat(const float *from, const float *to, float weight, float *out) noexcept {
+    float target[4] = {to[0], to[1], to[2], to[3]};
+    float dot = from[0] * target[0] + from[1] * target[1] + from[2] * target[2] + from[3] * target[3];
+    if (dot < 0.0f) {
+        for (float &value : target) value = -value;
+        dot = -dot;
+    }
+    const float t = weight < 0.0f ? 0.0f : (weight > 1.0f ? 1.0f : weight);
+    if (dot > 0.9995f) {
+        for (int i = 0; i < 4; ++i) out[i] = from[i] + (target[i] - from[i]) * t;
+    } else {
+        const float theta = std::acos(dot);
+        const float sin_theta = std::sin(theta);
+        const float wa = std::sin((1.0f - t) * theta) / sin_theta;
+        const float wb = std::sin(t * theta) / sin_theta;
+        for (int i = 0; i < 4; ++i) out[i] = from[i] * wa + target[i] * wb;
+    }
+    const float length = std::sqrt(out[0] * out[0] + out[1] * out[1] + out[2] * out[2] + out[3] * out[3]);
+    if (length > 1e-6f) for (int i = 0; i < 4; ++i) out[i] /= length;
+}
 
 // A clip is frames * joints * 10 floats.
 struct Clip {
@@ -63,6 +128,17 @@ struct Playback {
     ULONGLONG record_started{};
     float record_fps{60.0f};
     bool dump_request{};
+    // Masking. `mask` is set from the console; the rest is only touched by the
+    // write path, which runs on the animation thread.
+    std::atomic<int> mask{static_cast<int>(PoseMask::automatic)};
+    float mask_weight{};
+    ULONGLONG mask_updated{};
+    std::array<float, 3> world_sample{};
+    ULONGLONG world_sampled{};
+    bool world_valid{};
+    float speed{};
+    bool moving{};
+    bool on_board{};
 };
 Playback &playback() { static Playback p; return p; }
 std::mutex &status_mutex() { static std::mutex m; return m; }
@@ -172,14 +248,51 @@ std::uintptr_t local_component(std::uintptr_t base, std::uintptr_t client) {
     }
 }
 
-void write_frame(std::uintptr_t buffer, const float *frame, std::uint32_t joints) noexcept {
-    for (std::uint32_t j = 0; j < joints; ++j) {
-        const auto *src = frame + static_cast<std::size_t>(j) * floats_per_joint;
-        auto *dst = reinterpret_cast<std::uint8_t *>(buffer) + static_cast<std::size_t>(j) * 0x30;
-        std::memcpy(dst + 0x00, src + 0, 12);  // scale.xyz (w left alone)
-        std::memcpy(dst + 0x10, src + 3, 16);  // quat.xyzw
-        std::memcpy(dst + 0x20, src + 7, 12);  // pos.xyz (w left alone)
+void write_frame(std::uintptr_t buffer, const float *frame, std::uint32_t joints, float keep) noexcept {
+    for (std::uint32_t i = 0; i < joints; ++i) {
+        const auto joint = i + 2;
+        const auto *src = frame + static_cast<std::size_t>(i) * floats_per_joint;
+        auto *dst = reinterpret_cast<std::uint8_t *>(buffer) + static_cast<std::size_t>(joint) * 0x30;
+        if (!joint_masked(joint) || keep <= 0.0f) {
+            std::memcpy(dst + 0x00, src + 0, 12);  // scale.xyz (w left alone)
+            std::memcpy(dst + 0x10, src + 3, 16);  // quat.xyzw
+            std::memcpy(dst + 0x20, src + 7, 12);  // pos.xyz (w left alone)
+            continue;
+        }
+        if (keep >= 1.0f) continue; // the game keeps this joint outright
+        // Mid-ramp: the buffer already holds the game's own value for this
+        // frame, so blend it toward the clip instead of snapping between layers.
+        const float weight = 1.0f - keep;
+        float game_scale[3], game_quat[4], game_pos[3];
+        std::memcpy(game_scale, dst + 0x00, sizeof(game_scale));
+        std::memcpy(game_quat, dst + 0x10, sizeof(game_quat));
+        std::memcpy(game_pos, dst + 0x20, sizeof(game_pos));
+        float value[12];
+        for (int c = 0; c < 3; ++c) {
+            value[c] = game_scale[c] * keep + src[c] * weight;
+            value[8 + c] = game_pos[c] * keep + src[7 + c] * weight;
+        }
+        blend_quat(game_quat, src + 3, weight, value + 4);
+        std::memcpy(dst + 0x00, value + 0, 12);
+        std::memcpy(dst + 0x10, value + 4, 16);
+        std::memcpy(dst + 0x20, value + 8, 12);
     }
+}
+
+// How much of the game's own pose to keep for the masked joints, ramped so a
+// layer switch is a blend rather than a cut.
+float mask_weight(Playback &p, ULONGLONG now) noexcept {
+    const auto mode = static_cast<PoseMask>(p.mask.load(std::memory_order_relaxed));
+    bool engaged = false;
+    if (mode == PoseMask::legs) engaged = true;
+    else if (mode == PoseMask::automatic) engaged = p.on_board || p.moving;
+    const float target = engaged ? 1.0f : 0.0f;
+    const auto elapsed = now > p.mask_updated ? now - p.mask_updated : 0;
+    p.mask_updated = now;
+    const float step = static_cast<float>(elapsed) / static_cast<float>(mask_ramp_ms);
+    if (p.mask_weight < target) p.mask_weight = std::min(target, p.mask_weight + step);
+    else if (p.mask_weight > target) p.mask_weight = std::max(target, p.mask_weight - step);
+    return p.mask_weight;
 }
 } // namespace
 
@@ -203,6 +316,36 @@ void pack_frame(std::uintptr_t buffer, std::uint32_t joints, float *out) noexcep
 // callback (which the engine's own constraints later rewrite) and the
 // post-physics skeleton response, after which the write survives.
 namespace {
+// How the game is moving the skater, sampled once per frame from the pose the
+// engine just produced. Joint 1 carries world placement and the game writes it
+// every frame, so its speed is the skater's speed; the motion state says
+// whether they are on foot.
+void sample_motion(Playback &p, const PoseLocation &pose, std::uintptr_t component) noexcept {
+    const auto now = GetTickCount64();
+    if (pose.buffer && pose.joints > 1) {
+        std::array<float, 3> world{};
+        if (readable(pose.buffer + 0x30ULL + 0x20ULL, world.data(), sizeof(world))) {
+            if (p.world_valid && now > p.world_sampled) {
+                const float dt = static_cast<float>(now - p.world_sampled) / 1000.0f;
+                if (dt > 1e-3f) {
+                    const float dx = world[0] - p.world_sample[0];
+                    const float dy = world[1] - p.world_sample[1];
+                    const float dz = world[2] - p.world_sample[2];
+                    const float instant = std::sqrt(dx * dx + dy * dy + dz * dz) / dt;
+                    p.speed = 0.7f * p.speed + 0.3f * std::min(instant, 50.0f);
+                }
+            }
+            p.world_sample = world;
+            p.world_sampled = now;
+            p.world_valid = true;
+        }
+    }
+    // Hysteresis: once walking, keep believing it until the speed really drops,
+    // so a skater hovering around the threshold does not flicker between layers.
+    p.moving = p.speed > (p.moving ? walking_speed * 0.5f : walking_speed);
+    p.on_board = !skater_off_board(p.base, component);
+}
+
 void write_current(Playback &p, std::uintptr_t buffer) noexcept {
     if (!p.playing.load(std::memory_order_acquire) || !buffer) return;
     const auto note_write = [&p] {
@@ -244,10 +387,15 @@ void write_current(Playback &p, std::uintptr_t buffer) noexcept {
     // placement, and the game drives it from the board and physics. Leaving it
     // alone is what keeps the skater on the board, the way a gesture animates
     // in place while the player keeps moving.
+    //
+    // The legs and pelvis are the same story whenever the mask is engaged: the
+    // engine's own pose for them stays, so the feet keep the board and the walk
+    // keeps walking.
+    const auto keep = mask_weight(p, GetTickCount64());
     write_frame(buffer + 2 * 0x30ULL,
                 p.clip.data.data() + static_cast<std::size_t>(frame) * p.clip.joints * floats_per_joint +
                     2 * floats_per_joint,
-                p.clip.joints - 2);
+                p.clip.joints - 2, keep);
     note_write();
 }
 } // namespace
@@ -273,6 +421,7 @@ void on_skeleton_responded(std::uintptr_t rig) noexcept {
         if (!rig_is_local(rig, component)) return;
         const auto pose = pose_location(p.base, component);
         if (!pose.buffer) return;
+        sample_motion(p, pose, component);
         if (p.recording.load(std::memory_order_acquire)) {
             // Record AFTER the engine's constraints, so a replay reproduces the
             // pose that was actually rendered (feet on the board and all).
@@ -381,6 +530,24 @@ std::string pose_playback_status() {
     return playback().status;
 }
 
+void set_pose_mask(PoseMask mask) noexcept {
+    auto &p = playback();
+    p.mask.store(static_cast<int>(mask), std::memory_order_relaxed);
+    // Ramp on from wherever the last layer left the weight, so changing modes
+    // while a clip plays blends instead of jumping.
+    p.mask_updated = GetTickCount64();
+    logging::log(logging::Level::info, logging::Channel::skater, "Custom animation: masking set to {}.",
+                 pose_mask_name());
+}
+
+std::string pose_mask_name() {
+    switch (static_cast<PoseMask>(playback().mask.load(std::memory_order_relaxed))) {
+    case PoseMask::full: return "full";
+    case PoseMask::legs: return "legs";
+    default: return "auto";
+    }
+}
+
 void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
     try {
         auto &p = playback();
@@ -459,6 +626,13 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
             set_status("Custom animation: the local skater's animation component is unavailable.");
             return;
         }
+        // A new layer starts from a clean motion sample, so the automatic mask
+        // decides on this skater's current state rather than the last clip's.
+        p.world_valid = false;
+        p.moving = false;
+        p.speed = 0.0f;
+        p.on_board = false;
+        p.mask_updated = GetTickCount64();
         // The write that survives is the one after the engine's post-physics
         // response. That hook belongs to No Bail, which installs it at startup;
         // if it is missing, say so rather than playing invisibly.

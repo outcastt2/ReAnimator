@@ -200,16 +200,51 @@ void register_movement_commands(Commands &registry) {
 
     // Route B: overwrite the local skater's pose with a baked custom animation.
     auto poseanim = action("poseanim",
-        "Custom animation: poseanim test | record | off | play | save <path> | <file>.rska",
+        "Custom animation: poseanim test | record | off | play | save <path> | mask auto|full|legs | <file>.rska",
         Group::movement, {argument("clip", Type::text, true), argument("path", Type::text, true)});
     poseanim.execution = Execution::local;
     poseanim.inspect = [](const Model &) {
-        return State{true, {}, {}, skater::pose_playback_status(), false};
+        return State{true, {}, {},
+                     skater::pose_playback_status() + "  [mask: " + skater::pose_mask_name() + "]", false};
     };
     poseanim.run = [](const Model &, const Values &args, const Output &out) {
-        if (args.empty()) { out(skater::pose_playback_status()); return; }
+        if (args.empty()) {
+            out(skater::pose_playback_status());
+            out("Masking: " + skater::pose_mask_name() + ".");
+            return;
+        }
         const auto clip = std::get<std::string>(args[0]);
         if (lower(clip) == "off") { skater::request_pose_playback_stop(); out("Stopping custom animation..."); return; }
+        if (lower(clip) == "mask") {
+            // Which joints the clip is allowed to drive. "auto" hands the legs
+            // and pelvis to the game while riding or moving, so a clip layers on
+            // top of the board stance and the walk cycle.
+            const auto mode = args.size() > 1 ? lower(std::get<std::string>(args[1])) : std::string{};
+            if (mode != "auto" && mode != "full" && mode != "legs") {
+                out("usage: poseanim mask auto|full|legs  (currently " + skater::pose_mask_name() + ")");
+                return;
+            }
+            skater::set_pose_mask(mode == "auto" ? skater::PoseMask::automatic
+                                 : mode == "full" ? skater::PoseMask::full
+                                                  : skater::PoseMask::legs);
+            out(mode == "auto"
+                    ? "Custom animation masking: auto (the game keeps the legs while riding or moving)."
+                    : "Custom animation masking: " + mode + ".");
+            return;
+        }
+        if (lower(clip) == "play") {
+            // "play" alone replays the in-memory recording; "play <name>" loads
+            // the file, which is what a bare name does too.
+            if (args.size() > 1) {
+                const auto name = std::get<std::string>(args[1]);
+                skater::request_pose_playback(name);
+                out("Playing " + name + "...");
+            } else {
+                skater::request_pose_record_playback();
+                out("Playing the recorded pose...");
+            }
+            return;
+        }
         if (lower(clip) == "save") {
             const auto path = args.size() > 1 ? std::get<std::string>(args[1]) : std::string{};
             if (path.empty()) { out("usage: poseanim save <path>"); return; }
