@@ -231,15 +231,6 @@ float mask_weight(Playback &p, ULONGLONG now) noexcept {
                      "Custom animation: mask {} (on board {}, state {}, moving {}, {:.2f} m/s).",
                      engaged ? "engaged" : "released", p.on_board, p.physics_state, p.moving, p.speed);
     }
-    // A summary every couple of seconds, so one session in a log is enough to
-    // see what the layer decided and why.
-    if (now >= p.summary_at + 2000) {
-        p.summary_at = now;
-        logging::log(logging::Level::info, logging::Channel::skater,
-                     "Custom animation: layer: state={} on_board={} (motion object says {}) moving={} "
-                     "speed={:.2f} m/s mask={:.2f}.",
-                     p.physics_state, p.on_board, p.offboard_motion, p.moving, p.speed, p.mask_weight);
-    }
     const auto elapsed = now > p.mask_updated ? now - p.mask_updated : 0;
     p.mask_updated = now;
     p.mask_weight = layers::ramp_weight(p.mask_weight, engaged ? 1.0f : 0.0f, elapsed, mask_ramp_ms);
@@ -267,6 +258,18 @@ void pack_frame(std::uintptr_t buffer, std::uint32_t joints, float *out) noexcep
 // callback (which the engine's own constraints later rewrite) and the
 // post-physics skeleton response, after which the write survives.
 namespace {
+// A joint's position relative to another, in the pose's own space. Used to put
+// the kept legs in the log: a normal ride holds the ankles about 0.86 m below
+// joint 1, so one line says whether the pose being kept is a real stance.
+bool pose_offset(std::uintptr_t buffer, std::uint32_t joint, std::uint32_t reference, float out[3]) noexcept {
+    float a[3]{}, b[3]{};
+    if (!buffer) return false;
+    if (!readable(buffer + joint * layers::pose_stride + 0x20, a, sizeof(a))) return false;
+    if (!readable(buffer + reference * layers::pose_stride + 0x20, b, sizeof(b))) return false;
+    for (int c = 0; c < 3; ++c) out[c] = a[c] - b[c];
+    return true;
+}
+
 // How the game is moving the skater, sampled once per frame from the pose the
 // engine just produced. Joint 1 carries world placement and the game writes it
 // every frame, so its speed is the skater's speed; the motion state says
@@ -305,6 +308,22 @@ void sample_motion(Playback &p, const PoseLocation &pose, std::uintptr_t compone
     p.on_board = state == UINT32_MAX
         ? !p.offboard_motion
         : !(state == addr::no_bail::offboard_physics_state || state == addr::no_bail::wipeout_physics_state);
+    // A summary every couple of seconds, so one session in a log is enough to
+    // see what the layer decided and where the legs it kept actually are.
+    if (now >= p.summary_at + 2000 && pose.buffer) {
+        p.summary_at = now;
+        float pelvis[3]{}, left[3]{}, right[3]{};
+        const bool has_pelvis = pose_offset(pose.buffer, 7, 1, pelvis);
+        const bool has_left = pose_offset(pose.buffer, 10, 1, left);
+        const bool has_right = pose_offset(pose.buffer, 343, 1, right);
+        logging::log(logging::Level::info, logging::Channel::skater,
+                     "Custom animation: layer: state={} on_board={} moving={} speed={:.2f} m/s mask={:.2f} "
+                     "pelvis_yz=({:.3f},{:.3f}) ankles_yz=({:.3f},{:.3f})/({:.3f},{:.3f})",
+                     p.physics_state, p.on_board, p.moving, p.speed, p.mask_weight,
+                     has_pelvis ? pelvis[1] : 0.0f, has_pelvis ? pelvis[2] : 0.0f,
+                     has_left ? left[1] : 0.0f, has_left ? left[2] : 0.0f,
+                     has_right ? right[1] : 0.0f, has_right ? right[2] : 0.0f);
+    }
 }
 
 void write_current(Playback &p, std::uintptr_t buffer, std::uint32_t available_joints) noexcept {
@@ -367,15 +386,21 @@ void write_current(Playback &p, std::uintptr_t buffer, std::uint32_t available_j
 }
 } // namespace
 
+// Deliberately does nothing.
+//
+// This runs after the animation graph and *before* the engine's physics
+// response, and on this game that response is the ragdoll: it re-solves the
+// rendered pose from the physics, driven by the pose that is in the buffer.
+// Writing the clip here -- which the playback used to do -- feeds the clip's
+// upper body into that solve, and the solve answers with a different lower
+// body: a crouch with the feet off the board, which is exactly what survived
+// when the mask was keeping the game's legs.
+//
+// The write that matters is the one after the response, so the physics only
+// ever sees the game's own animation and the clip is applied on top of a body
+// the engine is happy with.
 void on_pose_evaluated(std::uintptr_t component) noexcept {
-    try {
-        auto &p = playback();
-        if (component != p.component.load(std::memory_order_acquire)) return;
-        if (!p.playing.load(std::memory_order_acquire)) return;
-        const auto pose = pose_location(p.base, component);
-        write_current(p, pose.buffer, pose.joints);
-    } catch (...) {
-    }
+    (void)component;
 }
 
 // Runs after the engine's own post-physics constraints, on the same update
