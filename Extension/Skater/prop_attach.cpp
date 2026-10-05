@@ -320,6 +320,19 @@ Ptr find_named_asset(Ptr base, const char *name, bool &faulted) noexcept {
 // references in the instance, the holder, the animation component and the
 // definition, then watch the words after each one so a gesture press can be read
 // off against an idle phase.
+// One-off dump: the values we are hunting are small integers or floats, so show
+// both readings for every word.
+void dump_region(Ptr address, std::size_t bytes, const std::string &label) {
+    for (std::size_t offset = 0; offset + 4 <= bytes; offset += 4) {
+        std::uint32_t value{};
+        if (!memory::read_bytes(address + offset, &value, 4)) break;
+        float as_float{};
+        std::memcpy(&as_float, &value, sizeof(as_float));
+        logging::log(logging::Level::info, logging::Channel::skater,
+                     "Hand props: {} +{:#04x} {:#010x} {} (float {:.6g})", label, offset, value, value, as_float);
+    }
+}
+
 void arm_assets(Ptr base, Ptr client, const std::string &extra, unsigned seconds) {
     auto &s = state();
     Local local;
@@ -408,11 +421,16 @@ void arm_assets(Ptr base, Ptr client, const std::string &extra, unsigned seconds
     s.pose_mode = false;
     // The asset's own bytes first: a global switch lives there, and the whole
     // asset header plus payload fits in a small window.
-    for (const auto &asset : assets) add_region(s, asset.label, asset.address, 0x80, true);
+    for (const auto &asset : assets) {
+        add_region(s, asset.label, asset.address, 0x80, true);
+        dump_region(asset.address, 0x40, asset.label);
+    }
     for (const auto &data : datas) {
         logging::log(logging::Level::info, logging::Channel::skater,
                      "Hand props: {} is already instantiated at {:#x}.", data.label, data.address);
-        add_region(s, data.label, data.address, 0x40);
+        // Wide enough to cover the value, wherever in the object it sits.
+        add_region(s, data.label, data.address, 0x200);
+        dump_region(data.address, 0x100, data.label);
     }
     for (const auto &spot : spots) add_region(s, spot.label, spot.address, 0x20);
     if (s.words.empty()) {
@@ -538,13 +556,10 @@ void sample() {
     }
     // Anything the loop discovered: the asset's data object, now worth reading.
     for (auto &[name, address] : s.pending_regions) {
-        std::array<std::uint32_t, 8> words{};
-        if (memory::read_bytes(address, words.data(), sizeof(words)))
-            logging::log(logging::Level::info, logging::Channel::skater,
-                         "Hand props: following {} at {:#x}: words {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
-                         name, address, words[0], words[1], words[2], words[3], words[4], words[5], words[6],
-                         words[7]);
-        add_region(s, name, address, 0x40);
+        logging::log(logging::Level::info, logging::Channel::skater,
+                     "Hand props: following {} at {:#x}.", name, address);
+        add_region(s, name, address, 0x200);
+        dump_region(address, 0x100, name);
     }
     s.pending_regions.clear();
     // A heartbeat, so a quiet window is provably a quiet window and the press
