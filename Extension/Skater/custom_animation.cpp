@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <string>
@@ -70,9 +71,37 @@ void set_status(const std::string &text) {
     playback().status = text;
 }
 
-bool load_clip(const std::string &path, Clip &clip, std::string &error) {
+// The game directory, from this process's own module path.
+std::filesystem::path game_directory() {
+    std::array<wchar_t, 32768> buffer{};
+    const auto count = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (!count || count >= buffer.size()) return {};
+    return std::filesystem::path(buffer.data()).parent_path();
+}
+// Clips live in <game>/CustomAnimations, so a bare name is enough. The console
+// treats a backslash as an escape, so forward slashes are accepted and a name
+// with no directory is looked up in that folder. `.rska` is assumed when the
+// name has no extension.
+std::filesystem::path resolve_clip_path(std::string_view name, bool for_write) {
+    std::wstring text;
+    for (const char c : name) text.push_back(static_cast<unsigned char>(c) < 128 ? wchar_t(c) : L'?');
+    for (auto &c : text) if (c == L'/') c = L'\\';
+    std::filesystem::path path(text);
+    if (!path.has_parent_path()) {
+        const auto directory = game_directory() / L"CustomAnimations";
+        if (for_write) {
+            std::error_code error;
+            std::filesystem::create_directories(directory, error);
+        }
+        path = directory / path;
+    }
+    if (!path.has_extension()) path += L".rska";
+    return path;
+}
+
+bool load_clip(const std::filesystem::path &path, Clip &clip, std::string &error) {
     std::ifstream in(path, std::ios::binary);
-    if (!in) { error = "cannot open " + path; return false; }
+    if (!in) { error = "cannot open " + path.string(); return false; }
     std::array<char, 20> header{};
     in.read(header.data(), header.size());
     if (in.gcount() != static_cast<std::streamsize>(header.size()) || std::memcmp(header.data(), "RSKA", 4) != 0) {
@@ -286,8 +315,9 @@ std::string save_recorded_clip(std::string_view path) {
         const auto frames = p.record_frames.load(std::memory_order_acquire);
         const auto joints = p.record_joints;
         if (frames < 2 || joints <= 2) return "nothing has been recorded yet";
-        std::ofstream out(std::string(path), std::ios::binary | std::ios::trunc);
-        if (!out) return "cannot write " + std::string(path);
+        const auto resolved = resolve_clip_path(path, true);
+        std::ofstream out(resolved, std::ios::binary | std::ios::trunc);
+        if (!out) return "cannot write " + resolved.string();
         std::array<char, 20> header{};
         const std::uint32_t version = 1;
         const float fps = p.record_fps;
@@ -302,7 +332,7 @@ std::string save_recorded_clip(std::string_view path) {
                                                sizeof(float)));
         out.close();
         logging::log(logging::Level::info, logging::Channel::skater,
-                     "Custom animation: saved {} frames x {} joints to {}.", frames, joints, std::string(path));
+                     "Custom animation: saved {} frames x {} joints to {}.", frames, joints, resolved.string());
         return {};
     } catch (const std::exception &e) {
         return std::string("save failed: ") + e.what();
@@ -513,7 +543,8 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
         } else {
             Clip clip;
             std::string error;
-            if (!load_clip(pending_clip, clip, error)) {
+            const auto path = resolve_clip_path(pending_clip, false);
+            if (!load_clip(path, clip, error)) {
                 set_status("Custom animation: " + error + ".");
                 logging::log(logging::Level::warning, logging::Channel::skater, "Custom animation: {}", error);
                 return;
@@ -523,7 +554,7 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
                 p.clip = std::move(clip);
             }
             p.test.store(false, std::memory_order_relaxed);
-            p.clip_name = pending_clip;
+            p.clip_name = path.string();
         }
         std::string detail;
         if (!multiplayer::install_entity_hooks(base, detail)) {
