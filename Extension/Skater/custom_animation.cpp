@@ -7,6 +7,7 @@
 #include "Engine/Core/Platform/memory.h"
 #include "Engine/Core/Log/logging.h"
 #include "Engine/Game/Build/addresses.h"
+#include "Engine/Game/Build/20260929/no_bail.h"
 #include "Engine/Game/Build/20260929/offboard_flight.h"
 #include <Windows.h>
 #include <array>
@@ -105,6 +106,9 @@ struct Playback {
     bool moving{};
     bool on_board{};
     bool mask_engaged{};
+    std::uint32_t physics_state{UINT32_MAX};
+    bool offboard_motion{};
+    ULONGLONG summary_at{};
 };
 Playback &playback() { static Playback p; return p; }
 std::mutex &status_mutex() { static std::mutex m; return m; }
@@ -224,8 +228,17 @@ float mask_weight(Playback &p, ULONGLONG now) noexcept {
     if (engaged != p.mask_engaged) {
         p.mask_engaged = engaged;
         logging::log(logging::Level::info, logging::Channel::skater,
-                     "Custom animation: mask {} (on board {}, moving {}, {:.2f} m/s).",
-                     engaged ? "engaged" : "released", p.on_board, p.moving, p.speed);
+                     "Custom animation: mask {} (on board {}, state {}, moving {}, {:.2f} m/s).",
+                     engaged ? "engaged" : "released", p.on_board, p.physics_state, p.moving, p.speed);
+    }
+    // A summary every couple of seconds, so one session in a log is enough to
+    // see what the layer decided and why.
+    if (now >= p.summary_at + 2000) {
+        p.summary_at = now;
+        logging::log(logging::Level::info, logging::Channel::skater,
+                     "Custom animation: layer: state={} on_board={} (motion object says {}) moving={} "
+                     "speed={:.2f} m/s mask={:.2f}.",
+                     p.physics_state, p.on_board, p.offboard_motion, p.moving, p.speed, p.mask_weight);
     }
     const auto elapsed = now > p.mask_updated ? now - p.mask_updated : 0;
     p.mask_updated = now;
@@ -281,7 +294,17 @@ void sample_motion(Playback &p, const PoseLocation &pose, std::uintptr_t compone
     // Hysteresis: once walking, keep believing it until the speed really drops,
     // so a skater hovering around the threshold does not flicker between layers.
     p.moving = p.speed > (p.moving ? walking_speed * 0.5f : walking_speed);
-    p.on_board = !skater_off_board(p.base, component);
+    // The physics state machine is the truth for "on foot": 504 is walking and
+    // 300 is a ground wipeout (the engine remaps between them), so anything else
+    // means riding. The motion object is sampled too -- it is the other way to
+    // ask the same question, and the log says when the two disagree.
+    const auto state = observed_physics_state();
+    p.physics_state = state;
+    p.offboard_motion = skater_off_board(p.base, component);
+    // Until the selector has chosen once, fall back to the motion object.
+    p.on_board = state == UINT32_MAX
+        ? !p.offboard_motion
+        : !(state == addr::no_bail::offboard_physics_state || state == addr::no_bail::wipeout_physics_state);
 }
 
 void write_current(Playback &p, std::uintptr_t buffer, std::uint32_t available_joints) noexcept {
@@ -577,7 +600,9 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
         p.speed = 0.0f;
         p.on_board = false;
         p.mask_engaged = false;
+        p.physics_state = UINT32_MAX;
         p.mask_updated = GetTickCount64();
+        p.summary_at = p.mask_updated;
         // The write that survives is the one after the engine's post-physics
         // response. That hook belongs to No Bail, which installs it at startup;
         // if it is missing, say so rather than playing invisibly.

@@ -178,6 +178,13 @@ void hold_off_board(std::uintptr_t selector, std::uint32_t current) noexcept {
     if (!resolve(board.owner.client, board.owner.entity, current_owner) || current_owner != board.owner) return;
     (void)cancel_request(current_owner.context, animation_request_offset, mount_request_mask);
 }
+// The physics state the selector last chose. Written by the selector hook, which
+// the engine calls as it steps the skater's state machine, and read by the custom
+// animation layer to tell riding from walking.
+std::atomic<std::uint32_t> &observed_state() {
+    static std::atomic<std::uint32_t> value{UINT32_MAX};
+    return value;
+}
 std::uint32_t choose_state(std::uintptr_t selector, std::uint32_t current) {
     {
         LastError error;
@@ -189,7 +196,13 @@ std::uint32_t choose_state(std::uintptr_t selector, std::uint32_t current) {
     const bool filtered = filter_requests(selector, &Owner::selector);
     const auto next = protection().choose_original(selector, current);
     LastError error;
-    return filtered && next == wipeout_physics_state && protected_owner(selector, &Owner::selector) ? current : next;
+    const auto result =
+        filtered && next == wipeout_physics_state && protected_owner(selector, &Owner::selector) ? current : next;
+    // What the physics thinks the skater is doing, for consumers outside this
+    // file: walking (504) and a ground wipeout (300) are on foot, everything
+    // else is riding.
+    observed_state().store(result, std::memory_order_relaxed);
+    return result;
 }
 // Set once by a consumer that needs to write a pose after the engine's own
 // constraints; read on every skeleton response.
@@ -266,7 +279,10 @@ bool compatible(std::uintptr_t base) noexcept {
     }
     return true;
 }
-}
+} // namespace
+
+std::uint32_t observed_physics_state() noexcept { return observed_state().load(std::memory_order_relaxed); }
+
 bool start_no_bail(std::uintptr_t base) noexcept {
     LastError error;
     try {
