@@ -23,7 +23,7 @@ namespace engine = game::build::v20260929::engine;
 // because context floats otherwise drown everything.
 constexpr unsigned item_scan_bytes = 0x60;  // each gesture item's interesting head
 constexpr unsigned max_watch_items = 64;    // sampled items, not a hard limit on discovery
-constexpr unsigned max_changes = 400;       // the log is a finding, not a trace
+constexpr unsigned max_changes = 1000;      // the log is a finding, not a trace
 constexpr unsigned default_seconds = 30;
 constexpr std::uint32_t id_ceiling = 254;   // gesture ids are uint8
 
@@ -45,6 +45,11 @@ struct Word {
     Ptr address{};
     std::uint32_t value{};
     unsigned region{};
+    // First change per address is logged, tagged with the phase it happened in:
+    // the animation graph churns hundreds of flags while idle, so the finding is
+    // the set difference between phases, not any single change.
+    bool logged{};
+    unsigned phase{};
 };
 struct State {
     std::mutex mutex;
@@ -58,6 +63,8 @@ struct State {
     ULONGLONG next_sample{};
     ULONGLONG next_heartbeat{};
     unsigned filtered{};
+    unsigned phase{};
+    bool mark_pending{};
     std::vector<Region> regions;
     std::vector<Word> words;
     unsigned changes{}, lines{};
@@ -203,9 +210,9 @@ void arm(Ptr base, Ptr client, const std::string &filter, unsigned seconds) {
     add_region(s, "skater", local.entity, 0x120);
     add_region(s, "anim", local.component, 0x120);
     add_region(s, "holder", local.holder, 0x80);
-    // The whole animation instance: a gesture request is graph state, and the
-    // graph lives in the rig far past the few fields the pose resolver uses.
-    add_region(s, "rig", local.rig, 0x2000);
+    // The whole animation instance: the graph's state and its churning flags
+    // live in the rig, far past the fields the pose resolver uses.
+    add_region(s, "rig", local.rig, 0x4000);
     add_region(s, "definition", local.definition, 0x200);
     // The skater's other components: a gesture request is as likely to live in
     // an emote or expression component as in the animation one.
@@ -246,12 +253,20 @@ void sample() {
         // matters.
         if (word.value > id_ceiling || value > id_ceiling) {
             ++s.filtered;
-        } else if (s.lines < max_changes) {
-            ++s.lines;
-            logging::log(logging::Level::info, logging::Channel::skater,
-                         "Hand props: change {} +{:#x} {} -> {} ({}s left)", s.regions[word.region].name,
-                         static_cast<unsigned>(word.address - s.regions[word.region].address), word.value, value,
-                         s.watch_until > now ? static_cast<unsigned>((s.watch_until - now) / 1000) : 0);
+        } else if (!word.logged) {
+            // One line per address, tagged with the phase. The animation graph
+            // churns while idle, so what identifies a request field is that it
+            // changes in the marked phase and not in the idle one.
+            word.logged = true;
+            word.phase = s.phase;
+            if (s.lines < max_changes) {
+                ++s.lines;
+                logging::log(logging::Level::info, logging::Channel::skater,
+                             "Hand props: change phase{} {} +{:#x} {} -> {} ({}s left)", word.phase,
+                             s.regions[word.region].name,
+                             static_cast<unsigned>(word.address - s.regions[word.region].address), word.value, value,
+                             s.watch_until > now ? static_cast<unsigned>((s.watch_until - now) / 1000) : 0);
+            }
         }
         word.value = value;
     }
@@ -260,16 +275,16 @@ void sample() {
     if (now >= s.next_heartbeat && now < s.watch_until) {
         s.next_heartbeat = now + 5000;
         logging::log(logging::Level::info, logging::Channel::skater,
-                     "Hand props: watching, {} integer change(s) ({} filtered), {}s left.", s.lines, s.filtered,
-                     static_cast<unsigned>((s.watch_until - now) / 1000));
+                     "Hand props: watching, phase{}, {} line(s), {} change(s) ({} filtered), {}s left.", s.phase,
+                     s.lines, s.changes, s.filtered, static_cast<unsigned>((s.watch_until - now) / 1000));
     }
     if (now >= s.watch_until) {
         s.watching = false;
         logging::log(logging::Level::info, logging::Channel::skater,
-                     "Hand props: watch finished: {} integer change(s), {} filtered out, {} words sampled; "
-                     "look for a field that became a gesture id.",
-                     s.lines, s.filtered, s.words.size());
-        set_status(std::format("Hand props: watch finished with {} integer change(s); see the log.", s.lines));
+                     "Hand props: watch finished: {} line(s), {} change(s), {} filtered, {} words, final phase {}; "
+                     "diff phase0 against phase1 for the request.",
+                     s.lines, s.changes, s.filtered, s.words.size(), s.phase);
+        set_status(std::format("Hand props: watch finished with {} line(s); see the log.", s.lines));
     }
 }
 } // namespace
@@ -286,6 +301,12 @@ void request_prop_watch(std::string filter, unsigned seconds) {
     s.filter = std::move(filter);
     s.watch_seconds = seconds;
     s.watch_pending = true;
+    s.mark_pending = false;
+}
+void request_prop_mark() {
+    auto &s = state();
+    std::lock_guard lock(s.mutex);
+    s.mark_pending = true;
 }
 std::string prop_status() {
     std::lock_guard lock(status_mutex());
@@ -321,6 +342,15 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
         }
         // Every frame: a request written and consumed inside one frame is only
         // visible if the sampling keeps up with the client tick.
+        if (s.mark_pending) {
+            s.mark_pending = false;
+            ++s.phase;
+            logging::log(logging::Level::info, logging::Channel::skater,
+                         "Hand props: mark: now phase{} ({}s left).", s.phase,
+                         s.watch_until > GetTickCount64()
+                             ? static_cast<unsigned>((s.watch_until - GetTickCount64()) / 1000)
+                             : 0);
+        }
         sample();
     } catch (const std::exception &e) {
         set_status(std::string("Hand props: ") + e.what());

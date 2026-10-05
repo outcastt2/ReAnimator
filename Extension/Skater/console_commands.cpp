@@ -217,7 +217,7 @@ void register_movement_commands(Commands &registry) {
     // Hand props: the game's own gesture props follow a custom animation, so the
     // trigger is what has to be found before anything is written.
     auto prop = action("prop",
-        "Hand props: prop | prop list [name] | prop watch [name] [seconds] - the gesture props that follow a custom pose",
+        "Hand props: prop | prop list [name] | prop watch [name] [seconds] | prop mark - gesture props that follow a custom pose",
         Group::movement, {argument("mode", Type::text, true), argument("name", Type::text, true),
                           argument("seconds", Type::number, true)});
     prop.execution = Execution::local;
@@ -231,13 +231,18 @@ void register_movement_commands(Commands &registry) {
             return;
         }
         if (mode == "watch") {
-            const auto seconds = args.size() > 2 ? static_cast<unsigned>(std::get<double>(args[2])) : 15u;
+            const auto seconds = args.size() > 2 ? static_cast<unsigned>(std::get<double>(args[2])) : 30u;
             skater::request_prop_watch(name, seconds);
             out("Hand props: watching engine state for " + std::to_string(seconds) +
-                "s; press the gesture now and read the log.");
+                "s; idle for a few seconds, then prop mark, then press the gesture.");
             return;
         }
-        out("usage: prop | prop list [name] | prop watch [name] [seconds]");
+        if (mode == "mark") {
+            skater::request_prop_mark();
+            out("Hand props: phase marked; presses from now on are tagged with it.");
+            return;
+        }
+        out("usage: prop | prop list [name] | prop watch [name] [seconds] | prop mark");
     };
     registry.add(std::move(prop));
 

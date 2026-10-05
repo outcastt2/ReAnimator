@@ -28,6 +28,9 @@ namespace dingosdk::skater {
 
 void request_prop_report(std::string filter);
 void request_prop_watch(std::string filter, unsigned seconds);
+// Bump the watch phase: the log tags each changed address with the phase it
+// first changed in, so an idle phase and a pressing phase can be diffed.
+void request_prop_mark();
 std::string prop_status();
 // Per-frame service on the client thread, beside the other skater ticks.
 void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept;
