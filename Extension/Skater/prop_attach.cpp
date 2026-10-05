@@ -23,7 +23,7 @@ namespace engine = game::build::v20260929::engine;
 // because context floats otherwise drown everything.
 constexpr unsigned item_scan_bytes = 0x60;  // each gesture item's interesting head
 constexpr unsigned max_watch_items = 64;    // sampled items, not a hard limit on discovery
-constexpr unsigned max_changes = 6000;      // the log is a finding, not a trace
+constexpr unsigned max_changes = 12000;     // the log is a finding, not a trace
 constexpr unsigned default_seconds = 60;
 constexpr unsigned idle_seconds = 10;       // phase 0 length before the auto mark
 
@@ -262,9 +262,16 @@ void arm_weight(Ptr base, Ptr client, unsigned seconds) {
     s.changes = s.lines = s.repeats = 0;
     s.phase = 1;
     s.log_every = true;
-    // The animation layer cluster: the first phased run put the gesture's work
-    // between rig+0x3b00 and rig+0x3e00, weights included.
-    add_region(s, "layer", local.rig + 0x3b00, 0x600);
+    // The whole animation instance plus its holders. The narrowed slice came
+    // back silent on a session where the phone demonstrably played, so the
+    // changing state is somewhere else in the rig and the pointer chain has to
+    // be on record to compare sessions.
+    add_region(s, "rig", local.rig, 0x4000);
+    add_region(s, "holder", local.holder, 0x400);
+    add_region(s, "anim", local.component, 0x200);
+    logging::log(logging::Level::info, logging::Channel::skater,
+                 "Hand props: chain component={:#x} holder={:#x} rig={:#x} definition={:#x}.", local.component,
+                 local.holder, local.rig, local.definition);
     if (s.words.empty()) {
         set_status("Hand props: no rig state to watch yet; load a map first.");
         return;
@@ -274,8 +281,8 @@ void arm_weight(Ptr base, Ptr client, unsigned seconds) {
     s.watch_until = s.watch_start + window * 1000ULL;
     s.next_heartbeat = s.watch_start + 5000;
     logging::log(logging::Level::info, logging::Channel::skater,
-                 "Hand props: watching the layer area ({} words at rig+0x3b00) for {}s, every change. "
-                 "Press the gesture a few times and let each one finish.",
+                 "Hand props: watching the animation instance ({} words: rig 16 KB, holder, anim component) for "
+                 "{}s, every change. Press the gesture a few times and let each one finish.",
                  s.words.size(), window);
     set_status(std::format("Hand props: watching the layer weights for {}s; press the gesture a few times.", window));
 }
@@ -341,9 +348,8 @@ void sample() {
     if (now >= s.watch_until) {
         s.watching = false;
         logging::log(logging::Level::info, logging::Channel::skater,
-                     "Hand props: watch finished: {} line(s) over {} address(es), {} change(s), {} words, final "
-                     "phase {}; diff phase0 against phase1.",
-                     s.lines, s.lines, s.changes, s.words.size(), s.phase);
+                     "Hand props: watch finished: {} line(s), {} change(s), {} words, final phase {}.",
+                     s.lines, s.changes, s.words.size(), s.phase);
         set_status(std::format("Hand props: watch finished with {} line(s); see the log.", s.lines));
     }
 }
