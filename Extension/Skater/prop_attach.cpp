@@ -335,6 +335,7 @@ void arm_assets(Ptr base, Ptr client, const std::string &extra, unsigned seconds
         Ptr address{};
     };
     std::vector<Spot> spots;
+    std::vector<Spot> assets;
     bool faulted{};
     // Studio's browser shows a tree, but the engine names an asset by its full
     // path (the vfx catalog spells them "effects/gestures/effectblueprints/
@@ -359,6 +360,10 @@ void arm_assets(Ptr base, Ptr client, const std::string &extra, unsigned seconds
             return;
         }
         logging::log(logging::Level::info, logging::Channel::skater, "Hand props: {} = {:#x}.", name, asset);
+        // A named graph switch is global: the gameplay code writes the value
+        // into the asset, so the asset's own bytes are the live value. Watch
+        // them as well as any instance reference.
+        assets.push_back({name + " asset", asset});
         struct Scan {
             const char *region;
             Ptr address;
@@ -395,6 +400,9 @@ void arm_assets(Ptr base, Ptr client, const std::string &extra, unsigned seconds
     s.phase = 0;
     s.log_every = false;
     s.pose_mode = false;
+    // The asset's own bytes first: a global switch lives there, and the whole
+    // asset header plus payload fits in a small window.
+    for (const auto &asset : assets) add_region(s, asset.label, asset.address, 0x80);
     for (const auto &spot : spots) add_region(s, spot.label, spot.address, 0x20);
     if (s.words.empty()) {
         set_status("Hand props: none of the phone assets are loaded to reference.");
@@ -406,11 +414,11 @@ void arm_assets(Ptr base, Ptr client, const std::string &extra, unsigned seconds
     s.watch_until = s.watch_start + window * 1000ULL;
     s.next_heartbeat = s.watch_start + 5000;
     logging::log(logging::Level::info, logging::Channel::skater,
-                 "Hand props: watching {} words around {} reference(s) for {}s. Idle {}s, then do the gesture "
-                 "(or hold the menu phone) so the two cases can be told apart.",
-                 s.words.size(), spots.size(), window, idle_seconds);
-    set_status(std::format("Hand props: {} phone-asset reference(s), {} words, {}s; idle {}s then gesture.",
-                           spots.size(), s.words.size(), window, idle_seconds));
+                 "Hand props: watching {} words: {} phone asset image(s) and {} instance reference(s), for {}s. "
+                 "Idle {}s, then do the gesture (or hold the menu phone) so the two cases can be told apart.",
+                 s.words.size(), assets.size(), spots.size(), window, idle_seconds);
+    set_status(std::format("Hand props: {} asset image(s), {} reference(s), {} words, {}s; idle {}s then gesture.",
+                           assets.size(), spots.size(), s.words.size(), window, idle_seconds));
 }
 
 void arm_pose(Ptr base, Ptr client, unsigned seconds) {
