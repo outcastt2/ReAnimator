@@ -215,7 +215,7 @@ void register_movement_commands(Commands &registry) {
 
     // Route B: overwrite the local skater's pose with a baked custom animation.
     auto poseanim = action("poseanim",
-        "Custom animation: poseanim test | record | off | play | save <path> | mask auto|full|legs | <file>.rska",
+        "Custom animation: poseanim test | record | off | play | save <path> | mask auto|full|legs | trace 0|1 | <file>.rska",
         Group::movement, {argument("clip", Type::text, true), argument("path", Type::text, true)});
     poseanim.execution = Execution::local;
     poseanim.inspect = [](const Model &) {
@@ -226,10 +226,20 @@ void register_movement_commands(Commands &registry) {
         if (args.empty()) {
             out(skater::pose_playback_status());
             out("Masking: " + skater::pose_mask_name() + ".");
+            out(skater::pose_playback_cost());
+            out(std::string("Layer trace: ") + (skater::pose_trace() ? "on" : "off") + " (poseanim trace 0|1).");
             return;
         }
         const auto clip = std::get<std::string>(args[0]);
         if (lower(clip) == "off") { skater::request_pose_playback_stop(); out("Stopping custom animation..."); return; }
+        if (lower(clip) == "trace") {
+            const auto mode = args.size() > 1 ? std::get<std::string>(args[1]) : std::string{};
+            const bool enabled = mode == "1" || lower(mode) == "on";
+            skater::set_pose_trace(enabled);
+            out(enabled ? "Layer trace on: one geometry line every two seconds."
+                        : "Layer trace off.");
+            return;
+        }
         if (lower(clip) == "mask") {
             // Which joints the clip is allowed to drive. "auto" hands the legs
             // and pelvis to the game while riding or moving, so a clip layers on
