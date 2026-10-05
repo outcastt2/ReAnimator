@@ -16,6 +16,10 @@ struct TransportPeer {
 struct TransportMessage {
     std::uint64_t peer{};
     std::vector<std::uint8_t> bytes;
+    // When Steam received it, in microseconds on a clock of its own (only differences mean
+    // anything); 0 when the transport does not say. A receiver that was kept from reading for a
+    // while gets everything that arrived meanwhile in one go: this is what tells that from a flood.
+    std::uint64_t arrived{};
 };
 // One message of SteamTransport::send_batch, with send()'s arguments; `sent` receives what
 // send() would have returned for it.

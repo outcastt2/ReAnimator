@@ -4,8 +4,8 @@
 #include <algorithm>
 #include <string>
 
-// The role badge ("Dev", "Admin", "Host", "Friend") before a player's name, in chat and on
-// nametags: a pill in the role's colour (animated for developers) with dark text.
+// The role badge ("Dev", "Creator", "Homie", "Admin", "Host", "Friend") before a player's name, in chat
+// and on nametags: a pill in the role's colour (animated for the roles in nametag_gradient.h) with dark text.
 namespace dingosdk::overlay::detail {
 inline float role_badge_width(ImFont *font, float size, const std::string &tag) {
     return tag.empty() ? 0.0f : font->CalcTextSizeA(size * 0.78f, FLT_MAX, 0.0f, tag.c_str()).x + size * 0.7f;

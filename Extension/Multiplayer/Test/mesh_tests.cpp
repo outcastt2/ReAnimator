@@ -35,10 +35,15 @@ bool clear_lobby_guest_objects() { ++simulated_guest_wipes; return true; }
 namespace dingosdk {
 bool teleport_local_skater(const std::array<float, 3>&) { return true; }
 void update_board_lock(std::uintptr_t, std::uintptr_t, bool) noexcept {}
-void update_developer_hoodie(std::uintptr_t, std::uintptr_t, std::uint64_t, std::uint64_t, DeveloperHoodieState &) noexcept {}
-void update_developer_board(std::uintptr_t, std::uintptr_t, std::uint64_t, std::uint64_t, DeveloperBoardState &) noexcept {}
+void update_developer_hoodie(std::uintptr_t, std::uintptr_t, std::uint64_t, std::uint64_t, DeveloperHoodieState &,
+                             const multiplayer::MarkStyles &) noexcept {}
+void update_developer_board(std::uintptr_t, std::uintptr_t, std::uint64_t, std::uint64_t, DeveloperBoardState &,
+                            const multiplayer::MarkStyles &) noexcept {}
 }
 namespace dingosdk::multiplayer {
+// The backend's lists are not read here: a check lists the players it means.
+std::set<std::pair<std::uint64_t, IdentityList>> simulated_identities;
+bool identity_listed(std::uint64_t id, IdentityList list) noexcept { return simulated_identities.contains({id, list}); }
 bool local_allows_player_collision(std::uintptr_t, std::uintptr_t) noexcept { return false; }
 void update_remote_collision(std::uintptr_t, std::uintptr_t, const Pose &, bool, std::uint64_t) noexcept {}
 void expire_remote_collision(std::uintptr_t, std::uint64_t) noexcept {}
@@ -89,6 +94,8 @@ struct SimulatedNetwork {
     static inline std::uint64_t hold_control_to{};
     static inline std::array<unsigned, 3> lane_sends{};
     static inline std::map<std::uint64_t, std::uint64_t> queues;
+    // What a message's arrival time is (TransportMessage::arrived); 0: the transport does not say.
+    static inline std::uint64_t clock{};
     static std::pair<std::uint64_t, std::uint64_t> pair(std::uint64_t a, std::uint64_t b) {
         return {std::min(a, b), std::max(a, b)};
     }
@@ -200,7 +207,7 @@ bool SteamTransport::send(std::uint64_t id, std::span<const std::uint8_t> bytes,
         return true;
     if (!reliable && SimulatedNetwork::lose_unreliable && ++p.unreliable % 5 == 0)
         return true;
-    Impl::bus.at(id)->inbox.push_back({{p.state.local_id, {bytes.begin(), bytes.end()}}, lane});
+    Impl::bus.at(id)->inbox.push_back({{p.state.local_id, {bytes.begin(), bytes.end()}, SimulatedNetwork::clock}, lane});
     return true;
 }
 void SteamTransport::send_batch(std::span<TransportSend> messages) {
@@ -469,6 +476,8 @@ struct Simulation {
     NativeFrame local;
     std::vector<float> positions;
     unsigned capacity, tps;
+    std::size_t held = static_cast<std::size_t>(-1); // a node that is not run: held up, reading nothing
+    bool stamp{};                                     // messages carry when they arrived
     explicit Simulation(unsigned limit = max_players, unsigned rate = 20) : capacity(limit), tps(rate) {
         local.ready = true;
         local.pose.skater.resize(395);
@@ -503,9 +512,10 @@ struct Simulation {
     void run(unsigned frames) {
         for (unsigned i = 0; i < frames; ++i) {
             now += network_tick_us;
+            SimulatedNetwork::clock = stamp ? now : 0;
             for (std::size_t n = 0; n < nodes.size(); ++n) {
                 auto &s = *nodes[n];
-                if (s.mode == Mode::off)
+                if (s.mode == Mode::off || n == held)
                     continue;
                 local.pose.root.position[0] = static_cast<float>(now - 10000000) / 1000000;
                 local.pose.root.position[2] = n < positions.size() ? positions[n] : static_cast<float>(n);
@@ -638,6 +648,164 @@ void party_checks() {
     stop(third, "Left"); sim.run(40);
     check(!host.local_party && host.parties.parties().empty(), "A guest who left the lobby stayed in the host's party");
     std::cout << "Lobby parties: nobody by default, invites, two parties, party chat, leaving and departures passed.\n";
+}
+// A player's badge and colour, in chat and on their nametag: who the backend lists them as
+// comes before what they are in the lobby, and a developer before the other lists.
+void role_checks() {
+    Simulation sim;
+    for (unsigned i = 0; i < 4; ++i) sim.add();
+    sim.run(60); sim.fresh(4);
+    auto &host = *sim.nodes[0], &first = *sim.nodes[1], &second = *sim.nodes[2], &third = *sim.nodes[3];
+    const auto id = [](const Session &s) { return s.transport.status().local_id; };
+    using Role = std::pair<std::uint32_t, std::string>;
+    using L = IdentityList;
+    check(player_role(first, id(host), false) == Role{nametag_host, "Host"} &&
+              player_role(host, id(host), true) == Role{nametag_host, "Host"} &&
+              player_role(host, id(first), false) == Role{nametag_white, {}},
+          "Players the backend does not list did not get their lobby roles");
+
+    simulated_identities = {{id(host), L::homie}, {id(first), L::content_creator},
+                            {id(second), L::developer}, {id(second), L::content_creator}, {id(second), L::homie},
+                            {id(third), L::content_creator}, {id(third), L::homie}};
+    check(player_role(first, id(host), false) == Role{nametag_homie, "Homie"} &&
+              player_role(host, id(host), true) == Role{nametag_homie, "Homie"},
+          "A homie who hosts is not shown as a homie");
+    check(player_role(host, id(first), false) == Role{nametag_creator, "Creator"} &&
+              player_role(first, id(first), true) == Role{nametag_creator, "Creator"},
+          "A content creator is not shown as one");
+    check(player_role(host, id(second), false) == Role{nametag_developer, "Dev"},
+          "A developer on every list is not shown as a developer");
+    check(player_role(host, id(third), false) == Role{nametag_creator, "Creator"},
+          "A content creator who is also a homie is not shown as a creator");
+    // A player who has turned their tag off (the Special page) is whatever they are in the lobby,
+    // to everyone: their appearance carries the choice through the host. Their items are a
+    // separate choice, which leaves the tag alone.
+    auto plain = packet(host, PacketKind::cosmetics, sim.now);
+    plain.appearance = {{skater_recipe_key, 2, {}, {{1, "Outfit0", {}}}}, {board_recipe_key, 1, {}, {{2, "Deck", {}}}}};
+    plain.appearance.hide_items = true;
+    host.cosmetic_packet = encode_wire(plain);
+    broadcast(host, plain, true, false, sim.now);
+    sim.run(20);
+    const auto told = [&](const Session &s) {
+        const auto *peer = find_peer(const_cast<Session &>(s), id(host));
+        return peer && !shows_items(*peer) && shows_tag(*peer);
+    };
+    check(told(first) && told(second) && player_role(first, id(host), false) == Role{nametag_homie, "Homie"},
+          "A homie who turned their items off was not seen to, or lost their tag");
+    // A later packet, as the host's game would send after the change.
+    const auto look = plain.appearance;
+    plain = packet(host, PacketKind::cosmetics, sim.now);
+    plain.appearance = look;
+    plain.appearance.hide_items = false, plain.appearance.hide_tag = true;
+    host.cosmetic_packet = encode_wire(plain);
+    broadcast(host, plain, true, false, sim.now);
+    sim.run(20);
+    check(player_role(first, id(host), false) == Role{nametag_host, "Host"} &&
+              player_role(second, id(host), false) == Role{nametag_host, "Host"},
+          "A homie who turned their tag off still shows as a homie");
+    const auto *shown = find_peer(first, id(host));
+    check(shown && shows_items(*shown), "Turning their tag off turned a player's items off");
+    check(player_role(host, id(first), false) == Role{nametag_creator, "Creator"}, "One player's choice hid another's tag");
+    show_own_items(false);
+    check(player_role(first, id(first), true) == Role{nametag_creator, "Creator"}, "Turning their items off hid a player's own tag");
+    show_own_items(true);
+    show_own_tag(false);
+    check(player_role(first, id(first), true) == Role{nametag_white, {}} &&
+              player_role(host, id(first), false) == Role{nametag_creator, "Creator"},
+          "A player's own choice did not hide their tag from themselves, or hid it from others before they were told");
+    show_own_tag(true);
+    // A chat line carries its sender's role.
+    check(send_chat(first, "new video is up").empty(), "A guest's chat was refused");
+    sim.run(20);
+    const auto said = std::find_if(host.chat.begin(), host.chat.end(), [](const auto &line) { return line.text == "new video is up"; });
+    check(said != host.chat.end() && said->color == nametag_creator && said->tag == "Creator",
+          "A content creator's chat line does not carry their role");
+    simulated_identities.clear();
+    std::cout << "Roles: lobby roles, homie, content creator, developer first and chat lines passed.\n";
+}
+// The backend's bans hold in every session, and reach one that is running: a banned guest is
+// out and cannot come back, the others stay, and nobody stays with a banned host.
+void global_ban_checks() {
+    Simulation sim;
+    for (unsigned i = 0; i < 3; ++i) sim.add();
+    sim.run(60); sim.fresh(3);
+    auto &host = *sim.nodes[0], &first = *sim.nodes[1], &second = *sim.nodes[2];
+    const auto id = [](const Session &s) { return s.transport.status().local_id; };
+    const auto first_id = id(first), host_id = id(host);
+
+    simulated_identities = {{first_id, IdentityList::banned}};
+    sim.run(40);
+    check(first.mode == Mode::off && first.status == banned_notice, "A banned guest stayed in the session");
+    check(!find_peer(host, first_id) && !find_peer(second, first_id), "The session kept a banned guest");
+    check(second.mode == Mode::join && find_peer(host, id(second)), "Banning one guest took another out");
+    // A banned player whose game does not stop itself is turned away by the host all the same.
+    first.mode = Mode::join;
+    first.host_id = host_id;
+    first.transport.join(host_id);
+    host.transport.poll();
+    networking(host, sim.local, sim.now);
+    const auto &links = host.transport.status().peers;
+    check(std::none_of(links.begin(), links.end(), [&](const auto &link) { return link.id == first_id; }) &&
+              !find_peer(host, first_id),
+          "The host let a banned player back in");
+    stop(first, "Left");
+
+    simulated_identities = {{host_id, IdentityList::banned}};
+    sim.run(40);
+    check(host.mode == Mode::off && host.status == banned_notice, "A banned host kept hosting");
+    check(second.mode == Mode::off, "A guest stayed with a banned host");
+    simulated_identities.clear();
+    std::cout << "Global bans: a banned guest, a guest who comes back, the other guests and a banned host passed.\n";
+}
+// A host that is kept from reading for a few seconds (a server whose console held it up) then
+// reads everything its guests sent meanwhile in one go. That is not a flood: nobody is dropped
+// for it, while a real flood still is.
+void stall_checks() {
+    {
+        // 16 s of a player's ordinary traffic read at once, counted by when it arrived.
+        ReceiveBudget backlog;
+        bool kept = true;
+        for (std::uint64_t i = 0; i < 16 * 90; ++i) kept = kept && backlog.accept(5000000 + i * (1000000 / 90), 300);
+        check(kept, "A backlog read after a stall was taken for a flood");
+        ReceiveBudget flood;
+        bool refused = false;
+        for (std::uint64_t i = 0; i < 2000; ++i) refused = refused || !flood.accept(5000000 + i * 100, 300);
+        check(refused, "A flood was let through the packet limit");
+        // Lanes are read one after another, so arrival times step back and forth.
+        ReceiveBudget lanes;
+        refused = false;
+        for (std::uint64_t i = 0; i < 2000; ++i) refused = refused || !lanes.accept(i % 2 ? 9000000 : 9500000, 300);
+        check(refused, "Packets read out of arrival order started the count again");
+    }
+    Simulation sim(max_players, 120);
+    sim.stamp = true;
+    for (unsigned i = 0; i < 4; ++i) sim.add();
+    sim.run(240);
+    auto &host = *sim.nodes[0];
+    const auto connected = [&] {
+        unsigned count{};
+        for (std::size_t n = 1; n < sim.nodes.size(); ++n) {
+            const auto *peer = find_peer(host, sim.nodes[n]->transport.status().local_id);
+            count += peer && peer->handshaken && sim.nodes[n]->mode == Mode::join;
+        }
+        return count;
+    };
+    check(connected() == 3, "The stall fixture did not connect its guests");
+    // Nine seconds unread: under the ten after which a silent player is given up on, and more
+    // than a second's allowance from every guest.
+    const auto sent = sim.nodes[1]->transport.status().sent;
+    sim.held = 0;
+    sim.run(static_cast<unsigned>(9000000 / network_tick_us));
+    sim.held = static_cast<std::size_t>(-1);
+    check(sim.nodes[1]->transport.status().sent - sent > 2ULL * multiplayer_tick_rates.back() + 80 + 32,
+          "The stall fixture did not queue more than the packet limit");
+    sim.run(240);
+    if (host.mode != Mode::host || connected() != 3)
+        for (std::size_t n = 0; n < sim.nodes.size(); ++n)
+            std::cerr << "  node " << n << " mode " << static_cast<int>(sim.nodes[n]->mode) << ": " << sim.nodes[n]->status << "\n";
+    check(host.mode == Mode::host && connected() == 3, "Guests were dropped after their host was held up for a few seconds");
+    SimulatedNetwork::clock = 0;
+    std::cout << "Stalls: a held-up host keeps its guests; floods and out-of-order arrival are still limited.\n";
 }
 // What a host changes outside its physics tuning (the trainer's class values and trick
 // multipliers) reaches its guests while it sets everyone's physics: when it changes, to a
@@ -1933,7 +2101,10 @@ int main(int argc, char **argv) {
         dingosdk::multiplayer::mesh_checks();
         dingosdk::multiplayer::throwdown_routing_checks();
         dingosdk::multiplayer::party_checks();
+        dingosdk::multiplayer::role_checks();
+        dingosdk::multiplayer::global_ban_checks();
         dingosdk::multiplayer::physics_extras_checks();
+        dingosdk::multiplayer::stall_checks();
         dingosdk::multiplayer::scoring_checks();
         dingosdk::multiplayer::object_sync_checks();
         dingosdk::multiplayer::session_controls_checks();

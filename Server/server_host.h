@@ -158,7 +158,8 @@ class Host {
     void change_map(std::string_view map); // a level name, level path or destination
     bool same_map(std::string_view asset) const { return map_hash(map_destination(asset)) == map_; }
     bool accept_data(Guest &source, const Packet &);
-    void receive(std::uint64_t peer, std::span<const std::uint8_t> bytes);
+    // `received_at`: the transport's arrival time for the message (TransportMessage::arrived).
+    void receive(std::uint64_t peer, std::span<const std::uint8_t> bytes, std::uint64_t received_at);
     void receive_cosmetics();
     void sync_objects();
     void apply_layers();

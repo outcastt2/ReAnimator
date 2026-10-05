@@ -19,10 +19,15 @@ struct NametagPlayer {
 };
 // Role colours; friends are the viewer's own Steam friends.
 inline constexpr std::uint32_t nametag_white = 0xffffffffU, nametag_developer = 0xffff78b4U, // purple
-                               nametag_admin = 0xff3dc8ffU,                              // gold
+                               nametag_creator = 0xff6464ffU,                            // red
+                               nametag_homie = 0xff7ae2ffU,                              // gold
+                               nametag_admin = 0xffc674ffU,                              // pink
                                nametag_host = 0xffffc85eU,                               // blue
                                nametag_friend = 0xff8ae07bU;                             // green
-inline constexpr std::uint32_t nametag_developer_start = 0xffff206eU; // #6E20FF, IM_COL32 layout
+// Developers, content creators and homies shimmer from these to their role colour.
+inline constexpr std::uint32_t nametag_developer_start = 0xffff206eU, // #6E20FF, IM_COL32 layout
+                               nametag_creator_start = 0xff2e10c8U,   // #C8102E
+                               nametag_homie_start = 0xff008ae0U;     // #E08A00
 
 // Client thread, once per rendered frame: everyone to label and the local skater's position
 // (for distances). Also reads whether the game is hiding its own nametags right now.

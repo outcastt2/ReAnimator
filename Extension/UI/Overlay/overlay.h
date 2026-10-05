@@ -305,7 +305,7 @@ struct Nametag {
     std::array<float, 3> position{}; // above the skater's head, world space
     std::string name;
     std::uint32_t color{0xffffffffU}; // R, G, B, A bytes (IM_COL32)
-    std::string tag;                  // role badge before the name ("Dev", "Admin", "Host", "Friend")
+    std::string tag;                  // role badge before the name ("Dev", "Creator", "Homie", "Admin", "Host", "Friend")
     float distance{};                 // metres from the local skater
     bool talking{};
 };

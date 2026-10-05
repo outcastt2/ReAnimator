@@ -12,6 +12,7 @@
 #include "Extension/UI/NativeMenu/native_menu.h"
 #include "Extension/Multiplayer/Hud/native_party.h"
 #include "Extension/Multiplayer/Hud/custom_nametags.h"
+#include "Extension/Multiplayer/developer_identity.h"
 #include "Extension/Multiplayer/Hud/follow_camera.h"
 #include "Engine/Game/UI/game_view.h"
 #include "Extension/Multiplayer/Steam/steam_friend_join.h"
@@ -143,9 +144,11 @@ void apply_performance_settings() {
 // of older cards resetting the device while loading (DXGI_ERROR_DEVICE_RESET in
 // gameRendBeginFrame on an RX 580, 2026-10-03). A quarter of the card's dedicated memory, from
 // the game's own 520 MB up to 3.5 GiB (from 16 GB cards up); cards of 6 GB or less keep the
-// game's value.
+// game's value. Cards of up to 12 GB stop at 2 GiB: a quarter was 3 GiB of a 12 GB card, and
+// with a big map and texture mods on top the game ran out of video memory (E_OUTOFMEMORY from
+// CreateCommittedResource on an RTX 4070 SUPER, 2026-10-04).
 namespace mesh_pool {
-constexpr std::uint32_t stock_kb = 532960, most_kb = 3584u * 1024u;
+constexpr std::uint32_t stock_kb = 532960, most_kb = 3584u * 1024u, most_to_12gb_kb = 2048u * 1024u;
 static_assert((std::uint64_t{most_kb} + 24576u) * 1024u <= 0xffffffffull);
 struct Card { std::uint64_t memory{}; std::string name; };
 // The hardware adapter with the most dedicated memory: the one the game renders on (a laptop's
@@ -173,9 +176,11 @@ Card largest_card() {
 }
 // KiB for the pool on this card, or 0 to keep the game's own value.
 std::uint32_t size_kb(std::uint64_t memory) {
-    constexpr std::uint64_t six_gib = 6ull << 30, slack = 256ull << 20; // "6 GB" cards report a little under
+    // Cards report a little under or over their nominal size.
+    constexpr std::uint64_t six_gib = 6ull << 30, twelve_gib = 12ull << 30, slack = 256ull << 20;
     if (memory <= six_gib + slack) return 0;
-    return static_cast<std::uint32_t>(std::clamp<std::uint64_t>(memory / 4 / 1024, stock_kb, most_kb));
+    const auto most = memory <= twelve_gib + slack ? most_to_12gb_kb : most_kb;
+    return static_cast<std::uint32_t>(std::clamp<std::uint64_t>(memory / 4 / 1024, stock_kb, most));
 }
 }
 void apply_mesh_streaming_pool() {
@@ -995,6 +1000,7 @@ void tick(std::uintptr_t client, std::uintptr_t update) {
             DINGO_PROFILE_ZONE("tick/multiplayer");
             dingosdk::multiplayer::tick(r.base,client,multiplayer_ready,r.multiplayer_map,load_multiplayer_map);
         }
+        dingosdk::multiplayer::refresh_identity_lists();
         const bool gesture_mounted=multiplayer_ready && dingosdk::board_gesture::mounted(r.base,client);
         dingosdk::board_gesture::tick(r.base,gesture_mounted);
         dingosdk::board_gesture::routes::tick(r.base,dingosdk::board_gesture::enabled(),gesture_mounted);

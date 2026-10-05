@@ -47,6 +47,10 @@ password           Empty for anyone; otherwise players type it to join.
 welcome            A chat line sent to each player as they join.
 listed             false hides the server; players then need the code.
 auto_update        Install new ReSkate releases when nobody is on (default true).
+global_bans        Turn away players the ReSkate team has banned from multiplayer
+                   (default true). The list is read from api.reskate.dev at startup
+                   and every ten minutes. false lets them in; the server's own
+                   "bans" apply either way.
 votes              Player votes, each off until turned on:
                      "map": {"enabled": true, "percent": 60}   /vote map <map>
                      "kick": {"enabled": true, "percent": 60}  /vote kick <player>
@@ -104,6 +108,7 @@ world_layer_sync   Force the "layers" below on every player.
 layers             World layer key -> "on" / "off".
 admins             SteamID64s (as strings) who may change settings in-game.
 bans               Players who can never join. Managed with ban / unban.
+                   The ReSkate team's own list is separate: see global_bans.
 
 Every change made from the console or by an admin is saved back to this file.
 

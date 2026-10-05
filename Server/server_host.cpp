@@ -1,6 +1,7 @@
 #include "server_host.h"
 #include "server_text.h"
 #include "Extension/Multiplayer/Net/wire_codec.h"
+#include "Extension/Multiplayer/developer_identity.h"
 #include "Extension/Multiplayer/Session/monotonic_clock.h"
 #include "Engine/Core/Text/word_filter.h"
 #include "Engine/Game/Build/supported_build.h"
@@ -414,10 +415,12 @@ bool Host::accept_data(Guest &source, const Packet &p) {
     }
     return true;
 }
-void Host::receive(std::uint64_t peer, std::span<const std::uint8_t> bytes) {
+void Host::receive(std::uint64_t peer, std::span<const std::uint8_t> bytes, std::uint64_t received_at) {
     auto *link = find(peer);
     if (!link) return;
-    if (!link->budget.accept(now_, bytes.size(), 1U)) return drop(peer, "Peer exceeded the multiplayer packet limit.");
+    // Counted by arrival: after the server was held up, everyone's packets are read at once.
+    if (!link->budget.accept(received_at ? received_at : now_, bytes.size(), 1U))
+        return drop(peer, "Peer exceeded the multiplayer packet limit.");
     bool missing_reference{};
     const auto decoded = link->receiver.receive(bytes, missing_reference, world_);
     if (missing_reference) return;
@@ -746,6 +749,11 @@ void Host::tick(std::uint64_t now) {
             transport_.disconnect(link.id, "You are banned from this server.");
             continue;
         }
+        // The backend's list (global_bans.h), which can reach a player who is already on.
+        if (config_.global_bans && multiplayer::reskate_banned(link.id)) {
+            transport_.disconnect(link.id, multiplayer::banned_notice.data());
+            continue;
+        }
         auto *guest = find(link.id);
         if (!guest && join_backoff_.waiting(link.id, now_)) {
             transport_.disconnect(link.id, "Too many failed attempts to join. Wait a little and try again.");
@@ -764,7 +772,7 @@ void Host::tick(std::uint64_t now) {
         }
         if (link.connected && !guest->connected_at) guest->connected_at = now_;
     }
-    for (const auto &message : transport_.receive()) receive(message.peer, message.bytes);
+    for (const auto &message : transport_.receive()) receive(message.peer, message.bytes, message.arrived);
     receive_cosmetics();
     for (auto it = guests_.begin(); it != guests_.end();) {
         auto &g = *(it++)->second;

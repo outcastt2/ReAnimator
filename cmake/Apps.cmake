@@ -56,6 +56,10 @@ if(DINGOSDK_BUILD_LAUNCHER_TESTS AND WIN32)
     target_link_libraries(dingosdk_mod_merge_added_assets_tests PRIVATE dingosdk_mods)
     target_include_directories(dingosdk_mod_merge_added_assets_tests PRIVATE "${PROJECT_SOURCE_DIR}")
     add_test(NAME mod_merge_added_assets COMMAND dingosdk_mod_merge_added_assets_tests)
+    add_executable(dingosdk_item_list_merge_tests Engine/Vfs/Test/item_list_merge_tests.cpp)
+    target_link_libraries(dingosdk_item_list_merge_tests PRIVATE dingosdk_mods)
+    target_include_directories(dingosdk_item_list_merge_tests PRIVATE "${PROJECT_SOURCE_DIR}")
+    add_test(NAME item_list_merge COMMAND dingosdk_item_list_merge_tests "${DINGOSDK_TEST_GAME_ROOT}")
 endif()
 
 if(WIN32)
@@ -128,6 +132,7 @@ endif()
 add_executable(dingosdk_server Server/main.cpp Server/server_host.cpp Server/server_party.cpp
     Extension/Multiplayer/Session/party_book.cpp Server/server_config.cpp Server/steam_server.cpp
     Server/server_update.cpp $<$<BOOL:${WIN32}>:Launcher/updater.cpp>
+    Server/global_bans.cpp Extension/Multiplayer/developer_identity.cpp
     Extension/Multiplayer/Steam/steam_transport.cpp Extension/Multiplayer/Net/protocol.cpp
     Extension/Multiplayer/Net/delta_codec.cpp Extension/Multiplayer/Net/wire_codec.cpp
     Extension/Multiplayer/Remote/playback_buffers.cpp Extension/Multiplayer/Session/password.cpp
@@ -135,7 +140,7 @@ add_executable(dingosdk_server Server/main.cpp Server/server_host.cpp Server/ser
 target_include_directories(dingosdk_server SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/External/steam_networking")
 if(WIN32)
     target_link_libraries(dingosdk_server PRIVATE dingosdk_launcher_support dingosdk_world_layer_scan dingosdk_json
-        dingosdk_lz4 dingosdk_zstd dingosdk_logging dingosdk_miniz dingosdk_word_filter winhttp bcrypt winmm)
+        dingosdk_lz4 dingosdk_zstd dingosdk_logging dingosdk_miniz dingosdk_word_filter dingosdk_https winhttp bcrypt winmm)
     set_target_properties(dingosdk_server PROPERTIES OUTPUT_NAME "ReSkateServer")
     dingosdk_version_info(dingosdk_server "ReSkate dedicated server" "ReSkateServer.exe" VFT_APP)
 else()

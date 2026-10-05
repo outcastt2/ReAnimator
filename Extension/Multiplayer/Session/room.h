@@ -160,11 +160,17 @@ struct JoinBackoff {
         });
     }
 };
+// How much one peer may send in a second. `when` is when the packet arrived (the transport's
+// TransportMessage::arrived), not when it is read: a receiver that could not read for a few
+// seconds (a server whose console held it up, a game loading a map) reads everything that
+// arrived meanwhile at once, and counted by reading time every peer looked like a flood and
+// was dropped. Packets are not always read in arrival order (Steam's lanes are read one after
+// another): one from before the second being counted is counted in it.
 struct ReceiveBudget {
     std::uint64_t since{}, bytes{}, packets{};
-    bool accept(std::uint64_t now, std::size_t size, unsigned sources = 1) {
-        if (now - since >= 1000000) {
-            since = now;
+    bool accept(std::uint64_t when, std::size_t size, unsigned sources = 1) {
+        if (when > since && when - since >= 1000000) {
+            since = when;
             bytes = packets = 0;
         }
         bytes += size;

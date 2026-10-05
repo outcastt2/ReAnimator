@@ -289,7 +289,7 @@ void sort_instances(Document& document) {
 } // namespace detail
 
 Document merge_documents(const Document& base, const std::span<const Document* const> edits,
-                         MergeSummary* summary) {
+                         MergeSummary* summary, const CarryImport& carry) {
     auto result = detail::clone_document(base);
     const auto* baseRoot = base.root();
     if (!baseRoot || !baseRoot->object) throw std::runtime_error("EBX base has no root object");
@@ -302,7 +302,8 @@ Document merge_documents(const Document& base, const std::span<const Document* c
             baseLengths.emplace(field.name, array->size());
 
     MergeSummary totals;
-    for (const auto* edit : edits) {
+    for (std::size_t index = 0; index < edits.size(); ++index) {
+        const auto* edit = edits[index];
         if (!edit) continue;
         const auto* editRoot = edit->root();
         if (!editRoot || !editRoot->object) throw std::runtime_error("EBX edit has no root object");
@@ -320,7 +321,17 @@ Document merge_documents(const Document& base, const std::span<const Document* c
             if (!target)
                 throw std::runtime_error("EBX merge cannot find the base array " + field.name);
             for (auto at = had; at < editArray->size(); ++at) {
-                target->push_back(mapper.value((*editArray)[at]));
+                const auto& entry = (*editArray)[at];
+                const auto* pointer = carry ? std::get_if<PointerReference>(&entry.data) : nullptr;
+                if (pointer && pointer->kind == PointerKind::external && pointer->index >= 0 &&
+                    static_cast<std::size_t>(pointer->index) < edit->imports.size()) {
+                    const auto& reference = edit->imports[static_cast<std::size_t>(pointer->index)];
+                    if (!carry(reference)) {
+                        totals.dropped.push_back({index, reference});
+                        continue;
+                    }
+                }
+                target->push_back(mapper.value(entry));
                 ++totals.arrayEntries;
             }
         }

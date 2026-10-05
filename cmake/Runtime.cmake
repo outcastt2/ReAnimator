@@ -60,6 +60,8 @@ add_library(dingosdk_runtime SHARED
     Extension/Multiplayer/Net/wire_codec.cpp
     Extension/Multiplayer/Net/delta_codec.cpp
     Extension/Multiplayer/Session/password.cpp
+    Extension/Multiplayer/developer_identity.cpp
+    Extension/Multiplayer/developer_identity_fetch.cpp
     Extension/Settings/console_commands.cpp
     Extension/Settings/job_spin.cpp
     Extension/Settings/engine_tweaks.cpp

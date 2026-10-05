@@ -5,6 +5,7 @@
 #include "Extension/Multiplayer/Remote/native_skater.h"
 #include <Windows.h>
 #include <cstring>
+#include <format>
 
 namespace dingosdk {
 namespace {
@@ -23,7 +24,7 @@ void report_hoodie(std::uintptr_t entity, std::uint64_t steam_id, std::string_vi
     }
     if (entry->entity == entity && (entry->message == hash || now - entry->at < 5000)) return;
     *entry = {entity, now, hash};
-    logging::log(level, logging::Channel::customization, "Developer hoodie (Steam {}, actor {:#x}): {}",
+    logging::log(level, logging::Channel::customization, "Skater items (Steam {}, actor {:#x}): {}",
                  steam_id, entity, message);
 }
 // NativeValue is owned by this material. Preserve its padding, type, priority,
@@ -41,12 +42,34 @@ bool publish_materials(std::uintptr_t base, std::uintptr_t item) noexcept {
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
+// What each of the skater's marked cosmetics does for this player: top, bottoms, shoes, ...
+using Animations = std::array<developer_hoodie_detail::ItemAnimation, developer_hoodie_detail::slots.size()>;
+Animations skater_animations(std::uint64_t steam_id, const multiplayer::MarkStyles &styles) noexcept {
+    const auto mark = multiplayer::identity_mark(steam_id);
+    Animations out;
+    for (std::size_t i = 0; i < out.size(); ++i) out[i] = developer_hoodie_detail::item_animation(mark, styles[i]);
+    return out;
+}
+bool any_on(const Animations &animations) noexcept {
+    return std::any_of(animations.begin(), animations.end(), [](const auto &animation) { return animation.on; });
+}
+// Which cosmetics are coloured, and how many colours of each: what is equipped decides.
+std::string coloured(const DeveloperHoodieState &state) {
+    std::array<unsigned, developer_hoodie_detail::slots.size()> colors{};
+    for (const auto &saved : state.colors) ++colors[saved.binding.part];
+    std::string out;
+    for (std::size_t i = 0; i < colors.size(); ++i)
+        if (colors[i]) out += std::format("{}{} ({})", out.empty() ? "" : ", ", multiplayer::mark_item_names[i], colors[i]);
+    return out.empty() ? "nothing equipped has a color to change" : "animation active on " + out;
+}
 } // namespace
 void update_developer_hoodie(std::uintptr_t base, std::uintptr_t entity, std::uint64_t steam_id,
-                             std::uint64_t generation, DeveloperHoodieState &state) noexcept {
-    const bool developer = multiplayer::reskate_developer(steam_id);
+                             std::uint64_t generation, DeveloperHoodieState &state,
+                             const multiplayer::MarkStyles &styles) noexcept {
+    const auto animations = skater_animations(steam_id, styles);
+    const bool listed = any_on(animations);
     if (!entity) { state = {}; return; }
-    if (!developer && !state.count) return;
+    if (!listed && state.colors.empty()) return;
     try {
         auto read = [](std::uintptr_t address, void *out, std::size_t size) { return memory::peek_bytes(address, out, size); };
         std::array<unsigned char, addr::native_cosmetics::publish_materials_prefix.size()> prefix{};
@@ -57,12 +80,10 @@ void update_developer_hoodie(std::uintptr_t base, std::uintptr_t entity, std::ui
         }
         const auto live = developer_hoodie_detail::materials(read, base, entity);
         bool published = true;
-        auto publish = [base, &published](std::uintptr_t item) { published = publish_materials(base, item); };
-        developer_hoodie_detail::animate(state, live, entity, generation, developer, GetTickCount64(), write_color, publish);
+        auto publish = [base, &published](std::uintptr_t item) { if (!publish_materials(base, item)) published = false; };
+        developer_hoodie_detail::animate(state, live, entity, generation, animations, GetTickCount64(), write_color, publish);
         if (!published) report_hoodie(entity, steam_id, "native material publication failed", logging::Level::warning);
-        else if (state.count) report_hoodie(entity, steam_id, "RGB active on the owned hoodie material", logging::Level::info);
-        else if (developer && live.eligible)
-            report_hoodie(entity, steam_id, "waiting for the assigned top slot's color parameters", logging::Level::warning);
+        else if (listed && !live.pending) report_hoodie(entity, steam_id, coloured(state), logging::Level::info);
     } catch (const std::exception &error) {
         report_hoodie(entity, steam_id, error.what(), logging::Level::warning);
     } catch (...) {
@@ -77,10 +98,11 @@ void tick_local_developer_hoodie(std::uintptr_t base, std::uintptr_t client, boo
     if (!ready) return;
     try {
         const auto social = multiplayer::steam_social_snapshot();
-        const auto id = social ? social->local.id : 0;
-        if (!multiplayer::reskate_developer(id) && !state.count) return;
+        const auto id = social && multiplayer::own_items_shown() ? social->local.id : 0;
+        const auto styles = developer_hoodie_detail::own_styles.load();
+        if (!any_on(skater_animations(id, styles)) && state.colors.empty()) return;
         const auto local = multiplayer::capture_local(base, client, false);
-        if (local.ready) update_developer_hoodie(base, local.entity, id, local.context, state);
+        if (local.ready) update_developer_hoodie(base, local.entity, id, local.context, state, styles);
         else report_hoodie(client, id, local.detail, logging::Level::warning);
     } catch (...) {}
 }

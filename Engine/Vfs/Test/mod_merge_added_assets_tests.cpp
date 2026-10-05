@@ -328,7 +328,8 @@ void copy_in_the_adders_toc_is_left_alone() {
 // Two asset mods each add test/song, each named by a change of its own (the rival's is to the
 // other asset). Only one can be carried into the map's copy: the higher-priority mod's. When the
 // two are different assets the merge says whose the name went to; the same asset added by both
-// is no clash and is not reported.
+// is no clash and is not reported. The bundle the two mods share keeps one asset per name as
+// well, and says so the same way.
 void same_name_from_two_mods(bool different) {
     const std::string label = different ? "name clash" : "same asset twice";
     Fixture fixture(different ? "name-clash" : "same-twice");
@@ -345,6 +346,10 @@ void same_name_from_two_mods(bool different) {
                                     "other mods' copies of the bundle get music's");
     expect(said == different, label + (different ? ": the merge says whose asset the name went to\n"
                                                  : ": nothing is reported\n") + describe(report));
+    const bool kept = noted(report, std::string("rival: ") + bundle_name + ": 1 added asset(s) share a name with ones "
+                                    "music adds, e.g. test/song; the merged bundle keeps music's");
+    expect(kept == different, label + (different ? ": the merge says whose asset the shared bundle keeps\n"
+                                                 : ": nothing is reported about the shared bundle\n") + describe(report));
     expect(noted(report, std::string("map: ") + bundle_name + ": 3 asset(s) added by other mods, e.g. test/song"),
            label + ": the map's copy still receives the first mod's three\n" + describe(report));
 }

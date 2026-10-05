@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <charconv>
+#include <sstream>
 #include <stdexcept>
 #include <ctime>
 
@@ -324,6 +325,43 @@ std::string edit_nametag_style(Session &s, std::string_view argument) {
     profile_runtime::set_local_preference("CustomNametags", s.custom_nametags);
     return s.custom_nametags ? "ReSkate nametags: names, distances and dots." : "The game's own nametags.";
 }
+// The Special page: a player on one of the backend's lists going without their tag, or
+// without the animation on their items. Their next appearance packet tells everyone
+// (session_send.cpp).
+std::string edit_own_tag(Session &, std::string_view argument) {
+    const auto shown = parse_switch(argument, own_tag_shown());
+    if (!shown) return "Use on, off, or toggle for your tag.";
+    show_own_tag(*shown);
+    profile_runtime::set_local_preference("IdentityTag", *shown);
+    return *shown ? "Your tag shows." : "Your tag is hidden, for you and everyone you skate with.";
+}
+std::string edit_own_items(Session &, std::string_view argument) {
+    const auto shown = parse_switch(argument, own_items_shown());
+    if (!shown) return "Use on, off, or toggle for your items.";
+    show_own_items(*shown);
+    profile_runtime::set_local_preference("IdentityItems", *shown);
+    return *shown ? "Your items animate." : "Your items are plain, for you and everyone you skate with.";
+}
+// The Special page: how one of the player's marked cosmetics is coloured, as
+// "<cosmetic> <mode> <rrggbb> <rrggbb> <speed>" (MarkStyle). It goes out with their next
+// appearance packet and is kept in their profile.
+std::string edit_mark_style(Session &, std::string_view argument) {
+    std::istringstream in{std::string(argument)};
+    unsigned item{}, mode{}, from{}, to{}, speed{};
+    if (!(in >> item >> mode >> std::hex >> from >> to >> std::dec >> speed) || item >= mark_items || mode > 3 ||
+        from > 0xffffff || to > 0xffffff || speed > 2)
+        return "That is not a cosmetic style.";
+    const auto colour = [](unsigned value) {
+        return std::array<std::uint8_t, 3>{static_cast<std::uint8_t>(value >> 16), static_cast<std::uint8_t>(value >> 8),
+                                           static_cast<std::uint8_t>(value)};
+    };
+    auto styles = developer_hoodie_detail::own_styles.load();
+    styles[item] = {static_cast<MarkMode>(mode), colour(from), colour(to), static_cast<std::uint8_t>(speed)};
+    developer_hoodie_detail::own_styles.store(styles);
+    profile_runtime::set_local_values({{"IdentityStyles", Json(developer_hoodie_detail::mark_styles_text(styles))}});
+    return std::string(mark_item_names[item]) +
+           (mode == 1 ? ": off." : mode == 2 ? ": your gradient." : mode == 3 ? ": your color." : ": back to the usual.");
+}
 // Hidden chat still receives lines, so showing it again brings back the conversation.
 std::string edit_chat_visible(Session &s, std::string_view argument) {
     const auto visible = parse_switch(argument, s.chat_visible);
@@ -436,12 +474,18 @@ std::string send_admin(Session &s, std::string text) {
     if (!send_packet(s, s.host_id, request, true, false)) return "Could not reach the server.";
     return "Sent to the server.";
 }
+// The Special page's commands. They are a player's own offline as well, where their hoodie and
+// board still animate.
+bool own_mark_command(std::string_view action) {
+    return action == "mark-tag" || action == "mark-items" || action == "mark-style";
+}
 } // namespace
 bool queue_command(std::string_view action, std::string_view argument, std::string_view password) {
-    if (launcher::offline_mode()) return false;
+    if (launcher::offline_mode() && !own_mark_command(action)) return false;
     if ((action != "host" && action != "host-config" && action != "join" && action != "join-lobby" && action != "join-friend-lobby" && action != "stop" &&
          action != "distances" && action != "object-placement" && action != "kick" && action != "clear-objects" &&
          action != "nametags" && action != "nametag-style" && action != "chat-visible" && action != "chat-filter" &&
+         !own_mark_command(action) &&
          action != "voice" && action != "voice-mute" &&
          action != "voice-volume" && action != "voice-allow" && action != "voice-range" && action != "chat" && action != "ban" && action != "unban" &&
          action != "world-layer-sync" && action != "noclip-allow" && action != "nobail-allow" && action != "boosts-allow" &&
@@ -465,7 +509,8 @@ bool queue_command(std::string_view action, std::string_view argument, std::stri
     return true;
 }
 std::string command(std::string_view action, std::string_view argument, std::string_view password) {
-    if (launcher::offline_mode()) return "Multiplayer is unavailable in offline mode. Start Steam and relaunch ReSkate.";
+    if (launcher::offline_mode() && !own_mark_command(action))
+        return "Multiplayer is unavailable in offline mode. Start Steam and relaunch ReSkate.";
     const bool configured_host = action == "host-config";
     if (configured_host) action = "host";
     PrivateRequest input;
@@ -620,6 +665,7 @@ std::string command(std::string_view action, std::string_view argument, std::str
             {"world-layer-sync", edit_world_layer_sync},   {"distances", edit_distances},
             {"nametags", edit_nametags},
             {"nametag-style", edit_nametag_style},
+            {"mark-tag", edit_own_tag}, {"mark-items", edit_own_items}, {"mark-style", edit_mark_style},
             {"chat-visible", edit_chat_visible}, {"chat-filter", edit_chat_filter}};
         for (const auto &[name, edit] : settings)
             if (action == name) {
@@ -705,6 +751,8 @@ std::string command(std::string_view action, std::string_view argument, std::str
             publish(s);
             return s.status;
         };
+        // Joining is for the host or the server to refuse (a server may opt out of the bans).
+        if (action == "host" && reskate_banned(s.transport.status().local_id)) return refuse(std::string(banned_notice));
         if (action == "host") {
             const auto space = argument.find(' ');
             if (space != std::string_view::npos) {

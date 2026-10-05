@@ -310,6 +310,23 @@ inline bool dedicated_host(const Session &s) { return s.mode == Mode::join && ga
 inline bool steam_vouched(const Session &s, const Peer &peer) {
     return s.mode != Mode::join || peer.member.id == s.host_id || peer.direct_ready;
 }
+// Whether a player shows the tag the backend gives them, and whether the items that come with
+// it animate: not until their appearance has arrived, and not when it says they turned that
+// off (Appearance::hide_tag, Appearance::hide_items).
+inline bool shows_tag(const Peer &peer) {
+    const auto &look = peer.appearance.value();
+    return look && !look->hide_tag;
+}
+inline bool shows_items(const Peer &peer) {
+    const auto &look = peer.appearance.value();
+    return look && !look->hide_items;
+}
+// How a player has each of their marked cosmetics animate: what their appearance says.
+inline const MarkStyles &mark_styles(const Peer &peer) {
+    static const MarkStyles standard{};
+    const auto &look = peer.appearance.value();
+    return look ? look->marks : standard;
+}
 Peer *find_peer(Session &s, std::uint64_t id);
 unsigned player_count(const Session &s);
 void reset_peer(Session &s, std::size_t slot);
@@ -327,7 +344,9 @@ bool is_banned(Session &s, std::uint64_t id);
 // Re-reads friend_ids when the Steam social snapshot has changed.
 void refresh_friends(Session &s);
 void add_chat(Session &s, std::uint64_t sender, std::string name, std::string text, bool local = false);
-// A player's role colour and badge ("Dev", "Admin", "Host", "Friend" or none), shown in chat
+// The colour and badge of one of the backend's categories.
+std::pair<std::uint32_t, std::string> mark_role(IdentityList list);
+// A player's role colour and badge ("Dev", "Creator", "Homie", "Admin", "Host", "Friend" or none), shown in chat
 // and on their nametag. `local`: the local player.
 std::pair<std::uint32_t, std::string> player_role(Session &s, std::uint64_t id, bool local);
 // Sends one line from this player; returns why not when it cannot.

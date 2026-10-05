@@ -81,6 +81,11 @@ if(DINGOSDK_BUILD_MULTIPLAYER_TESTS)
             dingosdk_lz4 dingosdk_zstd)
     endif()
     add_test(NAME server_config COMMAND dingosdk_server_config_tests)
+    add_executable(dingosdk_global_bans_tests Server/Test/global_bans_tests.cpp Server/global_bans.cpp
+        Extension/Multiplayer/developer_identity.cpp)
+    target_include_directories(dingosdk_global_bans_tests PRIVATE "${PROJECT_SOURCE_DIR}")
+    target_link_libraries(dingosdk_global_bans_tests PRIVATE dingosdk_json $<$<BOOL:${WIN32}>:dingosdk_https>)
+    add_test(NAME server_global_bans COMMAND dingosdk_global_bans_tests)
     add_executable(dingosdk_word_filter_tests Engine/Core/Text/Test/word_filter_tests.cpp)
     target_link_libraries(dingosdk_word_filter_tests PRIVATE dingosdk_word_filter)
     add_test(NAME word_filter COMMAND dingosdk_word_filter_tests)
@@ -155,6 +160,11 @@ if(DINGOSDK_BUILD_MULTIPLAYER_TESTS AND WIN32)
     target_link_libraries(dingosdk_multiplayer_mesh_tests PRIVATE dingosdk_logging dingosdk_launcher_support dingosdk_lz4 dingosdk_zstd bcrypt
         dingosdk_word_filter)
     add_test(NAME multiplayer_mesh COMMAND dingosdk_multiplayer_mesh_tests)
+    add_executable(dingosdk_developer_identity_tests
+        Extension/Multiplayer/Test/developer_identity_tests.cpp Extension/Multiplayer/developer_identity.cpp
+        Extension/Multiplayer/developer_identity_fetch.cpp)
+    target_link_libraries(dingosdk_developer_identity_tests PRIVATE dingosdk_json dingosdk_https dingosdk_logging winhttp)
+    add_test(NAME developer_identity COMMAND dingosdk_developer_identity_tests)
     add_executable(dingosdk_settings_lock_tests Engine/Game/Settings/Test/multiplayer_settings_lock_tests.cpp)
     target_include_directories(dingosdk_settings_lock_tests PRIVATE "${PROJECT_SOURCE_DIR}")
     add_test(NAME multiplayer_settings_lock COMMAND dingosdk_settings_lock_tests)

@@ -8,6 +8,7 @@
 //
 // Dropping a folder on the exe writes the pack next to it, in "<folder>_pack".
 #include "Engine/Core/Json/json.h"
+#include "Engine/Core/Platform/path_text.h"
 #include <Windows.h>
 #include <wincodec.h>
 #include <wrl/client.h>
@@ -26,6 +27,7 @@
 using Microsoft::WRL::ComPtr;
 namespace fs = std::filesystem;
 using dingosdk::Json;
+using dingosdk::path_utf8;
 
 namespace {
 // ReSkate's loader limits (chat_emotes.cpp): frames at most 256 x 256, names of letters,
@@ -198,10 +200,12 @@ std::vector<Frame> tidy(std::vector<Frame> frames, std::size_t limit) {
     return thinned;
 }
 
+// Built from the wide name: path::string() throws on a character outside the ANSI code page,
+// and one such file would stop the whole pack.
 std::string emote_name(const fs::path &file) {
     std::string name;
-    for (const char c : file.stem().string())
-        name += std::isalnum(static_cast<unsigned char>(c)) ? c : '_';
+    for (const wchar_t c : file.stem().wstring())
+        name += c < 128 && std::isalnum(static_cast<unsigned char>(c)) ? static_cast<char>(c) : '_';
     if (name.size() > max_name) name.resize(max_name);
     return name.empty() ? std::string("emote") : name;
 }
@@ -266,7 +270,7 @@ Options parse(int argc, wchar_t **argv) {
         if (arg == L"--size") o.size = std::stoi(value());
         else if (arg == L"--max-frames") o.max_frames = static_cast<std::size_t>(std::stoul(value()));
         else if (arg == L"--max-width") o.max_width = std::stoi(value());
-        else if (arg == L"--name") o.name = fs::path(value()).string();
+        else if (arg == L"--name") o.name = path_utf8(value());
         else if (arg == L"--help" || arg == L"-h" || arg == L"/?") throw std::invalid_argument("");
         else positional.emplace_back(arg);
     }
@@ -281,16 +285,16 @@ Options parse(int argc, wchar_t **argv) {
 }
 
 int run(const Options &o) {
-    if (!fs::is_directory(o.input)) throw std::runtime_error("not a folder: " + o.input.string());
+    if (!fs::is_directory(o.input)) throw std::runtime_error("not a folder: " + path_utf8(o.input));
     std::vector<fs::path> files;
     for (const auto &entry : fs::directory_iterator(o.input)) {
-        const auto extension = lowered(entry.path().extension().string());
+        const auto extension = lowered(path_utf8(entry.path().extension()));
         if (entry.is_regular_file() && (extension == ".png" || extension == ".gif" || extension == ".jpg" ||
                                         extension == ".jpeg" || extension == ".bmp" || extension == ".webp"))
             files.push_back(entry.path());
     }
     std::sort(files.begin(), files.end());
-    if (files.empty()) throw std::runtime_error("no .png, .gif, .jpg, .bmp or .webp files in " + o.input.string());
+    if (files.empty()) throw std::runtime_error("no .png, .gif, .jpg, .bmp or .webp files in " + path_utf8(o.input));
 
     std::vector<Emote> emotes;
     std::set<std::string> names, folded;
@@ -298,6 +302,8 @@ int run(const Options &o) {
     for (const auto &file : files) {
         try {
             auto name = emote_name(file);
+            if (std::none_of(name.begin(), name.end(), [](unsigned char c) { return std::isalnum(c); }))
+                throw std::runtime_error("no letters or digits to name it by; rename the file");
             for (int n = 2; names.contains(name); ++n) {
                 const auto suffix = "_" + std::to_string(n);
                 name = emote_name(file).substr(0, max_name - suffix.size()) + suffix;
@@ -315,10 +321,10 @@ int run(const Options &o) {
             names.insert(name);
             std::printf("  :%s:  %dx%d%s\n", name.c_str(), frames.front().image.width, frames.front().image.height,
                         frames.size() > 1 ? (", " + std::to_string(frames.size()) + " frames").c_str() : "");
-            emotes.push_back({name, file.filename().string(), std::move(frames)});
+            emotes.push_back({name, path_utf8(file.filename()), std::move(frames)});
         } catch (const std::exception &e) {
             ++failed;
-            std::printf("  skipped %s: %s\n", file.filename().string().c_str(), e.what());
+            std::printf("  skipped %s: %s\n", path_utf8(file.filename()).c_str(), e.what());
         }
     }
     if (emotes.empty()) throw std::runtime_error("no pictures could be read");
@@ -367,13 +373,14 @@ int run(const Options &o) {
     std::printf("\n%zu emotes (%zu frames) in a %dx%d atlas%s.\nWrote %s\\emotes.json and emotes.png.\n"
                 "Copy both into the repository's assets\\emotes and rebuild ReSkate.dll.\n",
                 emotes.size(), total, o.max_width, height, failed ? (", " + std::to_string(failed) + " skipped").c_str() : "",
-                o.output.string().c_str());
+                path_utf8(o.output).c_str());
     return failed ? 2 : 0;
 }
 } // namespace
 
 int wmain(int argc, wchar_t **argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0); // progress shows as it happens, even through a pipe
+    SetConsoleOutputCP(CP_UTF8);               // file names are printed as UTF-8
     const bool own_console = [] {
         DWORD processes[2];
         return GetConsoleProcessList(processes, 2) == 1; // started by double-click or drag-and-drop

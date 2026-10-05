@@ -631,4 +631,11 @@ Document read_document(const std::span<const std::byte> bytes) {
     return result;
 }
 
+Guid read_file_guid(const std::span<const std::byte> bytes) {
+    BinaryReader reader(bytes);
+    const auto chunks = read_chunks(reader);
+    reader.seek(unique_chunk(chunks, efix, "EFIX").begin);
+    return reader.guid();
+}
+
 }

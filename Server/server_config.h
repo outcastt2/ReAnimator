@@ -38,6 +38,7 @@ struct ServerConfig {
     std::string welcome;       // sent to each player as they join
     bool listed = true;        // shown in the in-game server browser
     bool auto_update = true;   // install new releases when nobody is on
+    bool global_bans = true;   // turn away players the ReSkate team has banned (global_bans.h)
     bool activity_log = true;  // console lines for throwdowns, objects and loading
     bool announce_throwdowns = true; // tell everyone in chat when a throwdown drop is placed
     // Players form parties (/party, the game's Social menu): 2-8 players each (the game's Party

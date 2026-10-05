@@ -696,7 +696,8 @@ std::vector<TransportMessage> SteamTransport::receive() {
                 continue;
             }
             const auto *data = static_cast<const std::uint8_t *>(message->m_pData);
-            result.push_back({id, {data, data + message->m_cbSize}});
+            result.push_back({id, {data, data + message->m_cbSize},
+                              message->m_usecTimeReceived > 0 ? static_cast<std::uint64_t>(message->m_usecTimeReceived) : 0});
             ++p.state.received;
             p.state.received_bytes += static_cast<std::uint64_t>(message->m_cbSize);
         }

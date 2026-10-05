@@ -194,5 +194,8 @@ struct Document {
 };
 
 [[nodiscard]] Document read_document(std::span<const std::byte> bytes);
+// The document's own guid, which is what another document's import names it by,
+// without reading the rest.
+[[nodiscard]] Guid read_file_guid(std::span<const std::byte> bytes);
 
 }

@@ -331,8 +331,30 @@ void cosmetics_codec() {
                     {board_recipe_key, 1, {0x3f800000}, {{13, "Own_Deck", {7}}}}};
     const auto bytes = encode(p);
     const auto decoded = decode(bytes);
-    check(decoded && decoded->appearance == p.appearance,
+    check(decoded && decoded->appearance == p.appearance && !decoded->appearance.hide_tag && !decoded->appearance.hide_items,
           "Cosmetic fields or opaque parameter bits were lost");
+    // A player's choices to go without their backend tag, or its animated items, travel with
+    // their outfit, each on its own.
+    for (const auto &[tag, items] : {std::pair{true, false}, std::pair{false, true}, std::pair{true, true}}) {
+        auto hidden = p;
+        hidden.appearance.hide_tag = tag, hidden.appearance.hide_items = items;
+        const auto told = decode(encode(hidden));
+        check(told && told->appearance.hide_tag == tag && told->appearance.hide_items == items &&
+                  told->appearance == hidden.appearance && !(told->appearance == p.appearance),
+              "A player's choice to hide their tag or their items was lost");
+    }
+    // So does how they have each marked cosmetic animate.
+    auto styled = p;
+    styled.appearance.marks[0] = {MarkMode::gradient, {1, 2, 3}, {250, 251, 252}, 2};
+    styled.appearance.marks[4] = {MarkMode::off, {}, {}, 1};
+    styled.appearance.marks.back() = {MarkMode::solid, {9, 8, 7}, {}, 0};
+    const auto kept = decode(encode(styled));
+    check(kept && kept->appearance == styled.appearance && kept->appearance.marks[0].to[2] == 252 &&
+              kept->appearance.marks.back().mode == MarkMode::solid && kept->appearance.marks.back().from[0] == 9 &&
+              kept->appearance.marks[1] == MarkStyle{} && !(kept->appearance == p.appearance),
+          "A player's cosmetic styles were lost");
+    check(!valid_mark_style({static_cast<MarkMode>(4), {}, {}, 0}) && !valid_mark_style({MarkMode::standard, {}, {}, 3}),
+          "A cosmetic style no menu can make was accepted");
     for (std::size_t n = 0; n < bytes.size(); ++n)
         check(!decode(std::span(bytes).first(n)), "Truncated cosmetics accepted");
     auto corrupt = bytes;

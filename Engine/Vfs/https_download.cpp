@@ -2,6 +2,9 @@
 #include <Windows.h>
 #include <winhttp.h>
 #include <array>
+#include <atomic>
+#include <fstream>
+#include <iterator>
 #include <string>
 
 namespace dingosdk::https {
@@ -71,5 +74,25 @@ Download get(std::wstring_view url, const std::filesystem::path& destination,
     if (!FlushFileBuffers(output.value)) return fail(GetLastError());
     result.ok = true;
     return result;
+}
+
+std::optional<std::string> get_text(std::wstring_view url, std::uint64_t max_bytes,
+    std::uint32_t timeout_seconds, const wchar_t* agent, Download* result) {
+    static std::atomic<unsigned> serial{};
+    wchar_t folder[MAX_PATH + 1]{};
+    const auto length = GetTempPathW(MAX_PATH, folder);
+    const auto path = std::filesystem::path(length ? std::wstring(folder, length) : L".") /
+        (L"reskate-get-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(++serial) + L".tmp");
+    std::error_code error;
+    std::filesystem::remove(path, error); // get needs a fresh destination
+    const auto download = get(url, path, max_bytes, timeout_seconds, agent);
+    if (result) *result = download;
+    std::optional<std::string> text;
+    if (download.ok) {
+        std::ifstream in(path, std::ios::binary);
+        text.emplace(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    std::filesystem::remove(path, error);
+    return text;
 }
 }

@@ -259,6 +259,11 @@ void publish_party(Session &s) {
         s.custom_nametags = profile_runtime::local_preference("CustomNametags").value_or(true);
         s.chat_visible = profile_runtime::local_preference("ChatVisible").value_or(true);
         s.chat_filter = profile_runtime::local_preference("ChatFilter").value_or(true);
+        show_own_tag(profile_runtime::local_preference("IdentityTag").value_or(true));
+        show_own_items(profile_runtime::local_preference("IdentityItems").value_or(true));
+        if (const auto saved = profile_runtime::local_value("IdentityStyles"); saved && saved->is_string())
+            if (const auto styles = developer_hoodie_detail::parse_mark_styles(saved->string()))
+                developer_hoodie_detail::own_styles.store(*styles);
         apply_nametags(s);
     }
     // The party's limit: parties players form hold up to eight (the game's Party panel rows),
@@ -429,7 +434,9 @@ void render(Session &s, std::uintptr_t client, const NativeFrame &local, std::ui
         }
     };
     // The developer hoodie and board mark an identity: only one Steam vouches for (steam_vouched).
-    const auto developer_id = [&](const Peer &p) { return steam_vouched(s, p) ? p.member.id : std::uint64_t{}; };
+    const auto developer_id = [&](const Peer &p) {
+        return steam_vouched(s, p) && shows_items(p) ? p.member.id : std::uint64_t{};
+    };
     each_active_peer(s, [&](Peer &p) {
         // A dedicated server has no skater to show.
         if (!p.member.id || (dedicated_host(s) && p.member.id == s.host_id))
@@ -438,8 +445,10 @@ void render(Session &s, std::uintptr_t client, const NativeFrame &local, std::ui
         // A far player between samples: their skater keeps its pose; sound, the label and
         // the spectate position are still refreshed (sound events are released one per frame).
         if (was_visible && local.ready && !p.render_failed && p.far_interval && now < p.next_far_sample) {
-            update_developer_hoodie(s.base, remote_skater_entity(), developer_id(p), remote_skater_generation(), p.developer_hoodie);
-            update_developer_board(s.base, remote_board_entity(), developer_id(p), remote_skater_generation(), p.developer_board);
+            update_developer_hoodie(s.base, remote_skater_entity(), developer_id(p), remote_skater_generation(), p.developer_hoodie,
+                                    mark_styles(p));
+            update_developer_board(s.base, remote_board_entity(), developer_id(p), remote_skater_generation(), p.developer_board,
+                                   mark_styles(p));
             present_audio(p);
             update_party_position(&p.render_pose);
             if (labels) label(p);
@@ -520,9 +529,9 @@ void render(Session &s, std::uintptr_t client, const NativeFrame &local, std::ui
             }
         }
         update_developer_hoodie(s.base, p.visible ? remote_skater_entity() : 0, developer_id(p),
-                                 remote_skater_generation(), p.developer_hoodie);
+                                 remote_skater_generation(), p.developer_hoodie, mark_styles(p));
         update_developer_board(s.base, p.visible ? remote_board_entity() : 0, developer_id(p),
-                               remote_skater_generation(), p.developer_board);
+                               remote_skater_generation(), p.developer_board, mark_styles(p));
         if (!p.visible) {
             stop_remote_audio();
             p.presented_audio.reset();

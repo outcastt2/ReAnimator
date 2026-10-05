@@ -21,6 +21,7 @@ Json to_json(const ServerConfig &c) {
     root["welcome"] = c.welcome;
     root["listed"] = c.listed;
     root["auto_update"] = c.auto_update;
+    root["global_bans"] = c.global_bans;
     root["activity_log"] = c.activity_log;
     root["announce_throwdowns"] = c.announce_throwdowns;
     root["parties"] = c.parties;
@@ -115,6 +116,7 @@ ServerConfig load_config(const std::filesystem::path &file, std::vector<std::str
     c.welcome = root.value("welcome", c.welcome);
     c.listed = root.value("listed", c.listed);
     c.auto_update = root.value("auto_update", c.auto_update);
+    c.global_bans = root.value("global_bans", c.global_bans);
     c.activity_log = root.value("activity_log", c.activity_log);
     c.announce_throwdowns = root.value("announce_throwdowns", c.announce_throwdowns);
     c.parties = root.value("parties", c.parties);

@@ -265,6 +265,17 @@ void networking(Session &s, const NativeFrame &local, std::uint64_t now) {
         stop(s, s.transport.status().detail);
         return;
     }
+    // The backend's bans (reskate_banned) arrive while a session runs: a banned player stops
+    // hosting theirs, and nobody stays with a banned host. A banned guest is for the host or
+    // the server to turn away (below, and Host::tick), which a server may choose not to.
+    if (s.mode == Mode::host && reskate_banned(s.transport.status().local_id)) {
+        stop(s, std::string(banned_notice));
+        return;
+    }
+    if (s.mode == Mode::join && reskate_banned(s.host_id)) {
+        stop(s, "This host is banned from ReSkate multiplayer.");
+        return;
+    }
     for (const auto &link : links) {
         if (s.mode == Mode::host && s.banned.contains(link.id)) {
             s.transport.disconnect(link.id, "You were kicked from this session.");
@@ -272,6 +283,10 @@ void networking(Session &s, const NativeFrame &local, std::uint64_t now) {
         }
         if (s.mode == Mode::host && is_banned(s, link.id)) {
             s.transport.disconnect(link.id, "You are banned from this host's lobbies.");
+            continue;
+        }
+        if (s.mode == Mode::host && reskate_banned(link.id)) {
+            s.transport.disconnect(link.id, banned_notice.data());
             continue;
         }
         auto *p = find_peer(s, link.id);
@@ -334,7 +349,7 @@ void networking(Session &s, const NativeFrame &local, std::uint64_t now) {
         if (!link)
             continue;
         const bool direct_link = s.mode == Mode::join && message.peer != s.host_id;
-        if (!link->budget.accept(now, message.bytes.size(),
+        if (!link->budget.accept(message.arrived ? message.arrived : now, message.bytes.size(),
                                  s.mode == Mode::join && !direct_link ? max_remote_players : 1U)) {
             disconnect(s, message.peer, "Peer exceeded the multiplayer packet limit.");
             if (s.mode == Mode::off)

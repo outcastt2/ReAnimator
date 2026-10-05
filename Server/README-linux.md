@@ -7,6 +7,9 @@ Self-update is disabled on Linux (V1) — update by replacing the binary.
 
 - 64-bit Linux (tested: CachyOS/Arch, Ubuntu 22.04+ should work).
 - `cmake >= 3.24`, `g++ >= 12` (C++20), `libssl-dev` (OpenSSL), `libcurl` headers optional (not needed for V1).
+- `curl` on the machine that runs the server: it is how the server reads the ReSkate team's
+  global ban list (`api.reskate.dev`). Without it the server says so in its log and enforces
+  only its own bans. Not needed with `"global_bans": false`.
 - Steam shared libs beside the binary: `libsteam_api.so` + `steamclient.so`
   (Valve proprietary, not in git — but bundled in the CI/release assets,
   like the Windows zip bundles its DLLs; otherwise fetch them, see below).
@@ -65,8 +68,8 @@ cmake --build --preset linux-release -j$(nproc)
 ctest --test-dir build/linux --output-on-failure
 ```
 
-Expected: 8 passed (`multiplayer_parties`, `server_activity`, `server_speed_check`,
-`server_config`, `word_filter`, `multiplayer_bandwidth`, `multiplayer_lanes`,
+Expected: 9 passed (`multiplayer_parties`, `server_activity`, `server_speed_check`,
+`server_config`, `server_global_bans`, `word_filter`, `multiplayer_bandwidth`, `multiplayer_lanes`,
 `multiplayer_prediction`). Windows-only tests (voice, lobbies, UI) stay `WIN32`-gated.
 
 ## Run
