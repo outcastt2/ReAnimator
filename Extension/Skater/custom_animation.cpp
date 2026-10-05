@@ -57,6 +57,7 @@ struct Playback {
     std::atomic<std::uint32_t> record_frames{};
     std::uint32_t record_capacity{};
     ULONGLONG record_started{};
+    float record_fps{60.0f};
 };
 Playback &playback() { static Playback p; return p; }
 std::mutex &status_mutex() { static std::mutex m; return m; }
@@ -200,11 +201,17 @@ void on_pose_evaluated(std::uintptr_t component) noexcept {
             return;
         }
         std::lock_guard lock(p.mutex);
-        if (p.clip.frames == 0 || p.clip.data.empty()) return;
+        if (p.clip.frames == 0 || p.clip.data.empty() || p.clip.joints <= 2) return;
         const auto frame = static_cast<std::uint32_t>(
             (static_cast<double>(elapsed_ms) * p.clip.fps / 1000.0)) % p.clip.frames;
-        write_frame(buffer, p.clip.data.data() + static_cast<std::size_t>(frame) * p.clip.joints * floats_per_joint,
-                    p.clip.joints);
+        // Joints 0 and 1 are not pose: joint 1 carries the skater's world
+        // placement, and the game drives it from the board and physics. Leaving
+        // it alone is what keeps the skater on the board, the way a gesture
+        // animates in place while the player keeps moving.
+        write_frame(buffer + 2 * 0x30ULL,
+                    p.clip.data.data() + static_cast<std::size_t>(frame) * p.clip.joints * floats_per_joint +
+                        2 * floats_per_joint,
+                    p.clip.joints - 2);
         note_write();
     } catch (...) {
     }
@@ -245,11 +252,16 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
         if (stop) {
             if (p.recording.load(std::memory_order_acquire)) {
                 const auto frames = p.record_frames.load(std::memory_order_acquire);
+                const auto elapsed = GetTickCount64() - p.record_started;
+                p.record_fps = elapsed > 0
+                    ? static_cast<float>(static_cast<double>(frames) * 1000.0 / static_cast<double>(elapsed)) : 60.0f;
+                if (p.record_fps < 1.0f || p.record_fps > 240.0f) p.record_fps = 60.0f;
                 p.recording.store(false, std::memory_order_release);
                 p.component.store(0, std::memory_order_release);
                 set_status("Recording stopped (" + std::to_string(frames) + " frames). Run poseanim play.");
                 logging::log(logging::Level::info, logging::Channel::skater,
-                             "Custom animation: recording stopped after {} frames.", frames);
+                             "Custom animation: recording stopped after {} frames over {} ms ({:.1f} fps).",
+                             frames, elapsed, p.record_fps);
                 return;
             }
             p.playing.store(false, std::memory_order_release);
@@ -338,10 +350,7 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
             Clip clip;
             clip.joints = expected_skater_joints;
             clip.frames = frames;
-            const auto elapsed = GetTickCount64() - p.record_started;
-            clip.fps = elapsed > 0
-                ? static_cast<float>(static_cast<double>(frames) * 1000.0 / static_cast<double>(elapsed)) : 60.0f;
-            if (clip.fps < 1.0f || clip.fps > 240.0f) clip.fps = 60.0f;
+            clip.fps = p.record_fps;
             clip.data.assign(p.record_data.begin(),
                              p.record_data.begin() + static_cast<std::size_t>(frames) * clip.joints * floats_per_joint);
             const auto fps = clip.fps;
