@@ -139,6 +139,7 @@ struct Playback {
     float speed{};
     bool moving{};
     bool on_board{};
+    bool mask_engaged{};
 };
 Playback &playback() { static Playback p; return p; }
 std::mutex &status_mutex() { static std::mutex m; return m; }
@@ -286,6 +287,12 @@ float mask_weight(Playback &p, ULONGLONG now) noexcept {
     bool engaged = false;
     if (mode == PoseMask::legs) engaged = true;
     else if (mode == PoseMask::automatic) engaged = p.on_board || p.moving;
+    if (engaged != p.mask_engaged) {
+        p.mask_engaged = engaged;
+        logging::log(logging::Level::info, logging::Channel::skater,
+                     "Custom animation: mask {} (on board {}, moving {}, {:.2f} m/s).",
+                     engaged ? "engaged" : "released", p.on_board, p.moving, p.speed);
+    }
     const float target = engaged ? 1.0f : 0.0f;
     const auto elapsed = now > p.mask_updated ? now - p.mask_updated : 0;
     p.mask_updated = now;
@@ -632,6 +639,7 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
         p.moving = false;
         p.speed = 0.0f;
         p.on_board = false;
+        p.mask_engaged = false;
         p.mask_updated = GetTickCount64();
         // The write that survives is the one after the engine's post-physics
         // response. That hook belongs to No Bail, which installs it at startup;
@@ -751,7 +759,8 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
         p.playing.store(true, std::memory_order_release);
         set_status("Custom animation playing: " + p.clip_name + ".");
         logging::log(logging::Level::info, logging::Channel::skater,
-                     "Custom animation: playing {} on component {:#x}.", p.clip_name, component);
+                     "Custom animation: playing {} on component {:#x} (mask {}).", p.clip_name, component,
+                     pose_mask_name());
     } catch (const std::exception &e) {
         set_status(std::string("Custom animation: ") + e.what());
     } catch (...) {
