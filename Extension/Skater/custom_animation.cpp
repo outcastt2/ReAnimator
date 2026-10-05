@@ -142,9 +142,10 @@ void on_pose_evaluated(std::uintptr_t component) noexcept {
         if (!buffer) return;
         // Confirm once per playback that the write is actually happening.
         const auto note_write = [&p] {
-            if (p.writes.fetch_add(1, std::memory_order_relaxed) == 0)
+            const auto count = p.writes.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count == 1 || count == 10 || count == 100 || count == 1000 || count == 10000)
                 logging::log(logging::Level::info, logging::Channel::skater,
-                             "Custom animation: pose written to the output buffer.");
+                             "Custom animation: pose written ({} times).", count);
         };
         const auto elapsed_ms = GetTickCount64() - p.started;
         if (p.test.load(std::memory_order_relaxed)) {
@@ -154,7 +155,7 @@ void on_pose_evaluated(std::uintptr_t component) noexcept {
             std::array<float, 12> bone{};
             if (!readable(buffer + test_joint * 0x30ULL, bone.data(), sizeof(bone))) return;
             const float phase = static_cast<float>(elapsed_ms) * 0.003f;
-            const float angle = 0.6f * std::sin(phase);
+            const float angle = 1.0f * std::sin(phase);
             const float half = angle * 0.5f, s = std::sin(half), c = std::cos(half);
             const float qx = bone[4], qy = bone[5], qz = bone[6], qw = bone[7];
             // q_new = q_old * q_delta, with q_delta a rotation about local +X (up).
@@ -225,7 +226,8 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
             p.saved_joints = 0;
             p.component.store(0, std::memory_order_release);
             set_status("Custom animation stopped.");
-            logging::log(logging::Level::info, logging::Channel::skater, "Custom animation: stopped.");
+            logging::log(logging::Level::info, logging::Channel::skater,
+                         "Custom animation: stopped after {} pose writes.", p.writes.load());
             return;
         }
         if (!pending) {
