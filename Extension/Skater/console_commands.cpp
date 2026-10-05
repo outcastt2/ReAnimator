@@ -200,8 +200,8 @@ void register_movement_commands(Commands &registry) {
 
     // Route B: overwrite the local skater's pose with a baked custom animation.
     auto poseanim = action("poseanim",
-        "Custom animation: poseanim test | record | off | play | <file>.rska",
-        Group::movement, {argument("clip", Type::text, true)});
+        "Custom animation: poseanim test | record | off | play | save <path> | <file>.rska",
+        Group::movement, {argument("clip", Type::text, true), argument("path", Type::text, true)});
     poseanim.execution = Execution::local;
     poseanim.inspect = [](const Model &) {
         return State{true, {}, {}, skater::pose_playback_status(), false};
@@ -210,10 +210,27 @@ void register_movement_commands(Commands &registry) {
         if (args.empty()) { out(skater::pose_playback_status()); return; }
         const auto clip = std::get<std::string>(args[0]);
         if (lower(clip) == "off") { skater::request_pose_playback_stop(); out("Stopping custom animation..."); return; }
+        if (lower(clip) == "save") {
+            const auto path = args.size() > 1 ? std::get<std::string>(args[1]) : std::string{};
+            if (path.empty()) { out("usage: poseanim save <path>"); return; }
+            const auto error = skater::save_recorded_clip(path);
+            out(error.empty() ? "Saved: " + path : "error: " + error);
+            return;
+        }
         skater::request_pose_playback(clip);
         out("Starting custom animation " + clip + "...");
     };
     registry.add(std::move(poseanim));
+
+    auto dumpskeleton = action("dumpskeleton", "Write the live skater skeleton resource beside the log",
+        Group::movement);
+    dumpskeleton.execution = Execution::local;
+    dumpskeleton.inspect = [](const Model &) { return State{true, {}, {}, {}, false}; };
+    dumpskeleton.run = [](const Model &, const Values &, const Output &out) {
+        skater::request_skeleton_dump();
+        out("Dumping the skeleton...");
+    };
+    registry.add(std::move(dumpskeleton));
 }
 void register_ai_commands(Commands &registry) {
     const auto ready = [](const Model &m) {

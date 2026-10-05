@@ -58,8 +58,10 @@ struct Playback {
     std::vector<float> record_data;
     std::atomic<std::uint32_t> record_frames{};
     std::uint32_t record_capacity{};
+    std::uint32_t record_joints{};
     ULONGLONG record_started{};
     float record_fps{60.0f};
+    bool dump_request{};
 };
 Playback &playback() { static Playback p; return p; }
 std::mutex &status_mutex() { static std::mutex m; return m; }
@@ -250,8 +252,11 @@ void on_skeleton_responded(std::uintptr_t rig) noexcept {
                 auto *dst = p.record_data.data() + static_cast<std::size_t>(frame) * pose.joints * floats_per_joint;
                 pack_frame(pose.buffer, pose.joints, dst);
                 p.record_frames.store(frame + 1, std::memory_order_release);
-                if (frame == 0)
-                    logging::log(logging::Level::info, logging::Channel::skater, "Custom animation: recording.");
+                if (frame == 0) {
+                    p.record_joints = pose.joints;
+                    logging::log(logging::Level::info, logging::Channel::skater,
+                                 "Custom animation: recording {} joints.", pose.joints);
+                }
             }
             return;
         }
@@ -274,6 +279,73 @@ void request_pose_playback_stop() {
 }
 void request_pose_record() { request_pose_playback("record"); }
 void request_pose_record_playback() { request_pose_playback("play"); }
+
+std::string save_recorded_clip(std::string_view path) {
+    try {
+        auto &p = playback();
+        const auto frames = p.record_frames.load(std::memory_order_acquire);
+        const auto joints = p.record_joints;
+        if (frames < 2 || joints <= 2) return "nothing has been recorded yet";
+        std::ofstream out(std::string(path), std::ios::binary | std::ios::trunc);
+        if (!out) return "cannot write " + std::string(path);
+        std::array<char, 20> header{};
+        const std::uint32_t version = 1;
+        const float fps = p.record_fps;
+        std::memcpy(header.data(), "RSKA", 4);
+        std::memcpy(header.data() + 4, &version, 4);
+        std::memcpy(header.data() + 8, &joints, 4);
+        std::memcpy(header.data() + 12, &frames, 4);
+        std::memcpy(header.data() + 16, &fps, 4);
+        out.write(header.data(), header.size());
+        out.write(reinterpret_cast<const char *>(p.record_data.data()),
+                  static_cast<std::streamsize>(static_cast<std::size_t>(frames) * joints * floats_per_joint *
+                                               sizeof(float)));
+        out.close();
+        logging::log(logging::Level::info, logging::Channel::skater,
+                     "Custom animation: saved {} frames x {} joints to {}.", frames, joints, std::string(path));
+        return {};
+    } catch (const std::exception &e) {
+        return std::string("save failed: ") + e.what();
+    }
+}
+
+void request_skeleton_dump() {
+    std::lock_guard lock(playback().mutex);
+    playback().dump_request = true;
+}
+
+namespace {
+// The live skeleton resource, beside the log. Read-only: this is the only place
+// the joint hierarchy and the bind pose can come from, and neither is in the
+// pose buffer.
+std::string write_skeleton_dump(std::uintptr_t base, std::uintptr_t client) {
+    const auto component = local_component(base, client);
+    if (!component) return "the local skater's animation component is unavailable.";
+    std::uintptr_t holder{};
+    if (!readable(component + 0xa0, &holder, 8) || !holder) return "the animation holder is unavailable.";
+    std::uintptr_t rig{};
+    if (!readable(holder + 0x78, &rig, 8) || !rig) return "the animation rig is unavailable.";
+    std::uintptr_t definition{};
+    if (!readable(rig + 0x18, &definition, 8) || !definition) return "the animation definition is unavailable.";
+    std::uintptr_t resource{};
+    if (!readable(definition + 0x1a0, &resource, 8) || !resource) return "the skeleton resource is unavailable.";
+    std::uint32_t count{};
+    if (!readable(resource + 0xc, &count, 4)) return "the skeleton bone count is unavailable.";
+    constexpr std::size_t window = 0x80000;
+    std::vector<std::byte> bytes(window);
+    if (!readable(resource, bytes.data(), bytes.size())) return "the skeleton resource could not be read.";
+    const auto path = logging::status().directory / L"skeleton_dump.bin";
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return "cannot write the skeleton dump.";
+    out.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    out.close();
+    logging::log(logging::Level::info, logging::Channel::skater,
+                 "Skeleton dump: component={:#x} holder={:#x} rig={:#x} definition={:#x} resource={:#x} joints={}.",
+                 component, holder, rig, definition, resource, count);
+    return "Skeleton dumped: " + std::to_string(count) + " joints at resource 0x" + std::to_string(resource) +
+           " -> skeleton_dump.bin";
+}
+} // namespace
 std::string pose_playback_status() {
     std::lock_guard lock(status_mutex());
     return playback().status;
@@ -332,6 +404,10 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
             logging::log(logging::Level::info, logging::Channel::skater,
                          "Custom animation: stopped after {} pose writes.", p.writes.load());
             return;
+        }
+        if (p.dump_request) {
+            p.dump_request = false;
+            set_status(write_skeleton_dump(base, client));
         }
         if (!pending) {
             // A level change or respawn frees the pose buffer: stop rather than
