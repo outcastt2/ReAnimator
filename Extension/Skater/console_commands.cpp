@@ -223,15 +223,32 @@ void register_movement_commands(Commands &registry) {
     prop.execution = Execution::local;
     prop.inspect = [](const Model &) { return State{true, {}, {}, skater::prop_status(), false}; };
     prop.run = [](const Model &, const Values &args, const Output &out) {
-        const auto mode = args.empty() ? std::string{} : lower(std::get<std::string>(args[0]));
-        const auto name = args.size() > 1 ? lower(std::get<std::string>(args[1])) : std::string{};
+        // Arguments arrive as a variant: "prop weight 45" puts the number in the
+        // text slot, so read both rather than assuming a lane.
+        const auto text_at = [&](std::size_t index) -> std::string {
+            if (index >= args.size() || !std::holds_alternative<std::string>(args[index])) return {};
+            return lower(std::get<std::string>(args[index]));
+        };
+        const auto number_at = [&](std::size_t index, unsigned fallback) -> unsigned {
+            if (index >= args.size()) return fallback;
+            try {
+                if (std::holds_alternative<double>(args[index])) return static_cast<unsigned>(std::get<double>(args[index]));
+                if (std::holds_alternative<std::int64_t>(args[index])) return static_cast<unsigned>(std::get<std::int64_t>(args[index]));
+                if (std::holds_alternative<std::uint64_t>(args[index])) return static_cast<unsigned>(std::get<std::uint64_t>(args[index]));
+                if (const auto text = text_at(index); !text.empty()) return static_cast<unsigned>(std::stoul(text));
+            } catch (...) {
+            }
+            return fallback;
+        };
+        const auto mode = text_at(0);
+        const auto name = text_at(1);
         if (mode.empty() || mode == "list") {
             skater::request_prop_report(name);
             out("Hand props: listing the loaded gesture items in the log...");
             return;
         }
         if (mode == "watch") {
-            const auto seconds = args.size() > 2 ? static_cast<unsigned>(std::get<double>(args[2])) : 60u;
+            const auto seconds = number_at(2, 60u);
             skater::request_prop_watch(name, seconds);
             out("Hand props: watching for " + std::to_string(seconds) +
                 "s. Idle for ~10s, then press the gesture three times; the phase flips by itself.");
@@ -243,7 +260,7 @@ void register_movement_commands(Commands &registry) {
             return;
         }
         if (mode == "weight") {
-            const auto seconds = args.size() > 1 ? static_cast<unsigned>(std::get<double>(args[1])) : 45u;
+            const auto seconds = number_at(1, 45u);
             skater::request_prop_weight(seconds);
             out("Hand props: watching the layer area for " + std::to_string(seconds) +
                 "s; press the gesture a few times, letting each finish.");
