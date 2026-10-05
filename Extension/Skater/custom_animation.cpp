@@ -44,6 +44,10 @@ struct Playback {
     ULONGLONG started{};
     bool pending{}, stop{}, pending_test{};
     std::string pending_clip;
+    // The pose as it was when playback began, written back on stop so a write
+    // into an idle graph's output buffer does not outlive the animation.
+    std::vector<std::byte> saved_pose;
+    std::uint32_t saved_joints{};
 };
 Playback &playback() { static Playback p; return p; }
 std::mutex &status_mutex() { static std::mutex m; return m; }
@@ -84,15 +88,36 @@ bool load_clip(const std::string &path, Clip &clip, std::string &error) {
     return true;
 }
 
-// The output pose buffer for a component, or 0.
-std::uintptr_t pose_buffer(std::uintptr_t base, std::uintptr_t component) {
+// The output pose buffer for a component, or {0, 0}.
+struct PoseLocation {
+    std::uintptr_t buffer{};
+    std::uint32_t joints{};
+};
+PoseLocation pose_location(std::uintptr_t base, std::uintptr_t component) {
     std::uintptr_t holder{};
-    if (!readable(component + 0xa0, &holder, 8) || !holder) return 0;
+    if (!readable(component + 0xa0, &holder, 8) || !holder) return {};
     const auto reader = [](std::uintptr_t address, void *out, std::size_t size) {
         return readable(address, out, size);
     };
     const auto pose = multiplayer::read_native_pose_layout(reader, base, holder, skater_joint_bound);
-    return pose.buffer;
+    return {pose.buffer, pose.count};
+}
+
+// The local skater's animation component, or 0.
+std::uintptr_t local_component(std::uintptr_t base, std::uintptr_t client) {
+    try {
+        nsd::require(ptr(client) == base + addr::engine::client_vtable, "Local client is unavailable.");
+        const auto context = ptr(client, 8);
+        const auto offset = read<std::uint32_t>(base, addr::engine::context_player_manager_offset);
+        nsd::require(offset <= 0x1000000, "Player manager offset changed.");
+        const auto manager = ptr(context, offset);
+        const auto begin = ptr(manager, 0x4c8);
+        const auto player = ptr(begin);
+        const auto entity = ptr(player, 0xb8);
+        return ptr(entity, 0x628);
+    } catch (...) {
+        return 0;
+    }
 }
 
 void write_frame(std::uintptr_t buffer, const float *frame, std::uint32_t joints) noexcept {
@@ -111,17 +136,25 @@ void on_pose_evaluated(std::uintptr_t component) noexcept {
         auto &p = playback();
         if (!p.playing.load(std::memory_order_acquire)) return;
         if (component != p.component.load(std::memory_order_acquire)) return;
-        const auto buffer = pose_buffer(p.base, component);
+        const auto pose = pose_location(p.base, component);
+        const auto buffer = pose.buffer;
         if (!buffer) return;
         const auto elapsed_ms = GetTickCount64() - p.started;
         if (p.test.load(std::memory_order_relaxed)) {
-            // A procedural head bob: read the evaluated pose and move the head.
+            // Rotate the head in its own space. Rotation is scale-invariant; a
+            // local translation here would be multiplied by the whole parent
+            // chain when it is composed to world, which flings the head away.
             std::array<float, 12> bone{};
             if (!readable(buffer + test_joint * 0x30ULL, bone.data(), sizeof(bone))) return;
-            const float phase = static_cast<float>(elapsed_ms) * 0.004f;
-            bone[8] += 0.0f;
-            bone[9] += 0.35f * std::sin(phase);
-            bone[10] += 0.20f * std::cos(phase * 0.7f);
+            const float phase = static_cast<float>(elapsed_ms) * 0.003f;
+            const float angle = 0.6f * std::sin(phase);
+            const float half = angle * 0.5f, s = std::sin(half), c = std::cos(half);
+            const float qx = bone[4], qy = bone[5], qz = bone[6], qw = bone[7];
+            // q_new = q_old * q_delta, with q_delta a rotation about local +X (up).
+            bone[4] = qw * s + qx * c;
+            bone[5] = qy * c + qz * s;
+            bone[6] = qz * c - qy * s;
+            bone[7] = qw * c - qx * s;
             (void)nsd::write(buffer + test_joint * 0x30ULL, bone.data(), sizeof(bone));
             return;
         }
@@ -167,26 +200,41 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
         }
         if (stop) {
             p.playing.store(false, std::memory_order_release);
+            // Put the pose captured at start back over the output buffer. Joint
+            // 1 carries world placement, so it is left alone: restoring it would
+            // teleport the skater back to where they stood when playback began.
+            const auto component = p.component.load(std::memory_order_acquire);
+            if (component && p.saved_joints > 2 && !p.saved_pose.empty()) {
+                const auto pose = pose_location(base, component);
+                if (pose.buffer && pose.joints > 2) {
+                    const auto joints = p.saved_joints < pose.joints ? p.saved_joints : pose.joints;
+                    (void)nsd::write(pose.buffer + 2 * 0x30ULL, p.saved_pose.data() + 2 * 0x30ULL,
+                                     static_cast<std::size_t>(joints - 2) * 0x30);
+                }
+            }
+            p.saved_pose.clear();
+            p.saved_joints = 0;
             p.component.store(0, std::memory_order_release);
             set_status("Custom animation stopped.");
             logging::log(logging::Level::info, logging::Channel::skater, "Custom animation: stopped.");
             return;
         }
-        if (!pending) return;
-        // The local skater's animation component.
-        std::uintptr_t component{};
-        try {
-            nsd::require(ptr(client) == base + addr::engine::client_vtable, "Local client is unavailable.");
-            const auto context = ptr(client, 8);
-            const auto offset = read<std::uint32_t>(base, addr::engine::context_player_manager_offset);
-            nsd::require(offset <= 0x1000000, "Player manager offset changed.");
-            const auto manager = ptr(context, offset);
-            const auto begin = ptr(manager, 0x4c8);
-            const auto player = ptr(begin);
-            const auto entity = ptr(player, 0xb8);
-            component = ptr(entity, 0x628);
-        } catch (const std::exception &e) {
-            set_status(std::string("Custom animation: ") + e.what());
+        if (!pending) {
+            // A level change or respawn frees the pose buffer: stop rather than
+            // keep writing to a component that is no longer the local skater.
+            if (p.playing.load(std::memory_order_acquire) &&
+                p.component.load(std::memory_order_acquire) != local_component(base, client)) {
+                p.playing.store(false, std::memory_order_release);
+                p.saved_pose.clear();
+                p.saved_joints = 0;
+                p.component.store(0, std::memory_order_release);
+                set_status("Custom animation stopped (the skater changed).");
+            }
+            return;
+        }
+        const auto component = local_component(base, client);
+        if (!component) {
+            set_status("Custom animation: the local skater's animation component is unavailable.");
             return;
         }
         if (pending_test) {
@@ -215,6 +263,14 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
         }
         multiplayer::set_pose_playback_listener(&on_pose_evaluated);
         p.base = base;
+        // Capture the current pose so stop can put it back.
+        p.saved_pose.clear();
+        p.saved_joints = 0;
+        if (const auto pose = pose_location(base, component); pose.buffer && pose.joints > 2) {
+            p.saved_pose.resize(static_cast<std::size_t>(pose.joints) * 0x30);
+            if (readable(pose.buffer, p.saved_pose.data(), p.saved_pose.size())) p.saved_joints = pose.joints;
+            else p.saved_pose.clear();
+        }
         p.component.store(component, std::memory_order_release);
         p.started = GetTickCount64();
         p.playing.store(true, std::memory_order_release);
