@@ -24,7 +24,7 @@ constexpr unsigned watch_hz = 5;
 constexpr unsigned item_scan_bytes = 0x60;  // each gesture item's interesting head
 constexpr unsigned max_watch_items = 64;    // sampled items, not a hard limit on discovery
 constexpr unsigned max_changes = 400;       // the log is a finding, not a trace
-constexpr unsigned default_seconds = 15;
+constexpr unsigned default_seconds = 30;
 
 struct Item {
     std::string name;
@@ -34,7 +34,7 @@ struct Item {
     std::uint8_t layered{}, stationary{};
 };
 struct Local {
-    Ptr player{}, entity{}, component{}, holder{}, rig{};
+    Ptr context{}, manager{}, player{}, entity{}, component{}, holder{}, rig{};
 };
 struct Region {
     std::string name;
@@ -55,6 +55,7 @@ struct State {
     bool watching{};
     ULONGLONG watch_until{};
     ULONGLONG next_sample{};
+    ULONGLONG next_heartbeat{};
     std::vector<Region> regions;
     std::vector<Word> words;
     unsigned changes{}, lines{};
@@ -137,8 +138,10 @@ bool resolve_local(Ptr base, Ptr client, Local &out) {
     const auto context = pointer(client + 8);
     if (!context || !memory::peek(base + engine::context_player_manager_offset, offset) || offset > 0x1000000)
         return false;
+    out.context = context;
     const auto manager = pointer(context + offset);
     if (!manager || pointer(manager) != base + engine::local_player_manager_vtable) return false;
+    out.manager = manager;
     const auto begin = pointer(manager + 0x4c8), end = pointer(manager + 0x4d0);
     if (!begin || end != begin + 8) return false;
     out.player = pointer(begin);
@@ -191,11 +194,24 @@ void arm(Ptr base, Ptr client, const std::string &filter, unsigned seconds) {
     for (const auto &item : items)
         add_region(s, "item " + item.name.substr(std::string("own_rctn_gesture_all_").size()), item.data,
                    item_scan_bytes);
+    add_region(s, "context", local.context, 0x100);
+    add_region(s, "manager", local.manager, 0x100);
     add_region(s, "player", local.player, 0x200);
     add_region(s, "skater", local.entity, 0x120);
     add_region(s, "anim", local.component, 0x120);
     add_region(s, "holder", local.holder, 0x80);
     add_region(s, "rig", local.rig, 0x100);
+    // The skater's other components: a gesture request is as likely to live in
+    // an emote or expression component as in the animation one.
+    const auto collection = pointer(local.component + 0x70);
+    std::uint8_t count{};
+    if (collection && memory::peek(collection + 8, count) && pointer(collection) == local.entity) {
+        for (unsigned i = 0; i < count && i < 24; ++i) {
+            const auto component = pointer(collection + 0x20 + std::uintptr_t{i} * 0x20);
+            if (!component) continue;
+            add_region(s, std::format("comp[{}]", i), component, 0x80);
+        }
+    }
     if (s.words.empty()) {
         set_status("Hand props: no state to watch yet; load a map first.");
         return;
@@ -204,6 +220,7 @@ void arm(Ptr base, Ptr client, const std::string &filter, unsigned seconds) {
     s.watching = true;
     s.watch_until = GetTickCount64() + window * 1000ULL;
     s.next_sample = 0;
+    s.next_heartbeat = GetTickCount64() + 5000;
     logging::log(logging::Level::info, logging::Channel::skater,
                  "Hand props: watching {} words over {} region(s) for {}s{}. Press the gesture now.",
                  s.words.size(), s.regions.size(), window, filter.empty() ? "" : " (filter \"" + filter + "\")");
@@ -226,6 +243,14 @@ void sample() {
                          s.watch_until > now ? static_cast<unsigned>((s.watch_until - now) / 1000) : 0);
         }
         word.value = value;
+    }
+    // A heartbeat, so a quiet window is provably a quiet window and the press
+    // can be placed on the timeline from the log alone.
+    if (now >= s.next_heartbeat && now < s.watch_until) {
+        s.next_heartbeat = now + 5000;
+        logging::log(logging::Level::info, logging::Channel::skater,
+                     "Hand props: watching, {} change(s) so far, {}s left.", s.changes,
+                     static_cast<unsigned>((s.watch_until - now) / 1000));
     }
     if (now >= s.watch_until) {
         s.watching = false;
