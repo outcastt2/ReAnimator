@@ -1,5 +1,6 @@
 #include "prop_attach.h"
 #include "Gestures/board_gesture_layout.h"
+#include "Extension/Multiplayer/Remote/native_pose_layout.h"
 #include "Engine/Core/Log/logging.h"
 #include "Engine/Core/Platform/memory.h"
 #include "Engine/Game/Build/addresses.h"
@@ -69,6 +70,9 @@ struct State {
     bool mark_pending{};
     bool weight_pending{};
     unsigned weight_seconds{45};
+    bool pose_pending{};
+    unsigned pose_seconds{45};
+    bool pose_mode{};   // pose-buffer watch: joints and fields, not raw words
     std::vector<Region> regions;
     std::vector<Word> words;
     unsigned changes{}, lines{};
@@ -287,6 +291,46 @@ void arm_weight(Ptr base, Ptr client, unsigned seconds) {
     set_status(std::format("Hand props: watching the layer weights for {}s; press the gesture a few times.", window));
 }
 
+void arm_pose(Ptr base, Ptr client, unsigned seconds) {
+    auto &s = state();
+    Local local;
+    if (!resolve_local(base, client, local)) {
+        set_status("Hand props: the local skater is not ready to watch.");
+        return;
+    }
+    const auto reader = [](Ptr address, void *out, std::size_t size) { return memory::read_bytes(address, out, size); };
+    const auto pose = multiplayer::read_native_pose_layout(reader, base, local.holder, 512);
+    if (!pose.buffer || pose.count < 395) {
+        set_status("Hand props: the skater's output pose is not ready.");
+        return;
+    }
+    const auto window = seconds ? seconds : s.pose_seconds;
+    s.regions.clear();
+    s.words.clear();
+    s.changes = s.lines = s.repeats = 0;
+    s.phase = 0;
+    s.log_every = false;
+    s.pose_mode = true;
+    // The whole output pose, every joint. If the phone hangs off a socket joint
+    // in the skeleton, that joint moves when the phone appears and this is where
+    // it shows.
+    add_region(s, "pose", pose.buffer, pose.count * 0x30);
+    if (s.words.empty()) {
+        set_status("Hand props: no pose state to watch yet.");
+        return;
+    }
+    s.watching = true;
+    s.watch_start = GetTickCount64();
+    s.watch_until = s.watch_start + window * 1000ULL;
+    s.next_heartbeat = s.watch_start + 5000;
+    logging::log(logging::Level::info, logging::Channel::skater,
+                 "Hand props: watching the output pose ({} joints, {} words) for {}s. Idle {}s, then hold the phone "
+                 "out (pause menu or gesture); every joint field that moves is logged once per phase.",
+                 pose.count, s.words.size(), window, idle_seconds);
+    set_status(std::format("Hand props: watching the pose for {}s; idle {}s, then hold the phone out.", window,
+                           idle_seconds));
+}
+
 void sample() {
     auto &s = state();
     const auto now = GetTickCount64();
@@ -311,12 +355,19 @@ void sample() {
             word.phase = s.phase;
             if (s.lines < max_changes) {
                 ++s.lines;
-                logging::log(logging::Level::info, logging::Channel::skater,
-                             "Hand props: change phase{} {} +{:#x} {} -> {} ({:#x} -> {:#x}) ({}s left)",
-                             word.phase, s.regions[word.region].name,
-                             static_cast<unsigned>(word.address - s.regions[word.region].address), word.value, value,
-                             word.value, value,
-                             s.watch_until > now ? static_cast<unsigned>((s.watch_until - now) / 1000) : 0);
+                const auto offset = static_cast<unsigned>(word.address - s.regions[word.region].address);
+                if (s.pose_mode) {
+                    logging::log(logging::Level::info, logging::Channel::skater,
+                                 "Hand props: pose phase{} j{:03d}.{} {} -> {} ({:#x} -> {:#x})",
+                                 word.phase, offset / 0x30, (offset % 0x30) / 4, word.value, value, word.value,
+                                 value);
+                } else {
+                    logging::log(logging::Level::info, logging::Channel::skater,
+                                 "Hand props: change phase{} {} +{:#x} {} -> {} ({:#x} -> {:#x}) ({}s left)",
+                                 word.phase, s.regions[word.region].name, offset, word.value, value, word.value,
+                                 value,
+                                 s.watch_until > now ? static_cast<unsigned>((s.watch_until - now) / 1000) : 0);
+                }
             }
         } else if (s.log_every) {
             // Narrow watch: the timeline is the finding, so every transition is
@@ -380,6 +431,12 @@ void request_prop_weight(unsigned seconds) {
     s.weight_seconds = seconds;
     s.weight_pending = true;
 }
+void request_prop_pose(unsigned seconds) {
+    auto &s = state();
+    std::lock_guard lock(s.mutex);
+    s.pose_seconds = seconds;
+    s.pose_pending = true;
+}
 std::string prop_status() {
     std::lock_guard lock(status_mutex());
     return state().status;
@@ -389,21 +446,25 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
     try {
         auto &s = state();
         std::string filter;
-        bool want_report{}, want_watch{}, want_weight{};
+        bool want_report{}, want_watch{}, want_weight{}, want_pose{};
         unsigned seconds{default_seconds};
         unsigned weight_seconds{};
+        unsigned pose_seconds{};
         {
             std::lock_guard lock(s.mutex);
             want_report = s.report_pending;
             want_watch = s.watch_pending;
             want_weight = s.weight_pending;
+            want_pose = s.pose_pending;
             filter = s.filter;
             seconds = s.watch_seconds;
             weight_seconds = s.weight_seconds;
-            s.report_pending = s.watch_pending = s.weight_pending = false;
+            pose_seconds = s.pose_seconds;
+            s.report_pending = s.watch_pending = s.weight_pending = s.pose_pending = false;
         }
         if (want_report) report(base, filter);
-        if (want_weight) arm_weight(base, client, weight_seconds);
+        if (want_pose) arm_pose(base, client, pose_seconds);
+        else if (want_weight) arm_weight(base, client, weight_seconds);
         else if (want_watch) arm(base, client, filter, seconds);
         if (!s.watching) return;
         // A level change invalidates every address the watch holds; stop rather

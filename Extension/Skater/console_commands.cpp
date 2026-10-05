@@ -266,7 +266,15 @@ void register_movement_commands(Commands &registry) {
                 "s; press the gesture a few times, letting each finish.");
             return;
         }
-        out("usage: prop | prop list [name] | prop watch [name] [seconds] | prop mark | prop weight [seconds]");
+        if (mode == "pose") {
+            const auto seconds = number_at(1, 45u);
+            skater::request_prop_pose(seconds);
+            out("Hand props: watching every joint for " + std::to_string(seconds) +
+                "s; idle ~10s, then hold the phone out (pause menu) until it ends.");
+            return;
+        }
+        out("usage: prop | prop list [name] | prop watch [name] [seconds] | prop mark | prop weight [seconds] | "
+            "prop pose [seconds]");
     };
     registry.add(std::move(prop));
 

@@ -38,6 +38,9 @@ void request_prop_mark();
 // Layer weights are floats; 1.0 means a layer is fully active, which is what a
 // gesture (and its prop) looks like from the outside.
 void request_prop_weight(unsigned seconds);
+// Watch the output pose joint by joint. If the phone hangs off a socket joint,
+// that joint moves when the phone appears, and this is the watch that shows it.
+void request_prop_pose(unsigned seconds);
 std::string prop_status();
 // Per-frame service on the client thread, beside the other skater ticks.
 void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept;
