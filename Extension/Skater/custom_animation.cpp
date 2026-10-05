@@ -40,6 +40,7 @@ struct Playback {
     std::atomic<bool> playing{};
     std::atomic<bool> test{};
     std::atomic<std::uintptr_t> component{};
+    std::atomic<std::uint64_t> writes{};
     std::uintptr_t base{};
     ULONGLONG started{};
     bool pending{}, stop{}, pending_test{};
@@ -139,6 +140,12 @@ void on_pose_evaluated(std::uintptr_t component) noexcept {
         const auto pose = pose_location(p.base, component);
         const auto buffer = pose.buffer;
         if (!buffer) return;
+        // Confirm once per playback that the write is actually happening.
+        const auto note_write = [&p] {
+            if (p.writes.fetch_add(1, std::memory_order_relaxed) == 0)
+                logging::log(logging::Level::info, logging::Channel::skater,
+                             "Custom animation: pose written to the output buffer.");
+        };
         const auto elapsed_ms = GetTickCount64() - p.started;
         if (p.test.load(std::memory_order_relaxed)) {
             // Rotate the head in its own space. Rotation is scale-invariant; a
@@ -156,6 +163,7 @@ void on_pose_evaluated(std::uintptr_t component) noexcept {
             bone[6] = qz * c - qy * s;
             bone[7] = qw * c - qx * s;
             (void)nsd::write(buffer + test_joint * 0x30ULL, bone.data(), sizeof(bone));
+            note_write();
             return;
         }
         std::lock_guard lock(p.mutex);
@@ -164,6 +172,7 @@ void on_pose_evaluated(std::uintptr_t component) noexcept {
             (static_cast<double>(elapsed_ms) * p.clip.fps / 1000.0)) % p.clip.frames;
         write_frame(buffer, p.clip.data.data() + static_cast<std::size_t>(frame) * p.clip.joints * floats_per_joint,
                     p.clip.joints);
+        note_write();
     } catch (...) {
     }
 }
@@ -222,8 +231,10 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
         if (!pending) {
             // A level change or respawn frees the pose buffer: stop rather than
             // keep writing to a component that is no longer the local skater.
-            if (p.playing.load(std::memory_order_acquire) &&
-                p.component.load(std::memory_order_acquire) != local_component(base, client)) {
+            // A zero here is a transient read failure, not a different skater.
+            if (const auto current = local_component(base, client);
+                p.playing.load(std::memory_order_acquire) && current &&
+                p.component.load(std::memory_order_acquire) != current) {
                 p.playing.store(false, std::memory_order_release);
                 p.saved_pose.clear();
                 p.saved_joints = 0;
@@ -272,6 +283,7 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
             else p.saved_pose.clear();
         }
         p.component.store(component, std::memory_order_release);
+        p.writes.store(0, std::memory_order_release);
         p.started = GetTickCount64();
         p.playing.store(true, std::memory_order_release);
         set_status("Custom animation playing: " + p.clip_name + ".");
