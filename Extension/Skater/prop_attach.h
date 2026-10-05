@@ -17,13 +17,16 @@
 // take the game down, so this module watches first:
 //
 //   prop list                    the loaded gesture items and their ids
-//   prop watch boombox 15        arm a field watch for that many seconds
+//   prop watch selfie 60         watch for a minute; after a ten second idle
+//                                phase it flips to phase 1 by itself, and the
+//                                gesture is pressed then
 //
 // The watch samples the plausible state -- the gesture items, the local player,
-// the skater entity and its animation component, the holder and the rig -- five
-// times a second and logs every word that changes. Press the gesture during the
-// window; the log then names the offset whose value becomes that gesture's id,
-// which is the request path. Nothing is written until that is identified.
+// the skater entity and its components, the holder and the whole animation
+// instance -- on every client frame and logs the first change of every address,
+// tagged with the phase it happened in. The animation graph churns while idle,
+// so the finding is the set difference: an address that changes in the marked
+// phase and not in the idle one. Nothing is written until that is identified.
 namespace dingosdk::skater {
 
 void request_prop_report(std::string filter);

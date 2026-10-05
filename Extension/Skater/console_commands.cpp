@@ -231,10 +231,10 @@ void register_movement_commands(Commands &registry) {
             return;
         }
         if (mode == "watch") {
-            const auto seconds = args.size() > 2 ? static_cast<unsigned>(std::get<double>(args[2])) : 30u;
+            const auto seconds = args.size() > 2 ? static_cast<unsigned>(std::get<double>(args[2])) : 60u;
             skater::request_prop_watch(name, seconds);
-            out("Hand props: watching engine state for " + std::to_string(seconds) +
-                "s; idle for a few seconds, then prop mark, then press the gesture.");
+            out("Hand props: watching for " + std::to_string(seconds) +
+                "s. Idle for ~10s, then press the gesture three times; the phase flips by itself.");
             return;
         }
         if (mode == "mark") {

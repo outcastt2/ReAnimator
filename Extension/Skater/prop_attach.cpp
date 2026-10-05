@@ -23,9 +23,9 @@ namespace engine = game::build::v20260929::engine;
 // because context floats otherwise drown everything.
 constexpr unsigned item_scan_bytes = 0x60;  // each gesture item's interesting head
 constexpr unsigned max_watch_items = 64;    // sampled items, not a hard limit on discovery
-constexpr unsigned max_changes = 1000;      // the log is a finding, not a trace
-constexpr unsigned default_seconds = 30;
-constexpr std::uint32_t id_ceiling = 254;   // gesture ids are uint8
+constexpr unsigned max_changes = 6000;      // the log is a finding, not a trace
+constexpr unsigned default_seconds = 60;
+constexpr unsigned idle_seconds = 10;       // phase 0 length before the auto mark
 
 struct Item {
     std::string name;
@@ -60,9 +60,10 @@ struct State {
     // Live watch: touched only from the client tick.
     bool watching{};
     ULONGLONG watch_until{};
+    ULONGLONG watch_start{};
     ULONGLONG next_sample{};
     ULONGLONG next_heartbeat{};
-    unsigned filtered{};
+    unsigned repeats{};
     unsigned phase{};
     bool mark_pending{};
     std::vector<Region> regions;
@@ -231,42 +232,53 @@ void arm(Ptr base, Ptr client, const std::string &filter, unsigned seconds) {
     }
     const auto window = seconds ? seconds : default_seconds;
     s.watching = true;
-    s.watch_until = GetTickCount64() + window * 1000ULL;
+    s.watch_start = GetTickCount64();
+    s.watch_until = s.watch_start + window * 1000ULL;
+    s.phase = 0;
     s.next_sample = 0;
-    s.next_heartbeat = GetTickCount64() + 5000;
+    s.next_heartbeat = s.watch_start + 5000;
     logging::log(logging::Level::info, logging::Channel::skater,
-                 "Hand props: watching {} words over {} region(s) for {}s{}. Press the gesture now.",
-                 s.words.size(), s.regions.size(), window, filter.empty() ? "" : " (filter \"" + filter + "\")");
-    set_status(std::format("Hand props: watching {} words for {}s{}; press the gesture now.", s.words.size(),
-                           window, filter.empty() ? "" : ", filtered to " + filter));
+                 "Hand props: watching {} words over {} region(s) for {}s{}. Idle for {}s, then phase1 begins and "
+                 "you press the gesture.",
+                 s.words.size(), s.regions.size(), window, filter.empty() ? "" : " (filter \"" + filter + "\")",
+                 idle_seconds);
+    set_status(std::format("Hand props: watching {} words for {}s; idle {}s, then press the gesture.",
+                           s.words.size(), window, idle_seconds));
 }
 
 void sample() {
     auto &s = state();
     const auto now = GetTickCount64();
+    // The idle phase ends by itself, so the press needs no console visit in the
+    // middle of the window (opening it steals input focus).
+    if (s.phase == 0 && now >= s.watch_start + idle_seconds * 1000ULL && now < s.watch_until) {
+        ++s.phase;
+        s.next_heartbeat = 0;
+        logging::log(logging::Level::info, logging::Channel::skater,
+                     "Hand props: idle phase over, phase1 begins ({}s left). Press the gesture now.",
+                     static_cast<unsigned>((s.watch_until - now) / 1000));
+    }
     for (auto &word : s.words) {
         std::uint32_t value{};
         if (!memory::peek(word.address, value) || value == word.value) continue;
         ++s.changes;
-        // A gesture id is a small integer. Everything else is a float that
-        // churns every frame, and logging it would bury the one line that
-        // matters.
-        if (word.value > id_ceiling || value > id_ceiling) {
-            ++s.filtered;
-        } else if (!word.logged) {
-            // One line per address, tagged with the phase. The animation graph
-            // churns while idle, so what identifies a request field is that it
-            // changes in the marked phase and not in the idle one.
+        if (!word.logged) {
+            // One line per address, tagged with the phase it first changed in.
+            // The value is not filtered: a request may be a pointer rather than
+            // an id, and the phase diff is what separates signal from churn.
             word.logged = true;
             word.phase = s.phase;
             if (s.lines < max_changes) {
                 ++s.lines;
                 logging::log(logging::Level::info, logging::Channel::skater,
-                             "Hand props: change phase{} {} +{:#x} {} -> {} ({}s left)", word.phase,
-                             s.regions[word.region].name,
+                             "Hand props: change phase{} {} +{:#x} {} -> {} ({:#x} -> {:#x}) ({}s left)",
+                             word.phase, s.regions[word.region].name,
                              static_cast<unsigned>(word.address - s.regions[word.region].address), word.value, value,
+                             word.value, value,
                              s.watch_until > now ? static_cast<unsigned>((s.watch_until - now) / 1000) : 0);
             }
+        } else {
+            ++s.repeats;
         }
         word.value = value;
     }
@@ -275,15 +287,15 @@ void sample() {
     if (now >= s.next_heartbeat && now < s.watch_until) {
         s.next_heartbeat = now + 5000;
         logging::log(logging::Level::info, logging::Channel::skater,
-                     "Hand props: watching, phase{}, {} line(s), {} change(s) ({} filtered), {}s left.", s.phase,
-                     s.lines, s.changes, s.filtered, static_cast<unsigned>((s.watch_until - now) / 1000));
+                     "Hand props: watching, phase{}, {} line(s), {} change(s), {} repeats, {}s left.", s.phase,
+                     s.lines, s.changes, s.repeats, static_cast<unsigned>((s.watch_until - now) / 1000));
     }
     if (now >= s.watch_until) {
         s.watching = false;
         logging::log(logging::Level::info, logging::Channel::skater,
-                     "Hand props: watch finished: {} line(s), {} change(s), {} filtered, {} words, final phase {}; "
-                     "diff phase0 against phase1 for the request.",
-                     s.lines, s.changes, s.filtered, s.words.size(), s.phase);
+                     "Hand props: watch finished: {} line(s) over {} address(es), {} change(s), {} words, final "
+                     "phase {}; diff phase0 against phase1.",
+                     s.lines, s.lines, s.changes, s.words.size(), s.phase);
         set_status(std::format("Hand props: watch finished with {} line(s); see the log.", s.lines));
     }
 }
