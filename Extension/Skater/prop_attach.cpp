@@ -3,6 +3,7 @@
 #include "Extension/Multiplayer/Remote/native_pose_layout.h"
 #include "Engine/Core/Log/logging.h"
 #include "Engine/Core/Platform/memory.h"
+#include "Engine/Game/Abi/native_data.h"
 #include "Engine/Game/Build/addresses.h"
 #include "Engine/Game/Build/20260929/engine.h"
 #include <Windows.h>
@@ -73,6 +74,9 @@ struct State {
     bool pose_pending{};
     unsigned pose_seconds{45};
     bool pose_mode{};   // pose-buffer watch: joints and fields, not raw words
+    bool assets_pending{};
+    std::string assets_extra;
+    unsigned assets_seconds{45};
     std::vector<Region> regions;
     std::vector<Word> words;
     unsigned changes{}, lines{};
@@ -291,6 +295,108 @@ void arm_weight(Ptr base, Ptr client, unsigned seconds) {
     set_status(std::format("Hand props: watching the layer weights for {}s; press the gesture a few times.", window));
 }
 
+// The engine's asset lookup is find-only, but it does answer for any loaded
+// asset by name; this is the same domain sweep the effect prototype uses.
+Ptr find_named_asset(Ptr base, const char *name, bool &faulted) noexcept {
+    __try {
+        const auto find = game::native_data().find_asset;
+        if (!find) return 0;
+        for (std::uint16_t domain = 0; domain < 0xbbf; ++domain) {
+            Ptr owner{};
+            if (!memory::read_bytes(base + engine::domain_owners + std::uintptr_t{domain} * 8, &owner, 8) || !owner)
+                continue;
+            if (const auto asset = find(domain, name)) return asset;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        faulted = true;
+    }
+    return 0;
+}
+
+// A graph parameter's live value is not in its asset: the animation instance
+// holds a reference to the asset, and the value lives beside it. Find those
+// references in the instance, the holder, the animation component and the
+// definition, then watch the words after each one so a gesture press can be read
+// off against an idle phase.
+void arm_assets(Ptr base, Ptr client, const std::string &extra, unsigned seconds) {
+    auto &s = state();
+    Local local;
+    if (!resolve_local(base, client, local)) {
+        set_status("Hand props: the local skater is not ready.");
+        return;
+    }
+    static constexpr const char *names[] = {
+        "bool.anim.phone.forceattachlock",  "bool.anim.ptm.layer.phone.enable", "bool.gp.phonepose.enable",
+        "bool.phone.attachlock",            "bool.state.is.phoneposeoffboard",  "ebool.onboard.phone.attachlock",
+        "float.anim.phoneposeweight",
+    };
+    struct Spot {
+        std::string label;
+        Ptr address{};
+    };
+    std::vector<Spot> spots;
+    bool faulted{};
+    const auto note = [&](const char *name) {
+        const auto asset = find_named_asset(base, name, faulted);
+        if (!asset) {
+            logging::log(logging::Level::info, logging::Channel::skater, "Hand props: {} is not loaded.", name);
+            return;
+        }
+        logging::log(logging::Level::info, logging::Channel::skater, "Hand props: {} = {:#x}.", name, asset);
+        struct Scan {
+            const char *region;
+            Ptr address;
+            std::size_t bytes;
+        };
+        const Scan regions[] = {
+            {"rig", local.rig, 0x4000},
+            {"holder", local.holder, 0x400},
+            {"anim", local.component, 0x200},
+            {"definition", local.definition, 0x400},
+        };
+        for (const auto &region : regions) {
+            for (std::size_t offset = 0; region.address && offset + 8 <= region.bytes; offset += 8) {
+                std::uint64_t value{};
+                if (!memory::read_bytes(region.address + offset, &value, 8)) break;
+                // References are tagged, so compare with the low bits masked off.
+                if ((static_cast<Ptr>(value) & ~Ptr{7}) != asset) continue;
+                logging::log(logging::Level::info, logging::Channel::skater,
+                             "Hand props:   {} held at {}+{:#x} (words {} {})", name, region.region, offset,
+                             static_cast<std::uint32_t>(value), static_cast<std::uint32_t>(value >> 32));
+                spots.push_back({std::format("{}+{:#x}", region.region, offset), region.address + offset});
+            }
+        }
+    };
+    for (const char *name : names) note(name);
+    if (!extra.empty()) note(extra.c_str());
+    logging::log(logging::Level::info, logging::Channel::skater,
+                 "Hand props: {} reference(s) found for the phone assets{}.", spots.size(),
+                 faulted ? " (the asset sweep faulted at least once)" : "");
+
+    s.regions.clear();
+    s.words.clear();
+    s.changes = s.lines = s.repeats = 0;
+    s.phase = 0;
+    s.log_every = false;
+    s.pose_mode = false;
+    for (const auto &spot : spots) add_region(s, spot.label, spot.address, 0x20);
+    if (s.words.empty()) {
+        set_status("Hand props: none of the phone assets are loaded to reference.");
+        return;
+    }
+    const auto window = seconds ? seconds : s.assets_seconds;
+    s.watching = true;
+    s.watch_start = GetTickCount64();
+    s.watch_until = s.watch_start + window * 1000ULL;
+    s.next_heartbeat = s.watch_start + 5000;
+    logging::log(logging::Level::info, logging::Channel::skater,
+                 "Hand props: watching {} words around {} reference(s) for {}s. Idle {}s, then do the gesture "
+                 "(or hold the menu phone) so the two cases can be told apart.",
+                 s.words.size(), spots.size(), window, idle_seconds);
+    set_status(std::format("Hand props: {} phone-asset reference(s), {} words, {}s; idle {}s then gesture.",
+                           spots.size(), s.words.size(), window, idle_seconds));
+}
+
 void arm_pose(Ptr base, Ptr client, unsigned seconds) {
     auto &s = state();
     Local local;
@@ -437,6 +543,13 @@ void request_prop_pose(unsigned seconds) {
     s.pose_seconds = seconds;
     s.pose_pending = true;
 }
+void request_prop_assets(std::string extra, unsigned seconds) {
+    auto &s = state();
+    std::lock_guard lock(s.mutex);
+    s.assets_extra = std::move(extra);
+    s.assets_seconds = seconds;
+    s.assets_pending = true;
+}
 std::string prop_status() {
     std::lock_guard lock(status_mutex());
     return state().status;
@@ -446,24 +559,30 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
     try {
         auto &s = state();
         std::string filter;
-        bool want_report{}, want_watch{}, want_weight{}, want_pose{};
+        bool want_report{}, want_watch{}, want_weight{}, want_pose{}, want_assets{};
         unsigned seconds{default_seconds};
         unsigned weight_seconds{};
         unsigned pose_seconds{};
+        unsigned assets_seconds{};
+        std::string assets_extra;
         {
             std::lock_guard lock(s.mutex);
             want_report = s.report_pending;
             want_watch = s.watch_pending;
             want_weight = s.weight_pending;
             want_pose = s.pose_pending;
+            want_assets = s.assets_pending;
             filter = s.filter;
             seconds = s.watch_seconds;
             weight_seconds = s.weight_seconds;
             pose_seconds = s.pose_seconds;
-            s.report_pending = s.watch_pending = s.weight_pending = s.pose_pending = false;
+            assets_seconds = s.assets_seconds;
+            assets_extra = s.assets_extra;
+            s.report_pending = s.watch_pending = s.weight_pending = s.pose_pending = s.assets_pending = false;
         }
         if (want_report) report(base, filter);
-        if (want_pose) arm_pose(base, client, pose_seconds);
+        if (want_assets) arm_assets(base, client, assets_extra, assets_seconds);
+        else if (want_pose) arm_pose(base, client, pose_seconds);
         else if (want_weight) arm_weight(base, client, weight_seconds);
         else if (want_watch) arm(base, client, filter, seconds);
         if (!s.watching) return;

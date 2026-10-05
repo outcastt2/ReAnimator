@@ -273,8 +273,16 @@ void register_movement_commands(Commands &registry) {
                 "s; idle ~10s, then hold the phone out (pause menu) until it ends.");
             return;
         }
+        if (mode == "assets") {
+            const auto seconds = number_at(2, 45u);
+            skater::request_prop_assets(name, seconds);
+            out("Hand props: resolving the phone's graph assets by name, then watching where the animation instance "
+                "references them for " + std::to_string(seconds) +
+                "s; idle ~10s, then do the selfie (or hold the menu phone).");
+            return;
+        }
         out("usage: prop | prop list [name] | prop watch [name] [seconds] | prop mark | prop weight [seconds] | "
-            "prop pose [seconds]");
+            "prop pose [seconds] | prop assets [asset] [seconds]");
     };
     registry.add(std::move(prop));
 

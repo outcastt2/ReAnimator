@@ -41,6 +41,11 @@ void request_prop_weight(unsigned seconds);
 // Watch the output pose joint by joint. If the phone hangs off a socket joint,
 // that joint moves when the phone appears, and this is the watch that shows it.
 void request_prop_pose(unsigned seconds);
+// Resolve the phone's graph assets by name, find where the animation instance
+// references them, and watch the words beside those references. The live value
+// of a graph parameter lives next to its asset reference, not in the asset.
+// `extra` is one more asset name to resolve, or empty.
+void request_prop_assets(std::string extra, unsigned seconds);
 std::string prop_status();
 // Per-frame service on the client thread, beside the other skater ticks.
 void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept;
