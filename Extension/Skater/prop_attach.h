@@ -71,6 +71,20 @@ void request_prop_hand_detach();
 void request_morph_find();
 void request_morph_unclamp(float max_value = 4.0f);
 void request_morph_clamp();
+// Ragdoll mode switchboard. The offboard wipeout's behaviour is chosen by bool
+// graph parameters ("Animation/Dingo/Bool.Physics.*") which the
+// SkaterCorePhysicsRagdollConfigAsset references; the config schema gives the
+// seventeen fields. `config` dumps the whole chain, `bools` the named switches,
+// `watch` samples every candidate value byte through a bail, and `set` holds
+// one byte at 0/1 (asset Default at +0x70, or the exported instance target when
+// `use_data`) until `stop` or the window ends, reporting every time the game
+// writes it back.
+void request_ragdoll_config();
+void request_ragdoll_bools();
+void request_ragdoll_watch(unsigned seconds);
+void request_ragdoll_set(std::string field, unsigned value, unsigned seconds, bool use_data = false,
+                         std::size_t data_offset = 0);
+void request_ragdoll_stop();
 std::string prop_status();
 // Per-frame service on the client thread, beside the other skater ticks.
 void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept;

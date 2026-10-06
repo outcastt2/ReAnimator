@@ -403,6 +403,77 @@ void register_movement_commands(Commands &registry) {
     };
     registry.add(std::move(morph));
 
+    // The ragdoll mode switchboard: the SkaterCorePhysicsRagdollConfigAsset
+    // references the bool graph parameters that pick how a wipeout is driven.
+    // `config` dumps the whole chain, `watch` samples the candidate value bytes
+    // through a bail, and `set` holds one byte at 0/1 to find the live one.
+    auto ragdoll = action("ragdoll",
+        "Ragdoll modes: ragdoll | ragdoll config | ragdoll bools | ragdoll watch [seconds] | "
+        "ragdoll set <field|index> <0|1> [seconds] | ragdoll setdata <field|index> <0|1> <offset> | ragdoll off",
+        Group::gameplay, {argument("mode", Type::text, true), argument("field", Type::text, true),
+                          argument("value", Type::text, true), argument("extra", Type::text, true)});
+    ragdoll.execution = Execution::local;
+    ragdoll.inspect = [](const Model &) { return State{true, {}, {}, skater::prop_status(), false}; };
+    ragdoll.run = [](const Model &, const Values &args, const Output &out) {
+        const auto text = [&](std::size_t index) -> std::string {
+            if (index >= args.size() || !std::holds_alternative<std::string>(args[index])) return {};
+            return lower(std::get<std::string>(args[index]));
+        };
+        const auto number = [&](std::size_t index, unsigned fallback) -> unsigned {
+            if (index >= args.size()) return fallback;
+            try {
+                if (std::holds_alternative<double>(args[index])) return static_cast<unsigned>(std::get<double>(args[index]));
+                if (std::holds_alternative<std::int64_t>(args[index])) return static_cast<unsigned>(std::get<std::int64_t>(args[index]));
+                if (std::holds_alternative<std::uint64_t>(args[index])) return static_cast<unsigned>(std::get<std::uint64_t>(args[index]));
+                if (const auto value = text(index); !value.empty()) return static_cast<unsigned>(std::stoul(value, nullptr, 0));
+            } catch (...) {
+            }
+            return fallback;
+        };
+        const auto mode = text(0);
+        if (mode == "config") {
+            skater::request_ragdoll_config();
+            out("Ragdoll: resolving skatercorephysicsragdollconfig and its bool references (see the log)...");
+            return;
+        }
+        if (mode == "bools") {
+            skater::request_ragdoll_bools();
+            out("Ragdoll: resolving the named physics bool assets (see the log)...");
+            return;
+        }
+        if (mode == "watch") {
+            const auto seconds = number(1, 30u);
+            skater::request_ragdoll_watch(seconds);
+            out("Ragdoll: watching every switch byte for " + std::to_string(seconds) +
+                "s. Skitch a player, hold the grab, wipe out: changed bytes land in the log with labels.");
+            return;
+        }
+        if (mode == "set" || mode == "setdata") {
+            const auto field = text(1);
+            const auto value = number(2, 0u);
+            if (mode == "set") {
+                const auto seconds = number(3, 45u);
+                skater::request_ragdoll_set(field, value, seconds);
+                out("Ragdoll: holding " + field + " = " + std::to_string(value ? 1u : 0u) +
+                    " (asset Default) for " + std::to_string(seconds) + "s; 'ragdoll off' restores.");
+                return;
+            }
+            const auto offset = number(3, 0u);
+            skater::request_ragdoll_set(field, value, 45u, true, offset);
+            out("Ragdoll: holding " + field + " = " + std::to_string(value ? 1u : 0u) + " at instance+" +
+                std::to_string(offset) + " for 45s; 'ragdoll off' restores.");
+            return;
+        }
+        if (mode == "off") {
+            skater::request_ragdoll_stop();
+            out("Ragdoll: restoring every held byte.");
+            return;
+        }
+        out("usage: ragdoll | ragdoll config | ragdoll bools | ragdoll watch [seconds] | "
+            "ragdoll set <field|index> <0|1> [seconds] | ragdoll setdata <field|index> <0|1> <offset> | ragdoll off");
+    };
+    registry.add(std::move(ragdoll));
+
     // Route B: overwrite the local skater's pose with a baked custom animation.
     auto poseanim = action("poseanim",
         "Custom animation: poseanim test | record | off | play | save <path> | mask auto|full|legs | trace 0|1 | <file>.rska",

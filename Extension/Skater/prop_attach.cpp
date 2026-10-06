@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <format>
@@ -123,6 +124,30 @@ struct State {
     bool morph_find_pending{}, morph_unclamp_pending{}, morph_clamp_pending{};
     float morph_unclamp_max{4.0f};
     std::vector<std::pair<Ptr, float>> morph_originals;
+    // Ragdoll mode switchboard: the SkaterCorePhysicsRagdollConfigAsset
+    // references seventeen bool assets, and the offboard wipeout's behaviour
+    // (simulated velocity, ground follow, landing) is read from them. The tools
+    // resolve the chain by name, watch the candidate value bytes through a
+    // bail, and can hold one byte overwritten to find which one is live.
+    bool ragdoll_config_pending{}, ragdoll_bools_pending{};
+    bool ragdoll_watch_pending{};
+    unsigned ragdoll_watch_seconds{30};
+    bool ragdoll_stop_pending{};
+    bool ragdoll_set_pending{};
+    std::string ragdoll_field;
+    unsigned ragdoll_value{};
+    bool ragdoll_data_location{};
+    std::size_t ragdoll_data_offset{};
+    unsigned ragdoll_hold_seconds{45};
+    struct RagdollWrite {
+        Ptr address{};
+        std::uint8_t value{};
+        std::uint8_t old{};
+    };
+    std::vector<RagdollWrite> ragdoll_writes;
+    bool ragdoll_holding{};
+    ULONGLONG ragdoll_until{};
+    unsigned ragdoll_rewrites{};
     std::vector<Region> regions;
     std::vector<Word> words;
     std::vector<std::pair<std::string, Ptr>> pending_regions;
@@ -766,6 +791,25 @@ bool write_u32(Ptr address, std::uint32_t value) noexcept {
     }
 }
 
+// The same guarded write for a single byte: the ragdoll mode switches are
+// graph bools, one byte each.
+bool write_u8(Ptr address, std::uint8_t value) noexcept {
+    MEMORY_BASIC_INFORMATION region{};
+    if (!VirtualQuery(reinterpret_cast<void *>(address), &region, sizeof(region)) || region.State != MEM_COMMIT ||
+        (region.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
+        return false;
+    const auto protection = region.Protect & 0xff;
+    if (protection != PAGE_READWRITE && protection != PAGE_WRITECOPY && protection != PAGE_EXECUTE_READWRITE &&
+        protection != PAGE_EXECUTE_WRITECOPY)
+        return false;
+    __try {
+        std::memcpy(reinterpret_cast<void *>(address), &value, sizeof(value));
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // The write test. Three floats in the animation instance go to exactly 1.0 while
 // a gesture with a prop is pressed; if they are layer weights, holding them at
 // 1.0 should keep the phone out with no gesture. The old values are saved and
@@ -1158,6 +1202,265 @@ void arm_assets(Ptr base, Ptr client, const std::string &extra, unsigned seconds
                            assets.size(), spots.size(), s.words.size(), window, idle_seconds));
 }
 
+// ---------------------------------------------------------------------------
+// Ragdoll mode switchboard. The offboard wipeout follows a motion object whose
+// class, state and behaviour are chosen through SkaterCorePhysicsRagdollConfig:
+// the schema gives seventeen asset references at +0x28..+0xa8, of which
+// RagdollSimulatingVelocity (+0x80), RagdollFollowingGround (+0x88),
+// RagdollFollowingAnimatedGround (+0x90) and RagdollLandingAllowed (+0x98)
+// select how a ragdoll is driven. Every reference is a graph bool
+// ("Animation/Dingo/Bool.Physics.*"), whose asset image carries Default at
+// +0x70 and, at +0x28, a pointer to its exported instance when one is
+// installed. The dump resolves the whole chain by name; the watch samples every
+// candidate byte through a bail; the set command holds one byte at 0/1 and
+// counts how often the game puts it back -- which is also how the byte that is
+// actually read gets identified.
+struct RagdollField {
+    const char *name;
+    std::size_t offset;
+};
+constexpr RagdollField ragdoll_fields[] = {
+    {"ForceDisableSelfCollision", 0x28},
+    {"ForceDisableCollisionWithBoard", 0x30},
+    {"ForceDisableFeetCollision", 0x38},
+    {"ForceDisableLegCollision", 0x40},
+    {"ForceDisableHandCollision", 0x48},
+    {"ForceDisableLeftArmCollision", 0x50},
+    {"ForceDisableRightArmCollision", 0x58},
+    {"ForceDisableRagdollExtremitiesCollision", 0x60},
+    {"ForceDisableRagdollCollisionExceptLegs", 0x68},
+    {"ForceDisableRagdollCollisionExceptArms", 0x70},
+    {"ForceDisableRagdollCollision", 0x78},
+    {"RagdollSimulatingVelocity", 0x80},
+    {"RagdollFollowingGround", 0x88},
+    {"RagdollFollowingAnimatedGround", 0x90},
+    {"RagdollLandingAllowed", 0x98},
+    {"EnableClimbingRagdollProxyCollision", 0xa0},
+    {"ForceDisableClimbingRagdollProxyCollision", 0xa8},
+};
+constexpr const char *ragdoll_bool_names[] = {
+    "bool.physics.simragdoll",
+    "bool.physics.offboard.forcefollowragdoll",
+    "bool.physics.offboard.forceragdollsimulatedvelocity",
+    "bool.muscles.uselegacyragdoll",
+    "bool.anim.is.offboardragdollfollowingground",
+};
+constexpr Ptr ragdoll_default_offset = 0x70;    // BoolAsset.Default, one byte
+constexpr Ptr ragdoll_instance_pointer = 0x28;  // exported-instance pointer in the image
+
+Ptr ragdoll_config_asset(Ptr base, bool &faulted) {
+    return find_named_asset(base, "animation/dingo/skatercorephysicsragdollconfig", faulted);
+}
+// The engine names an asset by its full path, but fall back to the bare leaf
+// the way the phone probe does.
+Ptr ragdoll_lookup_bool(Ptr base, const char *name, bool &faulted) {
+    if (const auto asset = find_named_asset(base, ("animation/dingo/" + std::string(name)).c_str(), faulted))
+        return asset;
+    return find_named_asset(base, name, faulted);
+}
+std::string ragdoll_asset_name(Ptr asset) {
+    Ptr text{};
+    std::array<char, 128> buffer{};
+    if (!memory::peek(asset + 0x18, text) || !text || memory::peek_cstring(text, buffer.data(), buffer.size()) < 0)
+        return {};
+    return buffer.data();
+}
+// The exported instance pointer, when it looks like one: the tagged low bits are
+// masked off the same way the phone probe does it.
+Ptr ragdoll_instance(Ptr asset) {
+    Ptr data{};
+    if (!memory::peek(asset + ragdoll_instance_pointer, data)) return 0;
+    const auto cleaned = static_cast<Ptr>(data) & ~Ptr{7};
+    return cleaned >= 0x10000 ? cleaned : 0;
+}
+void ragdoll_byte_dump(Ptr address, std::size_t bytes, const std::string &label) {
+    for (std::size_t offset = 0; offset < bytes; offset += 0x10) {
+        std::array<std::uint8_t, 16> line{};
+        if (!memory::peek_bytes(address + offset, line.data(), line.size())) break;
+        std::string text;
+        for (const auto byte : line) text += std::format("{:02x} ", byte);
+        logging::log(logging::Level::info, logging::Channel::skater, "Ragdoll:   {} +{:#04x} {}", label, offset,
+                     text);
+    }
+}
+void ragdoll_report_target(const std::string &label, Ptr target) {
+    if (!target) {
+        logging::log(logging::Level::info, logging::Channel::skater, "Ragdoll: {} -> (null)", label);
+        return;
+    }
+    std::uint8_t value{};
+    const bool readable = memory::peek_bytes(target + ragdoll_default_offset, &value, sizeof(value));
+    const auto instance = ragdoll_instance(target);
+    logging::log(logging::Level::info, logging::Channel::skater,
+                 "Ragdoll: {} -> {:#x} \"{}\" default+0x70={}{} instance={:#x}", label, target,
+                 ragdoll_asset_name(target), readable ? static_cast<unsigned>(value) : 0,
+                 readable ? "" : " (unreadable)", instance);
+    if (instance) ragdoll_byte_dump(instance, 0x20, label + " inst");
+}
+void ragdoll_config_dump(Ptr base) {
+    bool faulted{};
+    const auto config = ragdoll_config_asset(base, faulted);
+    if (!config) {
+        logging::log(logging::Level::warning, logging::Channel::skater,
+                     "Ragdoll: skatercorephysicsragdollconfig did not resolve{}; be in a level.",
+                     faulted ? " (the asset sweep faulted)" : "");
+        set_status("Ragdoll: the config asset is not loaded.");
+        return;
+    }
+    logging::log(logging::Level::info, logging::Channel::skater, "Ragdoll: config asset {:#x} \"{}\"", config,
+                 ragdoll_asset_name(config));
+    for (const auto &field : ragdoll_fields) {
+        const auto target = pointer(config + field.offset);
+        ragdoll_report_target(std::format("{} (+{:#x})", field.name, field.offset), target);
+    }
+    set_status("Ragdoll: the config chain is in the log.");
+}
+void ragdoll_bools_dump(Ptr base) {
+    bool faulted{};
+    for (const char *name : ragdoll_bool_names) {
+        const auto asset = ragdoll_lookup_bool(base, name, faulted);
+        if (!asset) {
+            logging::log(logging::Level::info, logging::Channel::skater, "Ragdoll: {} is not loaded.", name);
+            continue;
+        }
+        ragdoll_report_target(name, asset);
+        ragdoll_byte_dump(asset, 0x80, name);
+    }
+    set_status("Ragdoll: the named bool images are in the log.");
+}
+void ragdoll_watch(Ptr base, Ptr client, unsigned seconds) {
+    auto &s = state();
+    Local local;
+    if (!resolve_local(base, client, local)) {
+        set_status("Ragdoll: the local skater is not ready to watch.");
+        return;
+    }
+    s.regions.clear();
+    s.words.clear();
+    s.changes = s.lines = s.repeats = 0;
+    s.phase = 0;
+    s.pose_mode = false;
+    s.log_every = true;   // the finding is when a byte flips, so keep the timeline
+    bool faulted{};
+    const auto config = ragdoll_config_asset(base, faulted);
+    if (config) {
+        add_region(s, "config", config, 0xb0, true);
+        for (const auto &field : ragdoll_fields) {
+            const auto target = pointer(config + field.offset);
+            if (!target) continue;
+            add_region(s, std::string("bool ") + field.name, target, 0x80, true);
+            const auto instance = ragdoll_instance(target);
+            if (instance) add_region(s, std::string("inst ") + field.name, instance, 0x40);
+        }
+    }
+    for (const char *name : ragdoll_bool_names) {
+        const auto asset = ragdoll_lookup_bool(base, name, faulted);
+        if (!asset) continue;
+        add_region(s, std::string("bool ") + name, asset, 0x80, true);
+        const auto instance = ragdoll_instance(asset);
+        if (instance) add_region(s, std::string("inst ") + name, instance, 0x40);
+    }
+    if (s.words.empty()) {
+        set_status("Ragdoll: nothing to watch; the config asset is not loaded.");
+        return;
+    }
+    const auto window = seconds ? seconds : s.ragdoll_watch_seconds;
+    s.watching = true;
+    s.watch_start = GetTickCount64();
+    s.watch_until = s.watch_start + window * 1000ULL;
+    s.next_heartbeat = s.watch_start + 5000;
+    logging::log(logging::Level::info, logging::Channel::skater,
+                 "Ragdoll: watching {} words over {} region(s) for {}s. Skitch a player, hold the grab, wipe out: "
+                 "every changed byte is logged with its label.",
+                 s.words.size(), s.regions.size(), window);
+    set_status(std::format("Ragdoll: watching {} words for {}s; bail while holding the grab.", s.words.size(),
+                           window));
+}
+bool ragdoll_field_matches(const std::string &query, const char *name) {
+    if (query.empty()) return false;
+    std::string lowered = query, candidate = name;
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::transform(candidate.begin(), candidate.end(), candidate.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return candidate.find(lowered) != std::string::npos;
+}
+void ragdoll_set(Ptr base, const std::string &field, unsigned value, unsigned seconds, bool use_data,
+                 std::size_t data_offset) {
+    auto &s = state();
+    bool faulted{};
+    const auto config = ragdoll_config_asset(base, faulted);
+    if (!config) {
+        set_status("Ragdoll: the config asset is not loaded; nothing written.");
+        return;
+    }
+    const RagdollField *found{};
+    if (!field.empty() && std::all_of(field.begin(), field.end(),
+                                      [](unsigned char c) { return std::isdigit(c) != 0; })) {
+        try {
+            const auto index = static_cast<std::size_t>(std::stoul(field));
+            if (index < std::size(ragdoll_fields)) found = &ragdoll_fields[index];
+        } catch (...) {
+        }
+    } else {
+        for (const auto &candidate : ragdoll_fields)
+            if (ragdoll_field_matches(field, candidate.name)) {
+                found = &candidate;
+                break;
+            }
+    }
+    if (!found) {
+        set_status("Ragdoll: no field matches \"" + field + "\".");
+        return;
+    }
+    const auto target = pointer(config + found->offset);
+    if (!target) {
+        set_status(std::format("Ragdoll: {} has no asset reference; nothing written.", found->name));
+        return;
+    }
+    const auto instance = ragdoll_instance(target);
+    if (use_data && !instance) {
+        set_status(std::format("Ragdoll: {} has no exported instance; nothing written.", found->name));
+        return;
+    }
+    const auto address = use_data ? instance + data_offset : target + ragdoll_default_offset;
+    std::uint8_t old{};
+    if (!memory::peek_bytes(address, &old, sizeof(old))) {
+        set_status(std::format("Ragdoll: {:#x} is not readable; nothing written.", address));
+        return;
+    }
+    const std::uint8_t wanted = value ? 1 : 0;
+    logging::log(logging::Level::info, logging::Channel::skater,
+                 "Ragdoll: set {} at {:#x} (was {}), hold {}s.", found->name, address, static_cast<unsigned>(old),
+                 seconds);
+    if (!write_u8(address, wanted)) {
+        set_status(std::format("Ragdoll: the write at {:#x} was refused (read-only page?).", address));
+        return;
+    }
+    s.ragdoll_writes.clear();
+    s.ragdoll_writes.push_back({address, wanted, old});
+    s.ragdoll_holding = true;
+    s.ragdoll_until = GetTickCount64() + (seconds ? seconds : s.ragdoll_hold_seconds) * 1000ULL;
+    s.ragdoll_rewrites = 0;
+    logging::log(logging::Level::info, logging::Channel::skater,
+                 "Ragdoll: holding {} = {}; every reset by the game is counted. 'ragdoll off' restores.",
+                 found->name, static_cast<unsigned>(wanted));
+    set_status(std::format("Ragdoll: holding {} = {}.", found->name, static_cast<unsigned>(wanted)));
+}
+void ragdoll_stop(bool restore) {
+    auto &s = state();
+    if (s.ragdoll_writes.empty()) return;
+    if (restore)
+        for (const auto &write : s.ragdoll_writes) (void)write_u8(write.address, write.old);
+    logging::log(logging::Level::info, logging::Channel::skater,
+                 "Ragdoll: {}; {} held byte(s), {} reset(s) by the game.", restore ? "restored" : "released",
+                 s.ragdoll_writes.size(), s.ragdoll_rewrites);
+    set_status(std::format("Ragdoll: {}.", restore ? "restored" : "released"));
+    s.ragdoll_writes.clear();
+    s.ragdoll_holding = false;
+    s.ragdoll_rewrites = 0;
+}
+
 void arm_pose(Ptr base, Ptr client, unsigned seconds) {
     auto &s = state();
     Local local;
@@ -1389,6 +1692,39 @@ void request_morph_clamp() {
     std::lock_guard lock(s.mutex);
     s.morph_clamp_pending = true;
 }
+void request_ragdoll_config() {
+    auto &s = state();
+    std::lock_guard lock(s.mutex);
+    s.ragdoll_config_pending = true;
+}
+void request_ragdoll_bools() {
+    auto &s = state();
+    std::lock_guard lock(s.mutex);
+    s.ragdoll_bools_pending = true;
+}
+void request_ragdoll_watch(unsigned seconds) {
+    auto &s = state();
+    std::lock_guard lock(s.mutex);
+    s.ragdoll_watch_seconds = seconds;
+    s.ragdoll_watch_pending = true;
+}
+void request_ragdoll_set(std::string field, unsigned value, unsigned seconds, bool use_data,
+                         std::size_t data_offset) {
+    auto &s = state();
+    std::lock_guard lock(s.mutex);
+    s.ragdoll_field = std::move(field);
+    s.ragdoll_value = value;
+    s.ragdoll_hold_seconds = seconds;
+    s.ragdoll_data_location = use_data;
+    s.ragdoll_data_offset = data_offset;
+    s.ragdoll_stop_pending = false;
+    s.ragdoll_set_pending = true;
+}
+void request_ragdoll_stop() {
+    auto &s = state();
+    std::lock_guard lock(s.mutex);
+    s.ragdoll_stop_pending = true;
+}
 std::string prop_status() {
     std::string text;
     {
@@ -1407,6 +1743,14 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
         bool want_report{}, want_watch{}, want_weight{}, want_pose{}, want_assets{}, want_poke{}, want_poke_stop{};
         bool want_trace{}, want_trace_off{}, want_derive{}, want_hand_attach{}, want_hand_detach{};
         bool want_morph_find{}, want_morph_unclamp{}, want_morph_clamp{};
+        bool want_ragdoll_config{}, want_ragdoll_bools{}, want_ragdoll_watch{}, want_ragdoll_set{},
+            want_ragdoll_stop{};
+        unsigned ragdoll_watch_seconds{30};
+        std::string ragdoll_field;
+        unsigned ragdoll_value{};
+        unsigned ragdoll_hold_seconds{45};
+        bool ragdoll_data_location{};
+        std::size_t ragdoll_data_offset{};
         unsigned seconds{default_seconds};
         unsigned weight_seconds{};
         unsigned pose_seconds{};
@@ -1435,6 +1779,17 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
             want_morph_find = s.morph_find_pending;
             want_morph_unclamp = s.morph_unclamp_pending;
             want_morph_clamp = s.morph_clamp_pending;
+            want_ragdoll_config = s.ragdoll_config_pending;
+            want_ragdoll_bools = s.ragdoll_bools_pending;
+            want_ragdoll_watch = s.ragdoll_watch_pending;
+            want_ragdoll_set = s.ragdoll_set_pending;
+            want_ragdoll_stop = s.ragdoll_stop_pending;
+            ragdoll_watch_seconds = s.ragdoll_watch_seconds;
+            ragdoll_field = s.ragdoll_field;
+            ragdoll_value = s.ragdoll_value;
+            ragdoll_hold_seconds = s.ragdoll_hold_seconds;
+            ragdoll_data_location = s.ragdoll_data_location;
+            ragdoll_data_offset = s.ragdoll_data_offset;
             filter = s.filter;
             seconds = s.watch_seconds;
             weight_seconds = s.weight_seconds;
@@ -1452,6 +1807,8 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
             s.trace_pending = s.trace_off_pending = s.derive_pending = false;
             s.hand_attach_pending = s.hand_detach_pending = false;
             s.morph_find_pending = s.morph_unclamp_pending = s.morph_clamp_pending = false;
+            s.ragdoll_config_pending = s.ragdoll_bools_pending = s.ragdoll_watch_pending = false;
+            s.ragdoll_set_pending = s.ragdoll_stop_pending = false;
         }
         if (want_poke_stop) stop_poke(true);
         else if (want_poke) arm_poke(base, client, poke_seconds);
@@ -1507,6 +1864,29 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
         service_derive(base);
         drain_trace(base);
         service_morph(base, want_morph_find, want_morph_unclamp, want_morph_clamp, morph_max);
+        if (want_ragdoll_stop) ragdoll_stop(true);
+        if (want_ragdoll_config) ragdoll_config_dump(base);
+        if (want_ragdoll_bools) ragdoll_bools_dump(base);
+        if (want_ragdoll_watch) ragdoll_watch(base, client, ragdoll_watch_seconds);
+        if (want_ragdoll_set)
+            ragdoll_set(base, ragdoll_field, ragdoll_value, ragdoll_hold_seconds, ragdoll_data_location,
+                        ragdoll_data_offset);
+        if (s.ragdoll_holding) {
+            // Hold the byte and count how often the game writes it back: a reset
+            // means the graph evaluates that byte, which makes it the live value.
+            for (const auto &write : s.ragdoll_writes) {
+                std::uint8_t current{};
+                if (!write.address || !memory::peek_bytes(write.address, &current, sizeof(current))) continue;
+                if (current == write.value) continue;
+                ++s.ragdoll_rewrites;
+                if (s.ragdoll_rewrites <= 10)
+                    logging::log(logging::Level::info, logging::Channel::skater,
+                                 "Ragdoll: the game reset {:#x} to {}; rewriting {}.", write.address,
+                                 static_cast<unsigned>(current), static_cast<unsigned>(write.value));
+                (void)write_u8(write.address, write.value);
+            }
+            if (GetTickCount64() >= s.ragdoll_until) ragdoll_stop(true);
+        }
         if (want_report) report(base, filter);
         if (want_assets) arm_assets(base, client, assets_extra, assets_seconds);
         else if (want_pose) arm_pose(base, client, pose_seconds);
