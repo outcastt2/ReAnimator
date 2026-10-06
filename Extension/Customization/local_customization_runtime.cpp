@@ -137,25 +137,27 @@ bool refresh_cosmetic_catalog() {
         !read(manager + 0x3c, current_count) || current_count != count) return false;
     const auto& catalogs = content_cache::catalogs();
     c.ownership_unavailable = !catalogs.available;
-    std::vector<std::string> keys, objects, reserved_keys, reserved_objects;
+    // The unlocker is a class policy, not a reserved split: gestures and build
+    // items are wanted (including the ones behind tiers); every other class
+    // goes on the revoke list so a previously granted item cannot linger.
+    std::vector<std::string> seed_cosmetics, seed_objects, locked_cosmetics, locked_objects;
     for (const auto& [key, info] : items) {
-        std::string folded = key;
-        for (auto& letter : folded) if (letter >= 'A' && letter <= 'Z') letter = static_cast<char>(letter + ('a' - 'A'));
-        const bool held = catalogs.reserved(folded);
-        (info.build_kit ? (held ? reserved_objects : objects) : (held ? reserved_keys : keys)).push_back(key);
+        if (info.build_kit) {
+            (profile::unlock_build_items ? seed_objects : locked_objects).push_back(key);
+        } else if (key.starts_with("own_rctn_gesture") || info.category.starts_with("gestures")) {
+            (profile::unlock_gesture_items ? seed_cosmetics : locked_cosmetics).push_back(key);
+        } else if (info.category.starts_with("cust_")) {
+            (profile::unlock_clothing_items ? seed_cosmetics : locked_cosmetics).push_back(key);
+        } else if (info.category.starts_with("board_") || info.category.starts_with("sb_")) {
+            (profile::unlock_board_items ? seed_cosmetics : locked_cosmetics).push_back(key);
+        } else {
+            (profile::unlock_other_cosmetics ? seed_cosmetics : locked_cosmetics).push_back(key);
+        }
     }
     if (!c.ownership_unavailable) {
-        // The unlock options are named for unlocking the whole catalogue, but
-        // only when the reserved-item unlocker is on: it decides whether the
-        // items behind Skate Pass, influence, events and ranks are seeded as
-        // owned too, and whether reconcile_inventory revokes them again.
-        if (profile::unlock_reserved_items) {
-            keys.insert(keys.end(), reserved_keys.begin(), reserved_keys.end());
-            objects.insert(objects.end(), reserved_objects.begin(), reserved_objects.end());
-        }
-        s.store->seed_cosmetic_inventory(keys);
-        s.store->seed_object_inventory(objects);
-        s.store->reconcile_inventory(reserved_keys, reserved_objects);
+        s.store->seed_cosmetic_inventory(seed_cosmetics);
+        s.store->seed_object_inventory(seed_objects);
+        s.store->reconcile_inventory(locked_cosmetics, locked_objects);
     }
     {
         std::set<std::uint32_t> hashes;
@@ -167,8 +169,9 @@ bool refresh_cosmetic_catalog() {
     c.items = std::move(items); c.item_count = count; c.item_manager = manager;
     ++c.items_generation;
     std::ostringstream event;
-    event << "{\"event\":\"local_cosmetic_catalog\",\"installed\":" << keys.size()
-          << ",\"objects\":" << objects.size() << '}';
+    event << "{\"event\":\"local_cosmetic_catalog\",\"installed\":"
+          << seed_cosmetics.size() + locked_cosmetics.size() << ",\"objects\":"
+          << seed_objects.size() + locked_objects.size() << '}';
     dingosdk::logging::event(dingosdk::logging::Channel::customization, event.str().c_str());
     return true;
 }

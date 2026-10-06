@@ -28,13 +28,15 @@ inline constexpr std::string_view unlock_bus_stops_option = "ReSkate.UnlockBusSt
 inline constexpr std::string_view unlock_cosmetics_option = "ReSkate.UnlockCosmetics";
 inline constexpr std::string_view unlock_objects_option = "ReSkate.UnlockObjects";
 inline constexpr std::string_view hide_challenges_option = "ReSkate.HideChallenges";
-// The SkateSkitch reserved-item unlocker. On, reserved items (Skate Pass,
-// influence, events, neighbourhood ranks) are seeded owned alongside the open
-// catalogue and reconcile_inventory leaves them alone. Off restores the
-// upstream behaviour: reserved items stay locked and are forced back to
-// unowned on every catalog refresh, even when the unlock options above are
-// enabled. Flip to true to unlock the whole installed catalogue again.
-inline constexpr bool unlock_reserved_items = false;
+// The SkateSkitch unlocker is by item class. Only the classes switched on here
+// are seeded owned; every other class is put on the catalog's revoke list and
+// forced back to unowned on each refresh. Gestures and build items include the
+// reserved ones behind Skate Pass, influence, events and neighbourhood ranks.
+inline constexpr bool unlock_gesture_items = true;      // own_rctn_gesture*, gestures*
+inline constexpr bool unlock_build_items = true;        // bkobjects (Object Dropper)
+inline constexpr bool unlock_clothing_items = false;    // cust_*: shirts, pants, shoes, hats...
+inline constexpr bool unlock_board_items = false;       // board_*, sb_*: decks, wheels, trucks, stickers
+inline constexpr bool unlock_other_cosmetics = false;   // player card, statements, everything else
 // Cosmetic slots the character wears nothing in, whatever preset is saved. One
 // boolean per slot name, so a slot is hidden by policy rather than by editing the
 // presets themselves and losing the ability to put the item back.

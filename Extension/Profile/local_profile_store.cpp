@@ -76,17 +76,9 @@ void Store::seed_object_inventory(const std::vector<std::string>& keys) {
 }
 void Store::reconcile_inventory(const std::vector<std::string>& cosmetics, const std::vector<std::string>& objects) {
     std::lock_guard lock(mutex_);
-    // The reserved-item unlocker alone decides whether reserved items stay
-    // owned. With it off they are forced back to unowned on every catalog
-    // refresh, even when the unlock options are enabled -- the upstream
-    // behaviour before SkateSkitch extended the unlock to reserved items.
-    const auto granted = [&](std::string_view option) {
-        const auto found = value_.bool_options.find(option);
-        return unlock_reserved_items && found != value_.bool_options.end() && found->second;
-    };
-    const bool cosmetics_granted = granted(unlock_cosmetics_option);
-    const bool objects_granted = granted(unlock_objects_option);
-    if (cosmetics_granted && objects_granted) return;
+    // Revoke every listed key, unconditionally: the catalog only lists classes
+    // the unlock policy does not cover, so an item granted by an earlier build
+    // cannot stay owned after the policy changes.
     const auto cosmetic_inventory = value_.customization.value("inventory", dingosdk::Json::object());
     const auto object_inventory =
         value_.extensions.value("object_dropper", dingosdk::Json::object()).value("inventory", dingosdk::Json::object());
@@ -97,12 +89,12 @@ void Store::reconcile_inventory(const std::vector<std::string>& cosmetics, const
     Update update(*this);
     bool changed{};
     for (const auto& key : cosmetics)
-        if (!cosmetics_granted && owned(cosmetic_inventory, key)) {
+        if (owned(cosmetic_inventory, key)) {
             update.json(value_.customization, {"inventory", key}) = false;
             changed = true;
         }
     for (const auto& key : objects)
-        if (!objects_granted && owned(object_inventory, key)) {
+        if (owned(object_inventory, key)) {
             update.json(value_.extensions, {"object_dropper", "inventory", key}) = false;
             changed = true;
         }
