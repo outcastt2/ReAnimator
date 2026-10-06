@@ -76,9 +76,16 @@ std::optional<TowPlan> TowController::update(WorldKey world,std::uint64_t local_
             now-c.sample.received_us<=250000 && valid(c.sample.hip.position) && yaw(c.heading).has_value();
     };
     const TowCandidate* target=nullptr;
+    bool stale_hold=false;
     if(attached_) {
         for(const auto& c:candidates) if(c.sample.player==target_ && eligible(c)) { target=&c; break; }
-        if(!target) { release("Target disappeared or became stale; released"); return {}; }
+        if(!target) {
+            // The leader's pose stream drops for a beat far more often than the
+            // player leaves. Keep the grip driving toward the last known hip
+            // through that window instead of releasing on every gap.
+            if(have_last_ && now>=last_seen_us_ && now-last_seen_us_<=tow_stale_grace_us) stale_hold=true;
+            else { release("Target disappeared or became stale; released"); return {}; }
+        }
     } else {
         if(!pressed || needs_release_) return {};
         float best=2.6f;
@@ -99,9 +106,10 @@ std::optional<TowPlan> TowController::update(WorldKey world,std::uint64_t local_
             travel_heading_=product(Q{0,1,0,0},travel_heading_);
         previous_hip_=target->sample.hip.position; previous_time_=now; velocity_={};
         velocity_hip_=previous_hip_; velocity_time_=now;
+        last_hip_=previous_hip_; last_seen_us_=now; have_last_=true;
         status_="Attached";
     }
-    const auto hip=target->sample.hip.position;
+    const auto hip=target ? target->sample.hip.position : last_hip_;
     if(now<previous_time_) { release("Clock changed; released"); return {}; }
     const auto elapsed=now-previous_time_;
     if(elapsed>250000) { release("Frame gap; released"); return {}; }
@@ -111,7 +119,7 @@ std::optional<TowPlan> TowController::update(WorldKey world,std::uint64_t local_
     const float travel_limit=std::min(35.f,4.f+tow_max_target_speed*static_cast<float>(elapsed)*1e-6f);
     if(length(sub(hip,previous_hip_))>travel_limit) { release("Target teleported; released"); return {}; }
     if(length(sub(hip,root))>tow_max_separation) { release("Tether separation exceeded 24 m; released"); return {}; }
-    if(now-velocity_time_>=50000) {
+    if(now-velocity_time_>=50000 && !stale_hold) {
         // Measure across a network-sized window. Per-frame derivatives of a
         // bursty pose alternated between zero and several times actual speed;
         // capping those spikes biased the estimate and let the rider fall behind.
@@ -126,6 +134,7 @@ std::optional<TowPlan> TowController::update(WorldKey world,std::uint64_t local_
     const float steering_dt=static_cast<float>(elapsed)*1e-6f;
     steering_offset_+=(steering-steering_offset_)*(1-std::exp(-4.f*steering_dt));
     previous_hip_=hip; previous_time_=now;
+    if(!stale_hold) { last_hip_=hip; last_seen_us_=now; have_last_=true; }
     // Travel, rather than stance-dependent pose/root yaw, owns the follow lane.
     // Keep the last direction below walking speed to avoid jitter at rest.
     if(length(velocity_)>1.f) {

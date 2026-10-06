@@ -23,6 +23,12 @@ struct State {
     std::atomic<int> hand_side{-1}; // selection hysteresis avoids swapping on small pose jitter
     std::atomic<const char*> hand_detail{"waiting for grab"};
     std::atomic<const char*> failure_reason{"Skitch physics changed; release grab and try again"};
+    // Whole-body placement drag: the render thread eases into the drag and
+    // fades it out on release so the game's own placement is not reasserted as
+    // a teleport. Only animation_evaluated touches these.
+    std::atomic<float> drag_blend{0};
+    std::atomic<std::uint64_t> drag_time{};
+    std::array<float,3> drag_goal{};
     float steering{};
     std::uintptr_t owner{};
     std::uint64_t next_report{};
@@ -32,6 +38,10 @@ struct State {
 State& state() { static State s; return s; }
 bool write_rotation(std::uintptr_t at, const std::array<float,4>& q) noexcept {
     __try { std::memcpy(reinterpret_cast<void*>(at), q.data(), sizeof(q)); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+bool write_position(std::uintptr_t at, const std::array<float,3>& p) noexcept {
+    __try { std::memcpy(reinterpret_cast<void*>(at), p.data(), sizeof(p)); return true; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
@@ -264,10 +274,38 @@ void animation_evaluated(std::uintptr_t component) noexcept {
         const auto holder=reader.pointer(component,0xa0);
         const auto pose=multiplayer::read_native_pose_layout(first_person_read,r->base,holder,512);
         if(!pose.buffer || pose.count!=395) { state().hand_detail.store("pose unavailable"); return; }
-        // The old pose-only drag wrote joint 1 (world placement) here: it moved
-        // the render while the physics stayed behind, and the game snapped back
-        // on release. The drag now drives the wipeout motion state's velocity,
-        // so the game owns the placement and nothing is written here.
+        // Ragdoll drag, whole body: the wipeout solver recomputes the ragdoll
+        // from its own source every update (its state fields are outputs, and
+        // every follow state -- Falling, FollowRagdoll, FollowAnimatedRagdoll
+        // -- reads the same context source), so no memory write survives there.
+        // The final skeleton response still applies this pose, so the world
+        // placement (joint 1, the AI trajectory) is eased to the follow slot
+        // and the whole body travels with the grip. On release the offset is
+        // faded out instead of snapping back.
+        {
+            const auto now_ms=GetTickCount64();
+            const auto previous_ms=state().drag_time.exchange(now_ms);
+            const float dt=previous_ms && now_ms>previous_ms
+                ? std::min(0.1f,static_cast<float>(now_ms-previous_ms)*0.001f) : 1.f/60.f;
+            float blend=state().drag_blend.load();
+            if(r->plan.ragdoll) { state().drag_goal=r->plan.root_goal; blend=std::min(1.f,blend+dt*5.f); }
+            else blend=std::max(0.f,blend-dt*2.5f);
+            state().drag_blend.store(blend);
+            if(blend>0.001f) {
+                const auto placement=pose.buffer+0x30ULL+0x20;
+                std::array<float,3> current{};
+                if(!first_person_read(placement,current.data(),sizeof(current))) state().hand_detail.store("placement unreadable");
+                else if(!source_writable(placement,12)) state().hand_detail.store("placement not writable");
+                else {
+                    const auto& goal=state().drag_goal;
+                    const std::array<float,3> eased{
+                        current[0]+(goal[0]-current[0])*blend,
+                        current[1]+(goal[1]-current[1])*blend,
+                        current[2]+(goal[2]-current[2])*blend};
+                    if(!write_position(placement,eased)) { fault(); return; }
+                }
+            }
+        }
         std::array<skateskitch::Joint,395> joints;
         for(const auto i : {0u,1u,7u,42u,43u,44u,45u,46u,47u,48u,49u,50u,275u,276u,277u,278u,283u}) {
             std::array<float,12> bone{};

@@ -13,6 +13,10 @@ inline constexpr float tow_max_separation=24.f;
 inline constexpr float tow_max_target_speed=160.f;
 inline constexpr float tow_max_rider_speed=180.f;
 inline constexpr float tow_max_acceleration=600.f;
+// A missing network sample is far more common than a leader actually leaving:
+// keep the grip on the last known hip through this window instead of tearing
+// the drag apart on every pose-stream gap.
+inline constexpr std::uint64_t tow_stale_grace_us=900000;
 struct TowCandidate {
     RemoteSample sample;
     std::array<float,4> heading{0,0,0,1};
@@ -40,6 +44,10 @@ private:
     std::array<float,4> travel_heading_{0,0,0,1};
     Vec3 offset_{}, previous_hip_{}, velocity_{}, velocity_hip_{};
     std::uint64_t previous_time_{}, velocity_time_{};
+    // Last fresh sample, held through a stale window (see tow_stale_grace_us).
+    Vec3 last_hip_{};
+    std::uint64_t last_seen_us_{};
+    bool have_last_{};
     std::string_view status_ = "Ready: hold V or LB+RB near a player";
 };
 // Deadzone and normalize left-stick X; does not consume native game input.
