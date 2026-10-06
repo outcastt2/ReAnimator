@@ -146,10 +146,11 @@ void probe_tick(std::uintptr_t core, bool wipeout) {
     if (!p.captured) {
         probe_capture(core);
     } else {
-        std::uintptr_t motion{};
-        if (memory::peek(core + 0x3b0, motion) && motion != p.motion) {
+        std::uintptr_t motion{}, active{};
+        if (memory::peek(core + 0x3b0, motion) &&
+            (motion != p.motion || (memory::peek(motion + 0x48, active) && active != p.substate))) {
             logging::log(logging::Level::info, logging::Channel::runtime,
-                "Player skitch probe: the motion object changed; recapturing.");
+                "Player skitch probe: the active motion state changed; recapturing.");
             probe_capture(core);
         }
     }

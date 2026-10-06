@@ -172,52 +172,31 @@ void noclip_apply_velocity(std::uintptr_t core) noexcept {
                 reader.verify();
             } else if (bodies.seconds > 0) {
                 if (drag) {
-                    // A wipeout solver discards body-level edits (the drag ran
-                    // every step and the ragdoll never moved), so the drag moves
-                    // the entity root instead: the ragdoll hangs off the entity.
-                    std::array<float, 3> reference{};
-                    std::size_t count{};
-                    for (std::size_t i = 9; i < bodies.parts.size(); ++i) {
-                        const auto velocity = reader.value<std::array<float, 3>>(bodies.parts[i], 0x70);
-                        reference[0] += velocity[0];
-                        reference[1] += velocity[1];
-                        reference[2] += velocity[2];
-                        ++count;
-                    }
-                    source_require(count > 0, "Skitch skeleton parts are unavailable.");
-                    for (auto& v : reference) v /= static_cast<float>(count);
+                    // The wipeout rides a fourth embedded state of the same
+                    // motion object the walking flight uses (state vtables near
+                    // 0x65e8c20..0x65e8ed0), and its velocity accumulator is the
+                    // state's +0x10 -- the same field sync_offboard_flight_velocity
+                    // writes for walking. Match the target velocity there and the
+                    // state integrates it: physics, camera and all.
+                    const auto motion = reader.pointer(bodies.core, 0x3b0);
+                    const auto active = motion ? reader.pointer(motion, 0x48) : 0;
+                    source_require(active != 0, "Skitch motion state is unavailable.");
+                    const auto vtable = reader.pointer(active);
+                    source_require(vtable >= state.trial.base + 0x65e8c00 && vtable < state.trial.base + 0x65e9100,
+                        "Skitch motion state is not a flight state.");
+                    std::array<float, 3> velocity{};
+                    source_require(reader.raw(active + 0x10, velocity.data(), sizeof(velocity)),
+                        "Skitch motion velocity unreadable.");
                     const auto delta =
-                        skateskitch::tow_velocity_delta(bodies.root, reference, skitch->plan, bodies.seconds);
+                        skateskitch::tow_velocity_delta(bodies.root, velocity, skitch->plan, bodies.seconds);
                     source_require(delta.has_value(), "Skitch correction exceeded bounds.");
-                    float step[2] = { (reference[0] + (*delta)[0]) * bodies.seconds,
-                                      (reference[2] + (*delta)[2]) * bodies.seconds };
-                    const float step_length = std::hypot(step[0], step[1]);
-                    constexpr float max_drag_step = 0.35f; // metres per physics step
-                    if (step_length > max_drag_step) {
-                        step[0] *= max_drag_step / step_length;
-                        step[1] *= max_drag_step / step_length;
-                    }
-                    const auto collection = reader.pointer(skitch->entity, 0x70);
-                    std::array<float, 16> root{};
-                    bool placed{};
-                    if (collection && reader.pointer(collection) == skitch->entity) {
-                        const auto first = reader.value<std::uint8_t>(collection, 9);
-                        const auto extra = reader.value<std::uint8_t>(collection, 10);
-                        if (first <= 128 && extra <= 32) {
-                            const auto at = collection + 0x10 +
-                                (static_cast<std::uintptr_t>(first) + 2 * std::uintptr_t(extra)) * 0x20;
-                            if (reader.raw(at, root.data(), sizeof(root))) {
-                                root[12] += step[0];
-                                root[14] += step[1];
-                                reader.verify();
-                                using Place = void (*)(std::uintptr_t, const void *);
-                                reinterpret_cast<Place>(state.trial.base + entities::place_entity)(skitch->entity,
-                                                                                                  root.data());
-                                placed = true;
-                            }
-                        }
-                    }
-                    source_require(placed, "Skitch entity transform unavailable.");
+                    velocity[0] += (*delta)[0];
+                    velocity[2] += (*delta)[2];
+                    reader.verify();
+                    std::array<float, 3> written{};
+                    source_require(copy_to(active + 0x10, velocity.data(), sizeof(velocity)) &&
+                        memory::peek_bytes(active + 0x10, written.data(), sizeof(written)) && written == velocity,
+                        "Skitch motion velocity write failed.");
                     player_skitch::note_physics_step();
                 } else {
                     const auto current = reader.value<std::array<float,3>>(bodies.parts[0], 0x70);
