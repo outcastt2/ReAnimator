@@ -226,6 +226,15 @@ void tick(std::uintptr_t base,std::uintptr_t client,const multiplayer::NativeFra
     if(!s.on.load() || !local.ready || !native.initialized.load() || !native.velocity_guard_active.load()) {
         s.tow.release("Skitch unavailable; release grab to rearm"); s.detail=std::string(s.tow.status()); return;
     }
+    // Idle ticks must not pay for the physics layout: debug_noclip_bodies is
+    // ~100 native reads, and the grab, the drag and the probe are the only
+    // things that need it. With no press, no grip and no probe, the tick costs
+    // one input read.
+    if(!held && !s.tow.attached() && !s.ragdoll_active &&
+        !probe().pending.load(std::memory_order_relaxed) && !probe().active.load(std::memory_order_relaxed)) {
+        s.detail=std::string(s.tow.status());
+        return;
+    }
     if(native.busy.test_and_set(std::memory_order_acquire)) return;
     SourceBusyScope scope{native.busy};
     try {
