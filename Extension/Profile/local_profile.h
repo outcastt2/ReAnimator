@@ -28,15 +28,19 @@ inline constexpr std::string_view unlock_bus_stops_option = "ReSkate.UnlockBusSt
 inline constexpr std::string_view unlock_cosmetics_option = "ReSkate.UnlockCosmetics";
 inline constexpr std::string_view unlock_objects_option = "ReSkate.UnlockObjects";
 inline constexpr std::string_view hide_challenges_option = "ReSkate.HideChallenges";
-// The SkateSkitch unlocker is by item class. Only the classes switched on here
-// are seeded owned; every other class is put on the catalog's revoke list and
-// forced back to unowned on each refresh. Gestures and build items include the
-// reserved ones behind Skate Pass, influence, events and neighbourhood ranks.
-inline constexpr bool unlock_gesture_items = true;      // own_rctn_gesture*, gestures*
-inline constexpr bool unlock_build_items = true;        // bkobjects (Object Dropper)
-inline constexpr bool unlock_clothing_items = false;    // cust_*: shirts, pants, shoes, hats...
-inline constexpr bool unlock_board_items = false;       // board_*, sb_*: decks, wheels, trucks, stickers
-inline constexpr bool unlock_other_cosmetics = false;   // player card, statements, everything else
+// The SkateSkitch unlocker extends the upstream open-catalogue unlock to two
+// classes in full: gestures and build items are seeded owned whether or not
+// their source is currently open (most are tier rewards). Every other kind of
+// cosmetic keeps the upstream ReSkate behaviour -- the open catalogue, base
+// game and mods alike, is unlocked when UnlockCosmetics is on, and reserved
+// items (past seasons, Skate Pass) stay locked. Note that unowned items are
+// absent from the game's wardrobe, not shown locked, so "reserved stays
+// locked" really means "reserved is not there".
+inline constexpr bool unlock_gesture_items = true;
+inline constexpr bool unlock_build_items = true;
+// Reserved cosmetics other than gestures. Off is the upstream behaviour; on
+// unlocks everything, which is what SkateSkitch did before this was split.
+inline constexpr bool unlock_reserved_cosmetics = false;
 // Cosmetic slots the character wears nothing in, whatever preset is saved. One
 // boolean per slot name, so a slot is hidden by policy rather than by editing the
 // presets themselves and losing the ability to put the item back.

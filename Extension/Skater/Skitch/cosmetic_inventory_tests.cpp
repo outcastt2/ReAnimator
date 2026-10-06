@@ -14,8 +14,8 @@ int main() {
             profile::Store store(save);
             store.set_bool_option(profile::unlock_cosmetics_option,true);
             store.set_bool_option(profile::unlock_objects_option,true);
-            // The catalog's class decision is simulated here: gestures and build
-            // items go to the seed lists, clothing to the revoke list.
+            // The catalog's decision is simulated here: gestures and build items
+            // go to the seed lists, a reserved item to the revoke list.
             store.seed_cosmetic_inventory({"Own_TestGesture"});
             store.seed_object_inventory({"Own_TestObject"});
             store.seed_cosmetic_inventory({"Own_TestClothing"}); // an earlier build granted it

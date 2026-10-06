@@ -137,21 +137,23 @@ bool refresh_cosmetic_catalog() {
         !read(manager + 0x3c, current_count) || current_count != count) return false;
     const auto& catalogs = content_cache::catalogs();
     c.ownership_unavailable = !catalogs.available;
-    // The unlocker is a class policy, not a reserved split: gestures and build
-    // items are wanted (including the ones behind tiers); every other class
-    // goes on the revoke list so a previously granted item cannot linger.
+    // Gestures and build items are unlocked in full; every other cosmetic keeps
+    // the upstream open-catalogue rule, and only reserved items are revoked.
     std::vector<std::string> seed_cosmetics, seed_objects, locked_cosmetics, locked_objects;
     for (const auto& [key, info] : items) {
+        std::string folded = key;
+        for (auto& letter : folded) if (letter >= 'A' && letter <= 'Z') letter = static_cast<char>(letter + ('a' - 'A'));
+        const bool held = catalogs.reserved(folded);
         if (info.build_kit) {
             (profile::unlock_build_items ? seed_objects : locked_objects).push_back(key);
         } else if (key.starts_with("own_rctn_gesture") || info.category.starts_with("gestures")) {
             (profile::unlock_gesture_items ? seed_cosmetics : locked_cosmetics).push_back(key);
-        } else if (info.category.starts_with("cust_")) {
-            (profile::unlock_clothing_items ? seed_cosmetics : locked_cosmetics).push_back(key);
-        } else if (info.category.starts_with("board_") || info.category.starts_with("sb_")) {
-            (profile::unlock_board_items ? seed_cosmetics : locked_cosmetics).push_back(key);
+        } else if (!held || profile::unlock_reserved_cosmetics) {
+            // Upstream ReSkate: the open catalogue is unlocked, which is the
+            // base game clothing and everything a mod installed.
+            seed_cosmetics.push_back(key);
         } else {
-            (profile::unlock_other_cosmetics ? seed_cosmetics : locked_cosmetics).push_back(key);
+            locked_cosmetics.push_back(key);
         }
     }
     if (!c.ownership_unavailable) {
