@@ -1,6 +1,7 @@
 #include "client_source_spawn.h"
 #include "client_source_spawn_internal.h"
 #include "no_bail.h"
+#include "Skitch/player_skitch.h"
 #include "Engine/Core/Log/logging.h"
 #include "Engine/Core/Platform/launcher_support.h"
 #include "Engine/Game/Build/20260929/engine.h"
@@ -798,7 +799,12 @@ overlay::DebugModel on_client_debug_tick(std::uintptr_t base, std::uintptr_t cli
         } else if (debug.up_velocity.valid) {
             model.up_velocity_unavailable = "Up Boost is being applied.";
         }
-        model.no_bail_available = can_control && update_no_bail(client, model.skater_identity, debug.no_bail && no_bail_allowed,
+        // Grip-holds-the-bail: while the option is on and a grip is being
+        // published, the wipeout requests are suppressed like manual No Bail,
+        // so the rider stays on the board and the physical tow keeps working.
+        const bool grip_bail = player_skitch::grip_no_bail() && player_skitch::grip_holding();
+        model.no_bail_available = can_control && update_no_bail(client, model.skater_identity,
+            (debug.no_bail && no_bail_allowed) || grip_bail,
             debug.noclip && debug.noclip_velocity.valid, debug.noclip_velocity.expires);
         if (model.camera_available) {
             if (!model.no_bail_available) model.noclip_unavailable = "Waiting for local No Bail protection.";

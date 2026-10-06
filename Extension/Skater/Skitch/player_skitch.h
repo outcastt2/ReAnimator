@@ -23,6 +23,13 @@ void request_probe(unsigned seconds) noexcept;
 std::optional<Request> request() noexcept;
 void animation_evaluated(std::uintptr_t component) noexcept;
 void render_pose(std::uintptr_t animation_interface) noexcept;
+// Grip-holds-the-bail option. While on and the local skater has an active grip
+// (a plan is being published), wipeout requests are suppressed: the rider
+// stays on the board and the physical tow keeps working, instead of entering
+// the animation-driven ragdoll. Off by default; `ragdoll nobail on|off`.
+void set_grip_no_bail(bool on) noexcept;
+bool grip_no_bail() noexcept;
+bool grip_holding() noexcept;
 void set_enabled(bool) noexcept;
 bool enabled() noexcept;
 std::string status();

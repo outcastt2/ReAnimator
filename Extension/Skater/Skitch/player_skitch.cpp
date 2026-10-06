@@ -23,12 +23,18 @@ struct State {
     std::atomic<int> hand_side{-1}; // selection hysteresis avoids swapping on small pose jitter
     std::atomic<const char*> hand_detail{"waiting for grab"};
     std::atomic<const char*> failure_reason{"Skitch physics changed; release grab and try again"};
+    // Grip-holds-the-bail option: while set and a grip is active, wipeout
+    // requests are suppressed so the physical tow keeps working. Off by default.
+    std::atomic<bool> grip_no_bail_setting{false}, grip_active{false};
     // Whole-body placement drag: the render thread eases into the drag and
     // fades it out on release so the game's own placement is not reasserted as
-    // a teleport. Only animation_evaluated touches these.
+    // a teleport. Only the pose callback touches these.
     std::atomic<float> drag_blend{0};
     std::atomic<std::uint64_t> drag_time{};
     std::array<float,3> drag_goal{};
+    std::uintptr_t fade_base{}, fade_component{};
+    std::uint64_t fade_until{};
+    bool fade_active{};
     float steering{};
     std::uintptr_t owner{};
     std::uint64_t next_report{};
@@ -188,6 +194,9 @@ void suspend() noexcept {
 void fault(const char* reason) noexcept { state().failure_reason.store(reason); state().failed.store(true); }
 void note_physics_step() noexcept { state().physics_steps.fetch_add(1); }
 void note_turn_step() noexcept { state().turn_steps.fetch_add(1); }
+void set_grip_no_bail(bool on) noexcept { state().grip_no_bail_setting.store(on); }
+bool grip_no_bail() noexcept { return state().grip_no_bail_setting.load(); }
+bool grip_holding() noexcept { return state().grip_active.load(); }
 void request_probe(unsigned seconds) noexcept {
     auto &p = probe();
     p.seconds.store(seconds ? seconds : 60);
@@ -242,6 +251,7 @@ void tick(std::uintptr_t base,std::uintptr_t client,const multiplayer::NativeFra
         s.steering=steering;
         const auto plan=s.tow.update(world,local_id,now,bodies.root,playable,ragdoll,held,candidates,steering,was_attached && s.hand_side.load()==1);
         s.detail=std::string(s.tow.status());
+        s.grip_active.store(plan.has_value());
         const bool dragging=plan && plan->ragdoll;
         if(dragging!=s.ragdoll_active) {
             s.ragdoll_active=dragging;
@@ -264,6 +274,42 @@ void tick(std::uintptr_t base,std::uintptr_t client,const multiplayer::NativeFra
         s.tow.release("Local skater changed; release grab to rearm"); s.detail=std::string(s.tow.status());
     }
 }
+// Whole-body drag placement. The wipeout solver recomputes the ragdoll from
+// its own source every update (the state fields are outputs; Falling,
+// FollowRagdoll and FollowAnimatedRagdoll all read the same context source),
+// so no memory write survives there. The final skeleton response does apply
+// this pose, so joint 1 -- the world placement -- is eased to the follow slot
+// while the grip holds, and faded back to the game's own placement after
+// release instead of snapping. Runs from the pose callback, where the write
+// survives to the renderer; the fade path keeps it alive after the request
+// ends (the callback is the only place this write is seen).
+void drag_placement(std::uintptr_t base, std::uintptr_t component, bool active,
+    const skateskitch::Vec3* goal) noexcept {
+    auto& s=state();
+    const auto now_ms=GetTickCount64();
+    const auto previous_ms=s.drag_time.exchange(now_ms);
+    const float dt=previous_ms && now_ms>previous_ms
+        ? std::min(0.1f,static_cast<float>(now_ms-previous_ms)*0.001f) : 1.f/60.f;
+    float blend=s.drag_blend.load();
+    if(active && goal) { s.drag_goal=*goal; blend=std::min(1.f,blend+dt*5.f); }
+    else blend=std::max(0.f,blend-dt*2.5f);
+    s.drag_blend.store(blend);
+    if(blend<=0.001f) return;
+    std::uintptr_t holder{};
+    if(!first_person_read(component+0xa0,&holder,sizeof(holder)) || !holder) return;
+    const auto pose=multiplayer::read_native_pose_layout(first_person_read,base,holder,512);
+    if(!pose.buffer || pose.count!=395) return;
+    const auto placement=pose.buffer+0x30ULL+0x20;
+    std::array<float,3> current{};
+    if(!first_person_read(placement,current.data(),sizeof(current))) return;
+    if(!source_writable(placement,12)) { if(active) s.hand_detail.store("placement not writable"); return; }
+    const auto& target=s.drag_goal;
+    const std::array<float,3> eased{
+        current[0]+(target[0]-current[0])*blend,
+        current[1]+(target[1]-current[1])*blend,
+        current[2]+(target[2]-current[2])*blend};
+    if(!write_position(placement,eased) && active) fault();
+}
 void animation_evaluated(std::uintptr_t component) noexcept {
     const auto r=request(); if(!r || r->component!=component) return;
     state().hand_attempts.fetch_add(1);
@@ -274,38 +320,7 @@ void animation_evaluated(std::uintptr_t component) noexcept {
         const auto holder=reader.pointer(component,0xa0);
         const auto pose=multiplayer::read_native_pose_layout(first_person_read,r->base,holder,512);
         if(!pose.buffer || pose.count!=395) { state().hand_detail.store("pose unavailable"); return; }
-        // Ragdoll drag, whole body: the wipeout solver recomputes the ragdoll
-        // from its own source every update (its state fields are outputs, and
-        // every follow state -- Falling, FollowRagdoll, FollowAnimatedRagdoll
-        // -- reads the same context source), so no memory write survives there.
-        // The final skeleton response still applies this pose, so the world
-        // placement (joint 1, the AI trajectory) is eased to the follow slot
-        // and the whole body travels with the grip. On release the offset is
-        // faded out instead of snapping back.
-        {
-            const auto now_ms=GetTickCount64();
-            const auto previous_ms=state().drag_time.exchange(now_ms);
-            const float dt=previous_ms && now_ms>previous_ms
-                ? std::min(0.1f,static_cast<float>(now_ms-previous_ms)*0.001f) : 1.f/60.f;
-            float blend=state().drag_blend.load();
-            if(r->plan.ragdoll) { state().drag_goal=r->plan.root_goal; blend=std::min(1.f,blend+dt*5.f); }
-            else blend=std::max(0.f,blend-dt*2.5f);
-            state().drag_blend.store(blend);
-            if(blend>0.001f) {
-                const auto placement=pose.buffer+0x30ULL+0x20;
-                std::array<float,3> current{};
-                if(!first_person_read(placement,current.data(),sizeof(current))) state().hand_detail.store("placement unreadable");
-                else if(!source_writable(placement,12)) state().hand_detail.store("placement not writable");
-                else {
-                    const auto& goal=state().drag_goal;
-                    const std::array<float,3> eased{
-                        current[0]+(goal[0]-current[0])*blend,
-                        current[1]+(goal[1]-current[1])*blend,
-                        current[2]+(goal[2]-current[2])*blend};
-                    if(!write_position(placement,eased)) { fault(); return; }
-                }
-            }
-        }
+        drag_placement(r->base,component,r->plan.ragdoll,&r->plan.root_goal);
         std::array<skateskitch::Joint,395> joints;
         for(const auto i : {0u,1u,7u,42u,43u,44u,45u,46u,47u,48u,49u,50u,275u,276u,277u,278u,283u}) {
             std::array<float,12> bone{};
@@ -327,7 +342,22 @@ void animation_evaluated(std::uintptr_t component) noexcept {
     } catch(...) { state().hand_detail.store("ownership or layout changed"); fault(); }
 }
 void render_pose(std::uintptr_t animation_interface) noexcept {
-    const auto r=request(); if(!r) return;
+    auto& s=state();
+    const auto r=request();
+    if(!r) {
+        // The release fade has to outlive the request: without a request the
+        // callback is not invoked, and this is the only place the placement
+        // write is seen by the renderer. Keep running it until the blend ends.
+        if(!s.fade_active || GetTickCount64()>s.fade_until || !s.fade_component) return;
+        std::uintptr_t holder{};
+        if(!first_person_read(s.fade_component+0xa0,&holder,sizeof(holder)) || !holder ||
+            animation_interface!=holder+0xc0) return;
+        drag_placement(s.fade_base,s.fade_component,false,nullptr);
+        if(s.drag_blend.load()<=0.001f) s.fade_active=false;
+        return;
+    }
+    s.fade_active=true; s.fade_until=GetTickCount64()+4000;
+    s.fade_base=r->base; s.fade_component=r->component;
     std::uintptr_t holder{};
     if(first_person_read(r->component+0xa0,&holder,sizeof(holder)) && holder && animation_interface==holder+0xc0)
         animation_evaluated(r->component);

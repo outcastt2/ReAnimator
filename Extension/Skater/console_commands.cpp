@@ -409,7 +409,8 @@ void register_movement_commands(Commands &registry) {
     // through a bail, and `set` holds one byte at 0/1 to find the live one.
     auto ragdoll = action("ragdoll",
         "Ragdoll modes: ragdoll | ragdoll config | ragdoll bools | ragdoll watch [seconds] | "
-        "ragdoll set <field|index> <0|1> [seconds] | ragdoll setdata <field|index> <0|1> <offset> | ragdoll off",
+        "ragdoll set <field|index> <0|1> [seconds] | ragdoll setdata <field|index> <0|1> <offset> | "
+        "ragdoll nobail on|off | ragdoll off",
         Group::gameplay, {argument("mode", Type::text, true), argument("field", Type::text, true),
                           argument("value", Type::text, true), argument("extra", Type::text, true)});
     ragdoll.execution = Execution::local;
@@ -469,8 +470,16 @@ void register_movement_commands(Commands &registry) {
             out("Ragdoll: restoring every held byte.");
             return;
         }
+        if (mode == "nobail") {
+            const auto on = text(1) == "on" || number(1, 0u) != 0;
+            dingosdk::player_skitch::set_grip_no_bail(on);
+            out(on ? "Ragdoll: while a grip is held, wipeouts are now suppressed (stay on the board, physical tow)."
+                   : "Ragdoll: grip no longer suppresses wipeouts (a bail becomes a ragdoll again).");
+            return;
+        }
         out("usage: ragdoll | ragdoll config | ragdoll bools | ragdoll watch [seconds] | "
-            "ragdoll set <field|index> <0|1> [seconds] | ragdoll setdata <field|index> <0|1> <offset> | ragdoll off");
+            "ragdoll set <field|index> <0|1> [seconds] | ragdoll setdata <field|index> <0|1> <offset> | "
+            "ragdoll nobail on|off | ragdoll off");
     };
     registry.add(std::move(ragdoll));
 
