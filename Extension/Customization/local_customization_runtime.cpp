@@ -143,7 +143,13 @@ bool refresh_cosmetic_catalog() {
     for (const auto& [key, info] : items) {
         std::string folded = key;
         for (auto& letter : folded) if (letter >= 'A' && letter <= 'Z') letter = static_cast<char>(letter + ('a' - 'A'));
-        const bool held = catalogs.reserved(folded);
+        // Entitlement-granted collab collections ("Own_Own_...") are absent from
+        // the open content cache entirely -- it ships only content ReSkate can
+        // distribute -- so reserved() cannot see them. Treat them as reserved:
+        // they are the paid brand packs, and an owned paid item whose backing
+        // data the cache does not describe has crashed the client's item
+        // previews (a shared-pointer copy of an object that is not there).
+        const bool held = catalogs.reserved(folded) || folded.starts_with("own_own_");
         if (info.build_kit) {
             (profile::unlock_build_items ? seed_objects : locked_objects).push_back(key);
         } else if (key.starts_with("own_rctn_gesture") || info.category.starts_with("gestures")) {

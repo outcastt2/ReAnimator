@@ -38,8 +38,10 @@ inline constexpr std::string_view hide_challenges_option = "ReSkate.HideChalleng
 // locked" really means "reserved is not there".
 inline constexpr bool unlock_gesture_items = true;
 inline constexpr bool unlock_build_items = true;
-// Reserved cosmetics other than gestures. Off is the upstream behaviour; on
-// unlocks everything, which is what SkateSkitch did before this was split.
+// Reserved cosmetics other than gestures. Off is the upstream behaviour and
+// also hides the entitlement-granted collab packs ("Own_Own_..."), which the
+// open content cache cannot describe; on unlocks everything, which is what
+// SkateSkitch did before this was split.
 inline constexpr bool unlock_reserved_cosmetics = false;
 // Cosmetic slots the character wears nothing in, whatever preset is saved. One
 // boolean per slot name, so a slot is hidden by policy rather than by editing the
