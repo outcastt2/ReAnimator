@@ -60,11 +60,15 @@ void TowController::release(std::string_view reason) noexcept {
     attached_=false; needs_release_=true; velocity_={}; status_=reason;
 }
 std::optional<TowPlan> TowController::update(WorldKey world,std::uint64_t local_id,std::uint64_t now,
-    Vec3 root,bool playable,bool held,std::span<const TowCandidate> candidates,float steering,bool left_hand) {
+    Vec3 root,bool playable,bool ragdoll,bool held,std::span<const TowCandidate> candidates,float steering,bool left_hand) {
     steering=std::isfinite(steering) ? std::clamp(steering,-1.f,1.f) : 0;
     const bool pressed=held&&!previous_held_; previous_held_=held;
     if(!held) { attached_=false; needs_release_=false; status_="Released; normal skating"; return {}; }
-    if(!playable || !valid(root) || !world.session || !local_id) { release("Unavailable; release grab to rearm"); return {}; }
+    if(!valid(root) || !world.session || !local_id) { release("Unavailable; release grab to rearm"); return {}; }
+    // A bail keeps an existing grip (the ragdoll is dragged) but can never
+    // acquire one: the rider has to be on the board to reach for a leader.
+    if(ragdoll && !attached_) { status_="Bail: no grip to hold"; return {}; }
+    if(!playable && !ragdoll) { release("Unavailable; release grab to rearm"); return {}; }
     if(attached_ && world!=world_) { release("World changed; released"); return {}; }
     const auto eligible=[&](const TowCandidate& c) {
         return c.sample.eligible && c.sample.world==world && c.sample.player.id && c.sample.player.id!=local_id &&
@@ -150,7 +154,8 @@ std::optional<TowPlan> TowController::update(WorldKey world,std::uint64_t local_
     // influence orientation instead of immediately correcting it away.
     const float bias=-steering_offset_*.45f*.5f;
     heading=product(Q{0,std::sin(bias),0,std::cos(bias)},heading);
-    return TowPlan{target_,goal,velocity_,hip,heading,steering};
+    status_=ragdoll ? "Bail: holding on" : "Attached";
+    return TowPlan{target_,goal,velocity_,hip,heading,steering,ragdoll};
 }
 float skitch_steering_axis(float normalized) {
     if(!std::isfinite(normalized)) return 0;

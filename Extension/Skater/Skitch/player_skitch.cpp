@@ -22,6 +22,7 @@ struct State {
     float steering{};
     std::uintptr_t owner{};
     std::uint64_t next_report{};
+    bool ragdoll_active{};
     std::string detail = "Hold V or LB+RB near a player";
 };
 State& state() { static State s; return s; }
@@ -73,15 +74,29 @@ void tick(std::uintptr_t base,std::uintptr_t client,const multiplayer::NativeFra
         const auto bodies=debug_noclip_bodies(base,client,local.entity);
         SourceReader reader;
         const auto component=reader.pointer(local.entity,0x628);
-        const bool bailing=(reader.value<std::uint32_t>(bodies.context,0x13c4)&0x8000u)!=0 ||
-            (reader.value<std::uint32_t>(bodies.context,0x13d4)&0x08000000u)!=0;
+        const bool impact_bail=(reader.value<std::uint32_t>(bodies.context,0x13c4)&0x8000u)!=0;
+        const bool animation_bail=(reader.value<std::uint32_t>(bodies.context,0x13d4)&0x08000000u)!=0;
+        const bool bailing=impact_bail||animation_bail;
         const bool playable=active && !bodies.offboard && !bailing && !native.trial.debug.noclip &&
             !native.trial.debug.park_editor && !native.trial.debug.camera_owned &&
             reader.value<std::uint8_t>(local.entity,0x7e0)==0;
+        // Holding the grab through a bail keeps the grip: the ragdoll is dragged
+        // after the leader by the same controller, with no board yaw. A ragdoll
+        // can never acquire a grip, only keep the one it had.
+        const bool ragdoll=active && bailing && s.tow.attached();
         reader.verify();
         const bool was_attached=s.tow.attached();
         s.steering=steering;
-        const auto plan=s.tow.update(world,local_id,now,bodies.root,playable,held,candidates,steering,was_attached && s.hand_side.load()==1);
+        if(ragdoll!=s.ragdoll_active) {
+            s.ragdoll_active=ragdoll;
+            if(ragdoll)
+                logging::log(logging::Level::info,logging::Channel::runtime,
+                    "Player skitch: bail drag engaged; hold the grab to keep it.");
+            else
+                logging::log(logging::Level::info,logging::Channel::runtime,
+                    "Player skitch: bail drag ended.");
+        }
+        const auto plan=s.tow.update(world,local_id,now,bodies.root,playable,ragdoll,held,candidates,steering,was_attached && s.hand_side.load()==1);
         s.detail=std::string(s.tow.status());
         if(!plan || !was_attached) s.hand_side.store(-1);
         if(plan) s.pending=Request{base,client,local.entity,bodies.core,component,GetTickCount64()+150,*plan};

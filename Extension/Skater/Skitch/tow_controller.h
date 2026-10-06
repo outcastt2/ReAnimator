@@ -22,11 +22,13 @@ struct TowPlan {
     Vec3 root_goal{}, target_velocity{}, hand_goal{};
     std::array<float,4> heading{0,0,0,1};
     float steering{}; // live input reduces automatic yaw authority
+    bool ragdoll{};   // the grip survived a bail: drag the ragdoll, no board yaw
 };
 class TowController {
 public:
     std::optional<TowPlan> update(WorldKey, std::uint64_t local_id, std::uint64_t now_us,
-        Vec3 local_root, bool playable, bool held, std::span<const TowCandidate> candidates, float steering=0, bool left_hand=false);
+        Vec3 local_root, bool playable, bool ragdoll, bool held, std::span<const TowCandidate> candidates,
+        float steering=0, bool left_hand=false);
     void release(std::string_view reason) noexcept;
     bool attached() const noexcept { return attached_; }
     std::string_view status() const noexcept { return status_; }
