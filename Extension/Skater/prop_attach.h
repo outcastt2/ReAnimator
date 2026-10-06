@@ -66,6 +66,11 @@ void request_prop_derive(unsigned seconds);
 // where it was placed on detach.
 void request_prop_hand_attach(std::string name, bool left);
 void request_prop_hand_detach();
+// Character morph data mapping: report the authored ranges, raise the body
+// inputs' MaxValue (the CAS slider clamp), or restore the originals.
+void request_morph_find();
+void request_morph_unclamp(float max_value = 4.0f);
+void request_morph_clamp();
 std::string prop_status();
 // Per-frame service on the client thread, beside the other skater ticks.
 void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept;

@@ -117,6 +117,12 @@ struct State {
     std::uint16_t hand_joint{278};   // right wrist j278; j049 is the left
     std::uintptr_t hand_definition{};
     std::vector<std::uint16_t> hand_chain;
+    // Character morph clamp: the DingoMorph data mapping authors Min/Max for
+    // every input (0..1 for all body regions). This tool rewrites the live
+    // MaxValue floats and can put the originals back.
+    bool morph_find_pending{}, morph_unclamp_pending{}, morph_clamp_pending{};
+    float morph_unclamp_max{4.0f};
+    std::vector<std::pair<Ptr, float>> morph_originals;
     std::vector<Region> regions;
     std::vector<Word> words;
     std::vector<std::pair<std::string, Ptr>> pending_regions;
@@ -828,6 +834,144 @@ void stop_poke(bool restore) {
     s.poke_overwrites = s.poke_rewrites = 0;
 }
 
+// ---------------------------------------------------------------------------
+// Character morph clamp. CAS body sliders and body-type tweakables reach the
+// DingoMorph GPU graph through DingoMorphGraphDataMappingAsset: one entry per
+// input, each authoring MinValue/MaxValue (0..1 for every body region), and
+// that authored range is what clamps a slider. Runtime layout from the Studio
+// schema: the mapping container sits at asset+0x20 and each entry is 48 bytes --
+// name strings at +0x00/+0x08/+0x10, multiplier float +0x18, field hash +0x1c,
+// MaxValue float +0x20, DataFieldKey int +0x24, MinValue float +0x28.
+struct MorphEntry {
+    Ptr address{};
+    std::string name;
+    float min{1}, max{}, multiplier{1};
+    std::int32_t key{};
+};
+bool morph_body_input(const std::string &name) {
+    static constexpr const char *tokens[] = {
+        "BaseOverrideForBody", "feet",   "calfs",    "thighs",  "glute",    "gut",     "arms",
+        "chest",               "g_hips", "g_chest",  "g_crotch", "g_butt",  "Archetype",
+    };
+    for (const char *token : tokens)
+        if (name.find(token) != std::string::npos) return true;
+    return false;
+}
+std::string morph_name(Ptr address) {
+    Ptr text{};
+    std::array<char, 96> buffer{};
+    if (!memory::peek(address, text) || !text || memory::peek_cstring(text, buffer.data(), buffer.size()) < 0)
+        return {};
+    return buffer.data();
+}
+bool read_morph_mapping(Ptr base, std::vector<MorphEntry> &entries, Ptr &asset, std::string &error) {
+    bool faulted{};
+    asset = find_named_asset(base, "characters/maincharacters/generic/cas/common/metamorph/cas_rsp_datamappingasset",
+                             faulted);
+    if (!asset) {
+        error = "the morph mapping asset is not loaded (be in a level or in CAS first)";
+        return false;
+    }
+    std::array<Ptr, 3> container{};
+    if (!memory::peek_bytes(asset + 0x20, container.data(), sizeof(container))) {
+        error = "the mapping container is unreadable";
+        return false;
+    }
+    // The DataContainer is {begin,end,capacity} or {pointer,count,capacity}; take
+    // whichever shape lands on the schema's first entry ("BaseOverrideForBody").
+    Ptr table{};
+    std::size_t count{};
+    if (container[1] > container[0] && (container[1] - container[0]) % 48 == 0) {
+        table = container[0];
+        count = static_cast<std::size_t>((container[1] - container[0]) / 48);
+    } else if (container[1] && container[1] <= 4096) {
+        table = container[0];
+        count = container[1];
+    }
+    if (!table || count != 94 || morph_name(table + 0x10) != "BaseOverrideForBody") {
+        error = "the mapping layout did not match the Studio schema";
+        return false;
+    }
+    entries.clear();
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto address = table + i * 48;
+        MorphEntry entry;
+        entry.address = address;
+        entry.name = morph_name(address + 0x10);
+        (void)memory::peek(address + 0x18, entry.multiplier);
+        (void)memory::peek(address + 0x24, entry.key);
+        (void)memory::peek(address + 0x20, entry.max);
+        (void)memory::peek(address + 0x28, entry.min);
+        entries.push_back(std::move(entry));
+    }
+    return true;
+}
+void morph_find(Ptr base) {
+    std::vector<MorphEntry> entries;
+    Ptr asset{};
+    std::string error;
+    if (!read_morph_mapping(base, entries, asset, error)) {
+        logging::log(logging::Level::warning, logging::Channel::skater, "Hand props: morph mapping: {}.", error);
+        set_status("Hand props: morph mapping: " + error + ".");
+        return;
+    }
+    logging::log(logging::Level::info, logging::Channel::skater,
+                 "Hand props: morph mapping asset {:#x}, {} inputs.", asset, entries.size());
+    for (const auto &entry : entries) {
+        if (!morph_body_input(entry.name)) continue;
+        logging::log(logging::Level::info, logging::Channel::skater,
+                     "Hand props: morph {} key={} range [{:.2f}, {:.2f}] multiplier {:.2f}", entry.name, entry.key,
+                     entry.min, entry.max, entry.multiplier);
+    }
+    set_status(std::format("Hand props: morph mapping found; {} inputs, body entries in the log.", entries.size()));
+}
+void morph_patch(Ptr base, float max_value, bool restore) {
+    auto &s = state();
+    std::vector<MorphEntry> entries;
+    Ptr asset{};
+    std::string error;
+    if (!read_morph_mapping(base, entries, asset, error)) {
+        logging::log(logging::Level::warning, logging::Channel::skater, "Hand props: morph mapping: {}.", error);
+        set_status("Hand props: morph mapping: " + error + ".");
+        return;
+    }
+    if (restore) {
+        std::size_t count{};
+        for (const auto &[address, original] : s.morph_originals) {
+            std::uint32_t bits{};
+            std::memcpy(&bits, &original, sizeof(bits));
+            if (write_u32(address, bits)) ++count;
+        }
+        s.morph_originals.clear();
+        logging::log(logging::Level::info, logging::Channel::skater,
+                     "Hand props: morph clamp restored on {} input(s).", count);
+        set_status(std::format("Hand props: morph clamp restored on {} input(s).", count));
+        return;
+    }
+    const auto remember = [&](Ptr address, float current) {
+        for (const auto &[known, _] : s.morph_originals)
+            if (known == address) return;
+        s.morph_originals.emplace_back(address, current);
+    };
+    std::size_t count{};
+    for (const auto &entry : entries) {
+        if (!morph_body_input(entry.name) || entry.name.empty()) continue;
+        remember(entry.address + 0x20, entry.max);
+        std::uint32_t bits{};
+        std::memcpy(&bits, &max_value, sizeof(bits));
+        if (write_u32(entry.address + 0x20, bits)) ++count;
+    }
+    logging::log(logging::Level::info, logging::Channel::skater,
+                 "Hand props: morph max raised to {:.2f} on {} body input(s); 'morph clamp' restores them.",
+                 max_value, count);
+    set_status(std::format("Hand props: morph max {:.2f} on {} input(s).", max_value, count));
+}
+void service_morph(Ptr base, bool find, bool unclamp, bool clamp, float max_value) {
+    if (clamp) morph_patch(base, 0, true);
+    else if (unclamp) morph_patch(base, max_value, false);
+    else if (find) morph_find(base);
+}
+
 void dump_region(Ptr address, std::size_t bytes, const std::string &label) {
     for (std::size_t offset = 0; offset + 4 <= bytes; offset += 4) {
         std::uint32_t value{};
@@ -1170,6 +1314,23 @@ void request_prop_hand_detach() {
     s.hand_detach_pending = true;
     s.hand_attach_pending = false;
 }
+void request_morph_find() {
+    auto &s = state();
+    std::lock_guard lock(s.mutex);
+    s.morph_find_pending = true;
+}
+void request_morph_unclamp(float max_value) {
+    auto &s = state();
+    if (!std::isfinite(max_value) || max_value < 1.0f || max_value > 50.0f) max_value = 4.0f;
+    std::lock_guard lock(s.mutex);
+    s.morph_unclamp_max = max_value;
+    s.morph_unclamp_pending = true;
+}
+void request_morph_clamp() {
+    auto &s = state();
+    std::lock_guard lock(s.mutex);
+    s.morph_clamp_pending = true;
+}
 std::string prop_status() {
     std::string text;
     {
@@ -1187,6 +1348,7 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
         std::string filter;
         bool want_report{}, want_watch{}, want_weight{}, want_pose{}, want_assets{}, want_poke{}, want_poke_stop{};
         bool want_trace{}, want_trace_off{}, want_derive{}, want_hand_attach{}, want_hand_detach{};
+        bool want_morph_find{}, want_morph_unclamp{}, want_morph_clamp{};
         unsigned seconds{default_seconds};
         unsigned weight_seconds{};
         unsigned pose_seconds{};
@@ -1197,6 +1359,7 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
         std::string assets_extra;
         std::string hand_name;
         bool hand_left{};
+        float morph_max{4.0f};
         {
             std::lock_guard lock(s.mutex);
             want_report = s.report_pending;
@@ -1211,6 +1374,9 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
             want_derive = s.derive_pending;
             want_hand_attach = s.hand_attach_pending;
             want_hand_detach = s.hand_detach_pending;
+            want_morph_find = s.morph_find_pending;
+            want_morph_unclamp = s.morph_unclamp_pending;
+            want_morph_clamp = s.morph_clamp_pending;
             filter = s.filter;
             seconds = s.watch_seconds;
             weight_seconds = s.weight_seconds;
@@ -1222,10 +1388,12 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
             assets_extra = s.assets_extra;
             hand_name = s.hand_name;
             hand_left = s.hand_left;
+            morph_max = s.morph_unclamp_max;
             s.report_pending = s.watch_pending = s.weight_pending = s.pose_pending = s.assets_pending = false;
             s.poke_pending = s.poke_stop_pending = false;
             s.trace_pending = s.trace_off_pending = s.derive_pending = false;
             s.hand_attach_pending = s.hand_detach_pending = false;
+            s.morph_find_pending = s.morph_unclamp_pending = s.morph_clamp_pending = false;
         }
         if (want_poke_stop) stop_poke(true);
         else if (want_poke) arm_poke(base, client, poke_seconds);
@@ -1280,6 +1448,7 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
         // while no watch is armed.
         service_derive(base);
         drain_trace(base);
+        service_morph(base, want_morph_find, want_morph_unclamp, want_morph_clamp, morph_max);
         if (want_report) report(base, filter);
         if (want_assets) arm_assets(base, client, assets_extra, assets_seconds);
         else if (want_pose) arm_pose(base, client, pose_seconds);

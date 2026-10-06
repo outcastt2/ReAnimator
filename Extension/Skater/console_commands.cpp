@@ -339,6 +339,45 @@ void register_movement_commands(Commands &registry) {
     };
     registry.add(std::move(prop));
 
+    // Character morphs: the CAS sliders clamp to the data mapping's authored
+    // Min/Max (0..1 for every body region). This rewrites the live range.
+    auto morph = action("morph",
+        "Character morphs: morph find | morph unclamp [max] | morph clamp",
+        Group::gameplay, {argument("mode", Type::text, true), argument("max", Type::text, true)});
+    morph.execution = Execution::local;
+    morph.inspect = [](const Model &) { return State{true, {}, {}, skater::prop_status(), false}; };
+    morph.run = [](const Model &, const Values &args, const Output &out) {
+        const auto text = [&](std::size_t index) -> std::string {
+            if (index >= args.size() || !std::holds_alternative<std::string>(args[index])) return {};
+            return lower(std::get<std::string>(args[index]));
+        };
+        const auto mode = text(0);
+        if (mode.empty() || mode == "find") {
+            skater::request_morph_find();
+            out("Morph: reading the data mapping (see the log)...");
+            return;
+        }
+        if (mode == "unclamp") {
+            float max_value = 4.0f;
+            try {
+                const auto spec = text(1);
+                if (!spec.empty()) max_value = std::stof(spec);
+            } catch (...) {
+            }
+            skater::request_morph_unclamp(max_value);
+            out(std::format("Morph: raising the body inputs' maximum to {:.2f}; 'morph clamp' restores it.",
+                            max_value));
+            return;
+        }
+        if (mode == "clamp") {
+            skater::request_morph_clamp();
+            out("Morph: restoring the authored clamp values...");
+            return;
+        }
+        out("usage: morph find | morph unclamp [max] | morph clamp");
+    };
+    registry.add(std::move(morph));
+
     // Route B: overwrite the local skater's pose with a baked custom animation.
     auto poseanim = action("poseanim",
         "Custom animation: poseanim test | record | off | play | save <path> | mask auto|full|legs | trace 0|1 | <file>.rska",
