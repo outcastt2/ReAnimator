@@ -16,6 +16,10 @@ void suspend() noexcept;
 void fault(const char* reason="Skitch physics changed; release grab and try again") noexcept;
 void note_physics_step() noexcept;
 void note_turn_step() noexcept;
+// Passive probe of the wipeout motion state (core+0x3b0 and its +0x48 active
+// substate): dumps both on the first ragdoll frame and logs the first change of
+// every watched word. Read-only; use it to find the field that moves a ragdoll.
+void request_probe(unsigned seconds) noexcept;
 std::optional<Request> request() noexcept;
 void animation_evaluated(std::uintptr_t component) noexcept;
 void render_pose(std::uintptr_t animation_interface) noexcept;

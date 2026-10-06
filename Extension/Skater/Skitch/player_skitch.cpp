@@ -2,6 +2,7 @@
 #include "../client_source_spawn_internal.h"
 #include "../no_bail.h"
 #include "Extension/Multiplayer/Remote/native_pose_layout.h"
+#include "Engine/Core/Platform/memory.h"
 #include "Engine/Game/Build/addresses.h"
 #include "Engine/Game/Build/20260929/engine.h"
 #include "Engine/Game/Build/20260929/no_bail.h"
@@ -37,6 +38,135 @@ bool write_position(std::uintptr_t at, const std::array<float,3>& p) noexcept {
     __try { std::memcpy(reinterpret_cast<void*>(at), p.data(), sizeof(p)); return true; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
+
+// Probe of the motion state that owns a wipeout. core+0x3b0 is the parent
+// motion object and +0x48 selects the active embedded substate, the same shape
+// as the walking flight states. On the first wipeout frame the probe dumps both
+// objects and then logs the first change of every watched word, so the field
+// the game actually moves the character with can be identified. Read-only.
+struct Probe {
+    std::atomic<bool> pending{}, active{};
+    std::atomic<unsigned> seconds{60};
+    bool captured{};
+    ULONGLONG until{}, next_heartbeat{};
+    std::uintptr_t core{}, motion{}, substate{};
+    std::vector<std::uintptr_t> addresses;
+    std::vector<std::uint32_t> values;
+    std::vector<bool> changed;
+    unsigned lines{}, changes{};
+};
+Probe& probe() { static auto* p = new Probe; return *p; }
+void probe_dump(std::uintptr_t address, std::size_t bytes, const char* label) {
+    for (std::size_t offset = 0; offset + 4 <= bytes; offset += 4) {
+        std::uint32_t value{};
+        if (!memory::peek(address + offset, value)) break;
+        float as_float{};
+        std::memcpy(&as_float, &value, sizeof(as_float));
+        logging::log(logging::Level::info, logging::Channel::runtime,
+            "Player skitch probe: {} +{:#04x} {:#010x} {} (float {:.6g})", label, offset, value, value, as_float);
+    }
+}
+void probe_capture(std::uintptr_t core) {
+    auto& p = probe();
+    p.core = core;
+    p.motion = p.substate = 0;
+    (void)memory::peek(core + 0x3b0, p.motion);
+    std::uintptr_t motion_vtable{}, substate_vtable{};
+    if (p.motion) {
+        (void)memory::peek(p.motion, motion_vtable);
+        (void)memory::peek(p.motion + 0x48, p.substate);
+    }
+    if (p.substate) (void)memory::peek(p.substate, substate_vtable);
+    logging::log(logging::Level::info, logging::Channel::runtime,
+        "Player skitch probe: core={:#x} motion={:#x} vtable={:#x} substate={:#x} vtable={:#x}", core, p.motion,
+        motion_vtable, p.substate, substate_vtable);
+    if (p.motion) probe_dump(p.motion, 0x80, "motion");
+    if (p.substate) probe_dump(p.substate, 0x100, "substate");
+    p.addresses.clear();
+    p.values.clear();
+    p.changed.clear();
+    const std::array<std::pair<std::uintptr_t, std::size_t>, 2> regions{{
+        {p.motion, 0x80},
+        {p.substate, 0x200},
+    }};
+    for (const auto& [base, bytes] : regions) {
+        if (!base) continue;
+        for (std::size_t offset = 0; offset < bytes; offset += 4) {
+            std::uint32_t value{};
+            if (!memory::peek(base + offset, value)) continue;
+            p.addresses.push_back(base + offset);
+            p.values.push_back(value);
+            p.changed.push_back(false);
+        }
+    }
+    p.captured = true;
+    p.lines = p.changes = 0;
+    logging::log(logging::Level::info, logging::Channel::runtime,
+        "Player skitch probe: watching {} word(s) through this ragdoll.", p.addresses.size());
+}
+void probe_sample() {
+    auto& p = probe();
+    for (std::size_t i = 0; i < p.addresses.size(); ++i) {
+        std::uint32_t value{};
+        if (!memory::peek(p.addresses[i], value) || value == p.values[i]) continue;
+        ++p.changes;
+        if (!p.changed[i] && p.lines < 400) {
+            p.changed[i] = true;
+            ++p.lines;
+            float before{}, after{};
+            std::memcpy(&before, &p.values[i], sizeof(before));
+            std::memcpy(&after, &value, sizeof(after));
+            logging::log(logging::Level::info, logging::Channel::runtime,
+                "Player skitch probe: {:#x} {:#010x} -> {:#010x} (float {:.6g} -> {:.6g})", p.addresses[i],
+                p.values[i], value, before, after);
+        }
+        p.values[i] = value;
+    }
+}
+void probe_tick(std::uintptr_t core, bool wipeout) {
+    auto& p = probe();
+    const auto now = GetTickCount64();
+    if (p.pending.exchange(false)) {
+        const auto window = p.seconds.load() ? p.seconds.load() : 60u;
+        p.active.store(true);
+        p.captured = false;
+        p.until = now + window * 1000ULL;
+        p.next_heartbeat = now + 5000;
+        logging::log(logging::Level::info, logging::Channel::runtime,
+            "Player skitch probe: armed for {}s; bail while holding the grab (or just bail).", window);
+    }
+    if (!p.active.load()) return;
+    if (now >= p.until) {
+        p.active.store(false);
+        logging::log(logging::Level::info, logging::Channel::runtime,
+            "Player skitch probe over: {} change(s), {} line(s).", p.changes, p.lines);
+        return;
+    }
+    if (!wipeout) return;
+    if (!p.captured) {
+        probe_capture(core);
+    } else {
+        std::uintptr_t motion{};
+        if (memory::peek(core + 0x3b0, motion) && motion != p.motion) {
+            logging::log(logging::Level::info, logging::Channel::runtime,
+                "Player skitch probe: the motion object changed; recapturing.");
+            probe_capture(core);
+        }
+    }
+    probe_sample();
+    if (now >= p.next_heartbeat) {
+        p.next_heartbeat = now + 5000;
+        unsigned shown{};
+        for (std::size_t i = 0; i < p.addresses.size() && shown < 16; ++i) {
+            if (!p.changed[i]) continue;
+            float as_float{};
+            std::memcpy(&as_float, &p.values[i], sizeof(as_float));
+            logging::log(logging::Level::info, logging::Channel::runtime,
+                "Player skitch probe: now {:#x} {:#010x} (float {:.6g})", p.addresses[i], p.values[i], as_float);
+            ++shown;
+        }
+    }
+}
 }
 bool enabled() noexcept { return state().on.load(); }
 void set_enabled(bool on) noexcept { state().on.store(on); if(!on) suspend(); }
@@ -51,6 +181,11 @@ void suspend() noexcept {
 void fault(const char* reason) noexcept { state().failure_reason.store(reason); state().failed.store(true); }
 void note_physics_step() noexcept { state().physics_steps.fetch_add(1); }
 void note_turn_step() noexcept { state().turn_steps.fetch_add(1); }
+void request_probe(unsigned seconds) noexcept {
+    auto &p = probe();
+    p.seconds.store(seconds ? seconds : 60);
+    p.pending.store(true);
+}
 std::optional<Request> request() noexcept {
     auto& s=state(); std::lock_guard lock(s.mutex);
     if(!s.on.load() || s.failed.load() || !s.pending || GetTickCount64()>=s.pending->expires) return {};
@@ -94,6 +229,8 @@ void tick(std::uintptr_t base,std::uintptr_t client,const multiplayer::NativeFra
         // reach for a nearby player and grab.
         const bool ragdoll=active && (wipeout||bailing);
         reader.verify();
+        if(probe().pending.load(std::memory_order_relaxed)||probe().active.load(std::memory_order_relaxed))
+            probe_tick(bodies.core,wipeout||bailing);
         const bool was_attached=s.tow.attached();
         s.steering=steering;
         const auto plan=s.tow.update(world,local_id,now,bodies.root,playable,ragdoll,held,candidates,steering,was_attached && s.hand_side.load()==1);

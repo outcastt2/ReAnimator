@@ -14,6 +14,31 @@ void register_movement_commands(Commands &registry) {
     skitch.inspect = [](const Model&) { return boolean_state(true,player_skitch::enabled(),{},player_skitch::status()); };
     skitch.run = [](const Model&,const Values& args,const Output&) { player_skitch::set_enabled(std::get<bool>(args[0])); };
     skitch.reset = [](const Model&,const Output&) { player_skitch::set_enabled(false); };
+    auto skitchprobe = action("skitchprobe",
+        "Player skitch: probe the wipeout motion state during a bail (read-only, logs to the log)",
+        Group::movement, {argument("seconds", Type::number, true)});
+    skitchprobe.execution = Execution::local;
+    skitchprobe.inspect = [](const Model&) {
+        return State{true, {}, {}, "Probe the wipeout motion object; bail while holding the grab.", false};
+    };
+    skitchprobe.run = [](const Model&, const Values& args, const Output& out) {
+        unsigned seconds = 60;
+        if (!args.empty()) {
+            try {
+                if (std::holds_alternative<double>(args[0]))
+                    seconds = static_cast<unsigned>(std::get<double>(args[0]));
+                else if (std::holds_alternative<std::int64_t>(args[0]))
+                    seconds = static_cast<unsigned>(std::get<std::int64_t>(args[0]));
+                else if (std::holds_alternative<std::uint64_t>(args[0]))
+                    seconds = static_cast<unsigned>(std::get<std::uint64_t>(args[0]));
+            } catch (...) {
+            }
+        }
+        player_skitch::request_probe(seconds);
+        out("Player skitch: probing the wipeout motion state for " + std::to_string(seconds) +
+            "s (read-only). Bail while holding the grab, then check the log.");
+    };
+    registry.add(std::move(skitchprobe));
     registry.add(std::move(skitch));
     auto gesture = action("boardgesture", "Show automatic board gesture status; 0 disables, 1 enables", Group::movement, {argument("0|1", Type::boolean,true)});
     gesture.inspect = [](const Model&) { return boolean_state(true,board_gesture::enabled(),{},board_gesture::status()); };
