@@ -147,20 +147,27 @@ void noclip_apply_velocity(std::uintptr_t core) noexcept {
     };
     if (const auto skitch = player_skitch::request(); skitch && skitch->core == core) {
         try {
-            // A bail plan drags the ragdoll: the skeleton's physics parts get
-            // the horizontal velocity correction and the dropped board is left
-            // alone, so the ragdoll keeps its own tumble while it is towed.
+            // A ragdoll plan drags the skeleton while the rider flops; a riding
+            // plan drives the board and skeleton together. A bail can outrun
+            // the client tick by one step: a stale riding plan during that
+            // transition is skipped, not faulted -- the next plan is either a
+            // drag plan or a release.
             const bool drag = skitch->plan.ragdoll;
             const auto bodies = debug_noclip_bodies(state.trial.base, skitch->client, skitch->entity);
-            source_require(bodies.core == core && (!bodies.offboard || drag) && !debug.noclip && !debug.park_editor &&
+            source_require(bodies.core == core && !debug.noclip && !debug.park_editor &&
                 !debug.camera_owned && !debug.forward_velocity.valid && !debug.up_velocity.valid,
                 "Skitch physics changed.");
             SourceReader reader;
-            source_require(reader.value<std::uint8_t>(skitch->entity, 0x7e0) == 0 &&
-                (drag || (!(reader.value<std::uint32_t>(bodies.context, 0x13c4) & 0x8000u) &&
-                          !(reader.value<std::uint32_t>(bodies.context, 0x13d4) & 0x08000000u))),
-                "Skitch released for bail or teleport.");
-            if (bodies.seconds > 0) {
+            source_require(reader.value<std::uint8_t>(skitch->entity, 0x7e0) == 0,
+                "Skitch released for teleport.");
+            const bool bail_requested =
+                (reader.value<std::uint32_t>(bodies.context, 0x13c4) & 0x8000u) != 0 ||
+                (reader.value<std::uint32_t>(bodies.context, 0x13d4) & 0x08000000u) != 0;
+            if (!drag && (bodies.offboard || bail_requested)) {
+                // Transition step: the tick has not seen the bail yet. Leave
+                // the rider alone; the next plan decides.
+                reader.verify();
+            } else if (bodies.seconds > 0) {
                 if (drag) {
                     std::array<std::array<float, 3>, 32> velocities{};
                     std::array<std::uint32_t, 32> flags{};

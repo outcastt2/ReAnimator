@@ -1,7 +1,10 @@
 #include "player_skitch.h"
 #include "../client_source_spawn_internal.h"
+#include "../no_bail.h"
 #include "Extension/Multiplayer/Remote/native_pose_layout.h"
+#include "Engine/Game/Build/addresses.h"
 #include "Engine/Game/Build/20260929/engine.h"
+#include "Engine/Game/Build/20260929/no_bail.h"
 #include "Extension/Multiplayer/Hud/game_ui_state.h"
 #include "Engine/Core/Log/logging.h"
 #include <atomic>
@@ -77,27 +80,30 @@ void tick(std::uintptr_t base,std::uintptr_t client,const multiplayer::NativeFra
         const bool impact_bail=(reader.value<std::uint32_t>(bodies.context,0x13c4)&0x8000u)!=0;
         const bool animation_bail=(reader.value<std::uint32_t>(bodies.context,0x13d4)&0x08000000u)!=0;
         const bool bailing=impact_bail||animation_bail;
+        // The selector's own state is the reliable ragdoll signal (300 is a
+        // ground wipeout); the request bits cover the step before it switches.
+        const bool wipeout=dingosdk::observed_physics_state()==addr::no_bail::wipeout_physics_state;
         const bool playable=active && !bodies.offboard && !bailing && !native.trial.debug.noclip &&
             !native.trial.debug.park_editor && !native.trial.debug.camera_owned &&
             reader.value<std::uint8_t>(local.entity,0x7e0)==0;
-        // Holding the grab through a bail keeps the grip: the ragdoll is dragged
-        // after the leader by the same controller, with no board yaw. A ragdoll
-        // can never acquire a grip, only keep the one it had.
-        const bool ragdoll=active && bailing && s.tow.attached();
+        // Ragdoll: a grip is kept through a bail, and a floored skater can also
+        // reach for a nearby player and grab.
+        const bool ragdoll=active && (wipeout||bailing);
         reader.verify();
         const bool was_attached=s.tow.attached();
         s.steering=steering;
-        if(ragdoll!=s.ragdoll_active) {
-            s.ragdoll_active=ragdoll;
-            if(ragdoll)
+        const auto plan=s.tow.update(world,local_id,now,bodies.root,playable,ragdoll,held,candidates,steering,was_attached && s.hand_side.load()==1);
+        s.detail=std::string(s.tow.status());
+        const bool dragging=plan && plan->ragdoll;
+        if(dragging!=s.ragdoll_active) {
+            s.ragdoll_active=dragging;
+            if(dragging)
                 logging::log(logging::Level::info,logging::Channel::runtime,
                     "Player skitch: bail drag engaged; hold the grab to keep it.");
             else
                 logging::log(logging::Level::info,logging::Channel::runtime,
                     "Player skitch: bail drag ended.");
         }
-        const auto plan=s.tow.update(world,local_id,now,bodies.root,playable,ragdoll,held,candidates,steering,was_attached && s.hand_side.load()==1);
-        s.detail=std::string(s.tow.status());
         if(!plan || !was_attached) s.hand_side.store(-1);
         if(plan) s.pending=Request{base,client,local.entity,bodies.core,component,GetTickCount64()+150,*plan};
         if((plan && (!was_attached || now>=s.next_report)) || (was_attached && !plan)) {

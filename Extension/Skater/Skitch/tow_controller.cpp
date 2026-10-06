@@ -65,9 +65,9 @@ std::optional<TowPlan> TowController::update(WorldKey world,std::uint64_t local_
     const bool pressed=held&&!previous_held_; previous_held_=held;
     if(!held) { attached_=false; needs_release_=false; status_="Released; normal skating"; return {}; }
     if(!valid(root) || !world.session || !local_id) { release("Unavailable; release grab to rearm"); return {}; }
-    // A bail keeps an existing grip (the ragdoll is dragged) but can never
-    // acquire one: the rider has to be on the board to reach for a leader.
-    if(ragdoll && !attached_) { status_="Bail: no grip to hold"; return {}; }
+    // A ragdoll keeps an existing grip and can also reach for a leader: the
+    // press works the same floored or riding. Only walking on foot (neither
+    // flag) releases and re-arms.
     if(!playable && !ragdoll) { release("Unavailable; release grab to rearm"); return {}; }
     if(attached_ && world!=world_) { release("World changed; released"); return {}; }
     const auto eligible=[&](const TowCandidate& c) {
