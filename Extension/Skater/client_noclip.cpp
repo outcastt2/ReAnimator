@@ -169,13 +169,22 @@ void noclip_apply_velocity(std::uintptr_t core) noexcept {
                 reader.verify();
             } else if (bodies.seconds > 0) {
                 if (drag) {
+                    // A ragdoll does not consume body velocities (its motion
+                    // rules are its own), so the drag translates the skeleton's
+                    // physics bodies instead: the same transform write the
+                    // riding turn uses, no rotation, bounded per step so a goal
+                    // jump cannot teleport the ragdoll. Velocities are still
+                    // matched so the solver sees the motion.
                     std::array<std::array<float, 3>, 32> velocities{};
                     std::array<std::uint32_t, 32> flags{};
+                    std::array<std::array<float, 16>, 32> transforms{};
                     std::array<float, 3> reference{};
                     std::size_t count{};
                     for (std::size_t i = 9; i < bodies.parts.size(); ++i) {
                         velocities[i] = reader.value<std::array<float, 3>>(bodies.parts[i], 0x70);
                         flags[i] = reader.value<std::uint32_t>(bodies.parts[i], 0x60);
+                        source_require(reader.raw(bodies.parts[i] + 0x20, transforms[i].data(), sizeof(transforms[i])),
+                            "Skitch body transform unreadable.");
                         reference[0] += velocities[i][0];
                         reference[1] += velocities[i][1];
                         reference[2] += velocities[i][2];
@@ -186,12 +195,23 @@ void noclip_apply_velocity(std::uintptr_t core) noexcept {
                     const auto delta =
                         skateskitch::tow_velocity_delta(bodies.root, reference, skitch->plan, bodies.seconds);
                     source_require(delta.has_value(), "Skitch correction exceeded bounds.");
+                    float step[2] = { (reference[0] + (*delta)[0]) * bodies.seconds,
+                                      (reference[2] + (*delta)[2]) * bodies.seconds };
+                    const float step_length = std::hypot(step[0], step[1]);
+                    constexpr float max_drag_step = 0.35f; // metres per physics step
+                    if (step_length > max_drag_step) {
+                        step[0] *= max_drag_step / step_length;
+                        step[1] *= max_drag_step / step_length;
+                    }
                     reader.verify();
                     for (std::size_t i = 9; i < bodies.parts.size(); ++i) {
+                        transforms[i][12] += step[0];
+                        transforms[i][14] += step[1];
                         velocities[i][0] += (*delta)[0];
                         velocities[i][2] += (*delta)[2];
+                        body_transform_write(bodies.parts[i], transforms[i]);
                         body_write(bodies.parts[i] + 0x70, velocities[i]);
-                        body_write(bodies.parts[i] + 0x60, flags[i] | 8u);
+                        body_write(bodies.parts[i] + 0x60, flags[i] | 9u);
                     }
                     player_skitch::note_physics_step();
                 } else {
