@@ -214,10 +214,37 @@ void noclip_apply_velocity(std::uintptr_t core) noexcept {
                         drag_rejects = 0;
                         velocity[0] += (*delta)[0];
                         velocity[2] += (*delta)[2];
+                        // The game places the wipeout from its motion state's own
+                        // position, so translate those fields toward the follow
+                        // slot: a bounded step each frame (the same offset applied
+                        // to both, so whatever +0x30 and +0xe0 encode stays
+                        // consistent), with the velocity accumulator matched too.
+                        float step[2] = { skitch->plan.root_goal[0] - position[0],
+                                          skitch->plan.root_goal[2] - position[2] };
+                        const float distance = std::hypot(step[0], step[1]);
+                        constexpr float max_drag_step = 0.35f; // metres per physics step
+                        if (distance > max_drag_step) {
+                            step[0] *= max_drag_step / distance;
+                            step[1] *= max_drag_step / distance;
+                        }
+                        std::array<float, 3> ground{};
+                        const bool ground_has_position =
+                            reader.raw(active + 0x30, ground.data(), sizeof(ground)) &&
+                            (ground[0] != 0.0f || ground[2] != 0.0f);
+                        ground[0] += step[0];
+                        ground[2] += step[1];
+                        position[0] += step[0];
+                        position[2] += step[1];
+                        reader.verify();
+                        bool moved = copy_to(active + 0xe0, position.data(), sizeof(position));
+                        // The air state leaves +0x30 zeroed; only translate it
+                        // when it holds a real position.
+                        if (ground_has_position)
+                            moved = copy_to(active + 0x30, ground.data(), sizeof(ground)) && moved;
                         std::array<float, 3> written{};
-                        source_require(copy_to(active + 0x10, velocity.data(), sizeof(velocity)) &&
+                        source_require(moved && copy_to(active + 0x10, velocity.data(), sizeof(velocity)) &&
                             memory::peek_bytes(active + 0x10, written.data(), sizeof(written)) && written == velocity,
-                            "Skitch motion velocity write failed.");
+                            "Skitch motion write failed.");
                         player_skitch::note_physics_step();
                     }
                 } else {
