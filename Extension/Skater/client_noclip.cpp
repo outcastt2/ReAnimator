@@ -3,6 +3,7 @@
 #include "no_bail.h"
 #include "offboard_flight.h"
 #include "Engine/Core/Hooks/hooks.h"
+#include "Engine/Core/Log/logging.h"
 #include "Engine/Game/Build/addresses.h"
 #include "Engine/Game/Build/20260929/engine.h"
 #include "Engine/Game/Build/20260929/no_bail.h"
@@ -184,27 +185,41 @@ void noclip_apply_velocity(std::uintptr_t core) noexcept {
                     const auto vtable = reader.pointer(active);
                     source_require(vtable >= state.trial.base + 0x65e8c00 && vtable < state.trial.base + 0x65e9100,
                         "Skitch motion state is not a flight state.");
-                    std::array<float, 3> velocity{};
+                    // Both wipeout states carry the world position at +0xe0 (the
+                    // air state leaves +0x30 zeroed) and the velocity at +0x10,
+                    // the field the walking flight sync writes. The correction is
+                    // measured against the state's own position, never the pose.
+                    std::array<float, 3> velocity{}, position{};
                     source_require(reader.raw(active + 0x10, velocity.data(), sizeof(velocity)),
                         "Skitch motion velocity unreadable.");
-                    // The controller must measure against the motion state's own
-                    // position (+0x30), not the rendered pose: the pose can be
-                    // elsewhere (a drag write or a late animation), and a pose at
-                    // the goal would report zero error and never pull.
-                    std::array<float, 3> position{};
-                    source_require(reader.raw(active + 0x30, position.data(), sizeof(position)),
+                    source_require(reader.raw(active + 0xe0, position.data(), sizeof(position)),
                         "Skitch motion position unreadable.");
+                    reader.verify();
                     const auto delta =
                         skateskitch::tow_velocity_delta(position, velocity, skitch->plan, bodies.seconds);
-                    source_require(delta.has_value(), "Skitch correction exceeded bounds.");
-                    velocity[0] += (*delta)[0];
-                    velocity[2] += (*delta)[2];
-                    reader.verify();
-                    std::array<float, 3> written{};
-                    source_require(copy_to(active + 0x10, velocity.data(), sizeof(velocity)) &&
-                        memory::peek_bytes(active + 0x10, written.data(), sizeof(written)) && written == velocity,
-                        "Skitch motion velocity write failed.");
-                    player_skitch::note_physics_step();
+                    static unsigned drag_rejects{};
+                    if (!delta.has_value()) {
+                        // A transient bad sample (a state switch, a teleport
+                        // frame) must not drop the grip: skip the step.
+                        if (drag_rejects < 3) {
+                            ++drag_rejects;
+                            logging::log(logging::Level::warning, logging::Channel::runtime,
+                                "Player skitch: drag step rejected: pos=({:.2f},{:.2f},{:.2f}) "
+                                "vel=({:.2f},{:.2f},{:.2f}) goal=({:.2f},{:.2f},{:.2f}) dt={:.4f}",
+                                position[0], position[1], position[2], velocity[0], velocity[1], velocity[2],
+                                skitch->plan.root_goal[0], skitch->plan.root_goal[1], skitch->plan.root_goal[2],
+                                bodies.seconds);
+                        }
+                    } else {
+                        drag_rejects = 0;
+                        velocity[0] += (*delta)[0];
+                        velocity[2] += (*delta)[2];
+                        std::array<float, 3> written{};
+                        source_require(copy_to(active + 0x10, velocity.data(), sizeof(velocity)) &&
+                            memory::peek_bytes(active + 0x10, written.data(), sizeof(written)) && written == velocity,
+                            "Skitch motion velocity write failed.");
+                        player_skitch::note_physics_step();
+                    }
                 } else {
                     const auto current = reader.value<std::array<float,3>>(bodies.parts[0], 0x70);
                     const auto delta = skateskitch::tow_velocity_delta(bodies.root, current, skitch->plan, bodies.seconds);
