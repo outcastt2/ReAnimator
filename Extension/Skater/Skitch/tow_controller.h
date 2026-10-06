@@ -4,9 +4,12 @@
 
 namespace skateskitch {
 // Follow behind and to the leader's left, independent of grab approach.
-inline constexpr float tow_follow_back=1.25f;
-inline constexpr float tow_follow_left=.65f;
-inline constexpr float tow_follow_distance=1.4089003f; // hypot(back, left)
+// Scaled so the hip-to-goal distance is ~6 in (0.152 m) shorter than the
+// original 1.25/0.65 slot: the rider rides a touch closer without changing
+// the rear-left geometry or the side swap.
+inline constexpr float tow_follow_back=1.115f;
+inline constexpr float tow_follow_left=.58f;
+inline constexpr float tow_follow_distance=1.25683f; // hypot(back, left)
 inline constexpr float tow_turn_response=7.f;
 inline constexpr float tow_turn_rate=2.65f;
 inline constexpr float tow_max_separation=24.f;
