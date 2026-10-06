@@ -232,6 +232,9 @@ void tick(std::uintptr_t base,std::uintptr_t client,const multiplayer::NativeFra
     // one input read.
     if(!held && !s.tow.attached() && !s.ragdoll_active &&
         !probe().pending.load(std::memory_order_relaxed) && !probe().active.load(std::memory_order_relaxed)) {
+        // Record the release: the press edge must survive skipped ticks, or a
+        // later press would never read as an edge and nothing would acquire.
+        s.tow.observe(false);
         s.detail=std::string(s.tow.status());
         return;
     }

@@ -56,6 +56,10 @@ std::optional<std::array<Frame,12>> frames(std::span<const Joint> pose,bool left
     return output;
 }
 }
+void TowController::observe(bool held) noexcept {
+    previous_held_=held;
+    if(!held) { attached_=false; needs_release_=false; status_="Released; normal skating"; }
+}
 void TowController::release(std::string_view reason) noexcept {
     attached_=false; needs_release_=true; velocity_={}; status_=reason;
 }

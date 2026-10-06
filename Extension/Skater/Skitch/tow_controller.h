@@ -33,6 +33,10 @@ public:
     std::optional<TowPlan> update(WorldKey, std::uint64_t local_id, std::uint64_t now_us,
         Vec3 local_root, bool playable, bool ragdoll, bool held, std::span<const TowCandidate> candidates,
         float steering=0, bool left_hand=false);
+    // Record the grab input without the per-frame work. The idle gate in the
+    // client tick skips update(), and the press edge (and the re-arm flag) must
+    // survive those skipped ticks or a later press would never acquire.
+    void observe(bool held) noexcept;
     void release(std::string_view reason) noexcept;
     bool attached() const noexcept { return attached_; }
     std::string_view status() const noexcept { return status_; }
