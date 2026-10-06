@@ -176,7 +176,8 @@ void publish(Session &s, const NativeFrame *local) {
         if (const auto mark = identity_mark(social->local.id)) {
             std::tie(view.identity_tag_colour, view.identity_tag) = mark_role(*mark);
             view.identity_animation =
-                *mark == IdentityList::developer ? "RAINBOW" : *mark == IdentityList::content_creator ? "RED" : "GOLD";
+                *mark == IdentityList::developer ? "RAINBOW" : *mark == IdentityList::content_creator ? "RED" :
+                *mark == IdentityList::centrix ? "BLUE" : "GOLD";
             const auto styles = developer_hoodie_detail::own_styles.load();
             const auto standard = developer_hoodie_detail::standard_picks(*mark);
             view.identity_styles.resize(styles.size());
@@ -220,6 +221,11 @@ void publish(Session &s, const NativeFrame *local) {
     }
     view.chat_visible = s.chat_visible;
     view.chat_filter = s.chat_filter;
+    view.chat_bubbles = s.chat_bubbles;
+    view.chat_bubbles_own = s.chat_bubbles_own;
+    view.chat_bubbles_distance = s.chat_bubbles_distance;
+    view.chat_bubbles_duration = s.chat_bubbles_duration;
+    view.chat_bubbles_history = s.chat_bubbles_history;
     view.object_status = network_object_status();
     view.players = static_cast<int>(player_count(s));
     view.sent = t.sent;
@@ -523,7 +529,7 @@ void publish_chat(Session &s) {
             auto [found, added] = s.chat_masked.try_emplace(line.sequence);
             if (added) found->second = {text::mask_bad_words(line.name), text::mask_bad_words(line.text)};
             line.name = found->second.first;
-            line.text = found->second.second;
+            if (found->second.second != line.text) line.unmasked = std::exchange(line.text, found->second.second);
         }
     }
     std::lock_guard lock(s.mutex);
@@ -533,6 +539,7 @@ std::pair<std::uint32_t, std::string> mark_role(IdentityList list) {
     switch (list) {
     case IdentityList::developer: return {nametag_developer, "Dev"};
     case IdentityList::content_creator: return {nametag_creator, "Creator"};
+    case IdentityList::centrix: return {nametag_centrix, "Centrix"};
     default: return {nametag_homie, "Homie"};
     }
 }
@@ -560,7 +567,7 @@ std::pair<std::uint32_t, std::string> player_role(Session &s, std::uint64_t send
 void add_chat(Session &s, std::uint64_t sender, std::string name, std::string text, bool local, bool marks) {
     if (name.empty()) name = sender ? "Player" : "ReSkate";
     auto [color, tag] = player_role(s, sender, local, marks);
-    s.chat.push_back({++s.chat_sequence, sender, std::move(name), std::move(text), local, color, std::move(tag)});
+    s.chat.push_back({++s.chat_sequence, sender, now_us(), std::move(name), std::move(text), local, color, std::move(tag)});
     while (s.chat.size() > multiplayer_chat_history) s.chat.pop_front();
     publish_chat(s);
 }

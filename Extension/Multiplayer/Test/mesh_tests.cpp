@@ -269,7 +269,7 @@ void prepare_native_indicators(std::uintptr_t) noexcept {}
 void prepare_player_ui(std::uintptr_t) noexcept {}
 void prepare_remote_audio(std::uintptr_t) noexcept {}
 bool install_entity_hooks(std::uintptr_t, std::string &) noexcept { return true; }
-void publish_custom_nametags(std::uintptr_t, std::vector<NametagPlayer>, std::optional<std::array<float, 3>>) noexcept {}
+void publish_custom_nametags(std::uintptr_t, std::vector<NametagPlayer>, std::optional<std::array<float, 3>>, bool, bool, float) noexcept {}
 void set_custom_nametags_enabled(bool) noexcept {}
 GameUiState sample_game_ui_state(std::uintptr_t) noexcept { return {}; }
 void note_local_skater(const Transform &) noexcept {}
@@ -677,6 +677,12 @@ void role_checks() {
           "A developer on every list is not shown as a developer");
     check(player_role(host, id(third), false) == Role{nametag_creator, "Creator"},
           "A content creator who is also a homie is not shown as a creator");
+    // A special tag comes before every lobby role: a Centrix player who hosts is Centrix, not Host.
+    simulated_identities.insert({id(host), L::centrix});
+    check(player_role(first, id(host), false) == Role{nametag_centrix, "Centrix"} &&
+              player_role(host, id(host), true) == Role{nametag_centrix, "Centrix"},
+          "A Centrix player who hosts is not shown as Centrix");
+    simulated_identities.erase({id(host), L::centrix});
     // A player who has turned their tag off (the Special page) is whatever they are in the lobby,
     // to everyone: their appearance carries the choice through the host. Their items are a
     // separate choice, which leaves the tag alone.
