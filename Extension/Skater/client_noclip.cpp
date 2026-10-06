@@ -3,15 +3,18 @@
 #include "no_bail.h"
 #include "offboard_flight.h"
 #include "Engine/Core/Hooks/hooks.h"
+#include "Engine/Game/Build/addresses.h"
 #include "Engine/Game/Build/20260929/engine.h"
 #include "Engine/Game/Build/20260929/no_bail.h"
 #include "Engine/Game/Build/20260929/offboard_flight.h"
+#include "Engine/Game/Build/20260929/skater_entities.h"
 #include "free_flight.h"
 #include "Skitch/player_skitch.h"
 #include <cmath>
 
 namespace dingosdk::client_source::detail {
 namespace {
+namespace entities = addr::skater_entities;
 // Physics bodies already verified writable (a VirtualQuery each), so the
 // every-frame and every-simulation-step body reads below skip that system call.
 // A body at a new address, and every body once a second, is checked again.
@@ -169,25 +172,16 @@ void noclip_apply_velocity(std::uintptr_t core) noexcept {
                 reader.verify();
             } else if (bodies.seconds > 0) {
                 if (drag) {
-                    // A ragdoll does not consume body velocities (its motion
-                    // rules are its own), so the drag translates the skeleton's
-                    // physics bodies instead: the same transform write the
-                    // riding turn uses, no rotation, bounded per step so a goal
-                    // jump cannot teleport the ragdoll. Velocities are still
-                    // matched so the solver sees the motion.
-                    std::array<std::array<float, 3>, 32> velocities{};
-                    std::array<std::uint32_t, 32> flags{};
-                    std::array<std::array<float, 16>, 32> transforms{};
+                    // A wipeout solver discards body-level edits (the drag ran
+                    // every step and the ragdoll never moved), so the drag moves
+                    // the entity root instead: the ragdoll hangs off the entity.
                     std::array<float, 3> reference{};
                     std::size_t count{};
                     for (std::size_t i = 9; i < bodies.parts.size(); ++i) {
-                        velocities[i] = reader.value<std::array<float, 3>>(bodies.parts[i], 0x70);
-                        flags[i] = reader.value<std::uint32_t>(bodies.parts[i], 0x60);
-                        source_require(reader.raw(bodies.parts[i] + 0x20, transforms[i].data(), sizeof(transforms[i])),
-                            "Skitch body transform unreadable.");
-                        reference[0] += velocities[i][0];
-                        reference[1] += velocities[i][1];
-                        reference[2] += velocities[i][2];
+                        const auto velocity = reader.value<std::array<float, 3>>(bodies.parts[i], 0x70);
+                        reference[0] += velocity[0];
+                        reference[1] += velocity[1];
+                        reference[2] += velocity[2];
                         ++count;
                     }
                     source_require(count > 0, "Skitch skeleton parts are unavailable.");
@@ -203,16 +197,27 @@ void noclip_apply_velocity(std::uintptr_t core) noexcept {
                         step[0] *= max_drag_step / step_length;
                         step[1] *= max_drag_step / step_length;
                     }
-                    reader.verify();
-                    for (std::size_t i = 9; i < bodies.parts.size(); ++i) {
-                        transforms[i][12] += step[0];
-                        transforms[i][14] += step[1];
-                        velocities[i][0] += (*delta)[0];
-                        velocities[i][2] += (*delta)[2];
-                        body_transform_write(bodies.parts[i], transforms[i]);
-                        body_write(bodies.parts[i] + 0x70, velocities[i]);
-                        body_write(bodies.parts[i] + 0x60, flags[i] | 9u);
+                    const auto collection = reader.pointer(skitch->entity, 0x70);
+                    std::array<float, 16> root{};
+                    bool placed{};
+                    if (collection && reader.pointer(collection) == skitch->entity) {
+                        const auto first = reader.value<std::uint8_t>(collection, 9);
+                        const auto extra = reader.value<std::uint8_t>(collection, 10);
+                        if (first <= 128 && extra <= 32) {
+                            const auto at = collection + 0x10 +
+                                (static_cast<std::uintptr_t>(first) + 2 * std::uintptr_t(extra)) * 0x20;
+                            if (reader.raw(at, root.data(), sizeof(root))) {
+                                root[12] += step[0];
+                                root[14] += step[1];
+                                reader.verify();
+                                using Place = void (*)(std::uintptr_t, const void *);
+                                reinterpret_cast<Place>(state.trial.base + entities::place_entity)(skitch->entity,
+                                                                                                  root.data());
+                                placed = true;
+                            }
+                        }
                     }
+                    source_require(placed, "Skitch entity transform unavailable.");
                     player_skitch::note_physics_step();
                 } else {
                     const auto current = reader.value<std::array<float,3>>(bodies.parts[0], 0x70);

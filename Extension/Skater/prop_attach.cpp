@@ -835,18 +835,23 @@ void stop_poke(bool restore) {
 }
 
 // ---------------------------------------------------------------------------
-// Character morph clamp. CAS body sliders and body-type tweakables reach the
-// DingoMorph GPU graph through DingoMorphGraphDataMappingAsset: one entry per
-// input, each authoring MinValue/MaxValue (0..1 for every body region), and
-// that authored range is what clamps a slider. Runtime layout from the Studio
-// schema: the mapping container sits at asset+0x20 and each entry is 48 bytes --
-// name strings at +0x00/+0x08/+0x10, multiplier float +0x18, field hash +0x1c,
-// MaxValue float +0x20, DataFieldKey int +0x24, MinValue float +0x28.
+// Character morph clamp. The CAS body sliders and body-type tweakables reach
+// the DingoMorph GPU graph through DingoMorphGraphDataMappingAsset: one entry
+// per input, each authoring MinValue/MaxValue (0..1 for every body region), and
+// that authored range is what clamps a slider. The schema says the asset (48
+// bytes) points at a DataContainer at +0x20; the container and the entry layout
+// are probed at runtime and validated against the authored first entry
+// ("BaseOverrideForBody", max 1, min 0).
 struct MorphEntry {
     Ptr address{};
     std::string name;
     float min{1}, max{}, multiplier{1};
     std::int32_t key{};
+};
+struct MorphLayout {
+    Ptr table{};
+    std::size_t count{};
+    unsigned name_index{};   // which pointer field of an entry is the name
 };
 bool morph_body_input(const std::string &name) {
     static constexpr const char *tokens[] = {
@@ -857,12 +862,76 @@ bool morph_body_input(const std::string &name) {
         if (name.find(token) != std::string::npos) return true;
     return false;
 }
-std::string morph_name(Ptr address) {
+std::string morph_string(Ptr address) {
     Ptr text{};
     std::array<char, 96> buffer{};
     if (!memory::peek(address, text) || !text || memory::peek_cstring(text, buffer.data(), buffer.size()) < 0)
         return {};
     return buffer.data();
+}
+std::vector<MorphLayout> morph_layouts(Ptr asset) {
+    std::vector<MorphLayout> layouts;
+    const auto add = [&](Ptr table, std::size_t count) {
+        if (table >= 0x10000 && count && count <= 512)
+            for (unsigned name_index = 0; name_index < 3; ++name_index) layouts.push_back({table, count, name_index});
+    };
+    const auto from_words = [&](const std::array<Ptr, 3> &words) {
+        if (words[1] > words[0] && words[0] >= 0x10000 && (words[1] - words[0]) % 48 == 0)
+            add(words[0], static_cast<std::size_t>((words[1] - words[0]) / 48));
+        else if (words[1] <= 512)
+            add(words[0], words[1]);
+        // {count, capacity, data} order.
+        if (words[0] <= 512 && words[1] <= 512 && words[2] >= 0x10000) add(words[2], words[0]);
+    };
+    Ptr container{};
+    if (memory::peek(asset + 0x20, container) && container) {
+        std::array<Ptr, 3> words{};
+        if (memory::peek_bytes(container, words.data(), sizeof(words))) {
+            from_words(words);
+            std::array<Ptr, 3> inner{};
+            if (words[0] >= 0x10000 && memory::peek_bytes(words[0], inner.data(), sizeof(inner))) from_words(inner);
+        }
+    }
+    std::array<Ptr, 3> inline_words{};
+    if (memory::peek_bytes(asset + 0x20, inline_words.data(), sizeof(inline_words))) from_words(inline_words);
+    return layouts;
+}
+void morph_dump(Ptr asset) {
+    logging::log(logging::Level::info, logging::Channel::skater, "Hand props: morph dump asset={:#x}:", asset);
+    for (std::size_t offset = 0; offset < 0x40; offset += 0x10) {
+        std::array<std::uint32_t, 4> words{};
+        if (!memory::peek_bytes(asset + offset, words.data(), sizeof(words))) break;
+        logging::log(logging::Level::info, logging::Channel::skater,
+                     "Hand props:   +{:#04x}: {:#010x} {:#010x} {:#010x} {:#010x}", offset, words[0], words[1],
+                     words[2], words[3]);
+    }
+    Ptr container{};
+    if (memory::peek(asset + 0x20, container) && container) {
+        std::array<std::uint32_t, 12> words{};
+        if (memory::peek_bytes(container, words.data(), sizeof(words))) {
+            logging::log(logging::Level::info, logging::Channel::skater, "Hand props:   container={:#x}:", container);
+            for (std::size_t offset = 0; offset < 0x30; offset += 0x10)
+                logging::log(logging::Level::info, logging::Channel::skater,
+                             "Hand props:     +{:#04x}: {:#010x} {:#010x} {:#010x} {:#010x}", offset,
+                             words[offset / 4], words[offset / 4 + 1], words[offset / 4 + 2], words[offset / 4 + 3]);
+        }
+    }
+    for (const auto &layout : morph_layouts(asset)) {
+        std::array<std::uint32_t, 12> entry{};
+        if (!memory::peek_bytes(layout.table, entry.data(), sizeof(entry))) continue;
+        logging::log(logging::Level::info, logging::Channel::skater,
+                     "Hand props:   table={:#x} count={} entry0: {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} "
+                     "{:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x}",
+                     layout.table, layout.count, entry[0], entry[1], entry[2], entry[3], entry[4], entry[5], entry[6],
+                     entry[7], entry[8], entry[9], entry[10], entry[11]);
+        for (unsigned index = 0; index < 3; ++index) {
+            const auto name = morph_string(layout.table + index * 8);
+            if (!name.empty())
+                logging::log(logging::Level::info, logging::Channel::skater, "Hand props:   entry0 string[{}] = {}",
+                             index, name);
+        }
+        break;
+    }
 }
 bool read_morph_mapping(Ptr base, std::vector<MorphEntry> &entries, Ptr &asset, std::string &error) {
     bool faulted{};
@@ -872,39 +941,28 @@ bool read_morph_mapping(Ptr base, std::vector<MorphEntry> &entries, Ptr &asset, 
         error = "the morph mapping asset is not loaded (be in a level or in CAS first)";
         return false;
     }
-    std::array<Ptr, 3> container{};
-    if (!memory::peek_bytes(asset + 0x20, container.data(), sizeof(container))) {
-        error = "the mapping container is unreadable";
-        return false;
-    }
-    // The DataContainer is {begin,end,capacity} or {pointer,count,capacity}; take
-    // whichever shape lands on the schema's first entry ("BaseOverrideForBody").
-    Ptr table{};
-    std::size_t count{};
-    if (container[1] > container[0] && (container[1] - container[0]) % 48 == 0) {
-        table = container[0];
-        count = static_cast<std::size_t>((container[1] - container[0]) / 48);
-    } else if (container[1] && container[1] <= 4096) {
-        table = container[0];
-        count = container[1];
-    }
-    if (!table || count != 94 || morph_name(table + 0x10) != "BaseOverrideForBody") {
-        error = "the mapping layout did not match the Studio schema";
-        return false;
-    }
     entries.clear();
-    for (std::size_t i = 0; i < count; ++i) {
-        const auto address = table + i * 48;
-        MorphEntry entry;
-        entry.address = address;
-        entry.name = morph_name(address + 0x10);
-        (void)memory::peek(address + 0x18, entry.multiplier);
-        (void)memory::peek(address + 0x24, entry.key);
-        (void)memory::peek(address + 0x20, entry.max);
-        (void)memory::peek(address + 0x28, entry.min);
-        entries.push_back(std::move(entry));
+    for (const auto &layout : morph_layouts(asset)) {
+        if (morph_string(layout.table + layout.name_index * 8) != "BaseOverrideForBody") continue;
+        float max_value{}, min_value{};
+        if (!memory::peek(layout.table + 0x20, max_value) || !memory::peek(layout.table + 0x28, min_value)) continue;
+        if (std::abs(max_value - 1.0f) > 1e-3f || std::abs(min_value) > 1e-3f) continue;
+        for (std::size_t i = 0; i < layout.count; ++i) {
+            const auto address = layout.table + i * 48;
+            MorphEntry entry;
+            entry.address = address;
+            entry.name = morph_string(address + layout.name_index * 8);
+            (void)memory::peek(address + 0x18, entry.multiplier);
+            (void)memory::peek(address + 0x24, entry.key);
+            (void)memory::peek(address + 0x20, entry.max);
+            (void)memory::peek(address + 0x28, entry.min);
+            entries.push_back(std::move(entry));
+        }
+        return true;
     }
-    return true;
+    morph_dump(asset);
+    error = "the mapping entries were not found (raw dump in the log)";
+    return false;
 }
 void morph_find(Ptr base) {
     std::vector<MorphEntry> entries;
