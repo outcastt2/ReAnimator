@@ -187,8 +187,15 @@ void noclip_apply_velocity(std::uintptr_t core) noexcept {
                     std::array<float, 3> velocity{};
                     source_require(reader.raw(active + 0x10, velocity.data(), sizeof(velocity)),
                         "Skitch motion velocity unreadable.");
+                    // The controller must measure against the motion state's own
+                    // position (+0x30), not the rendered pose: the pose can be
+                    // elsewhere (a drag write or a late animation), and a pose at
+                    // the goal would report zero error and never pull.
+                    std::array<float, 3> position{};
+                    source_require(reader.raw(active + 0x30, position.data(), sizeof(position)),
+                        "Skitch motion position unreadable.");
                     const auto delta =
-                        skateskitch::tow_velocity_delta(bodies.root, velocity, skitch->plan, bodies.seconds);
+                        skateskitch::tow_velocity_delta(position, velocity, skitch->plan, bodies.seconds);
                     source_require(delta.has_value(), "Skitch correction exceeded bounds.");
                     velocity[0] += (*delta)[0];
                     velocity[2] += (*delta)[2];

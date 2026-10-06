@@ -34,10 +34,6 @@ bool write_rotation(std::uintptr_t at, const std::array<float,4>& q) noexcept {
     __try { std::memcpy(reinterpret_cast<void*>(at), q.data(), sizeof(q)); return true; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
-bool write_position(std::uintptr_t at, const std::array<float,3>& p) noexcept {
-    __try { std::memcpy(reinterpret_cast<void*>(at), p.data(), sizeof(p)); return true; }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-}
 
 // Probe of the motion state that owns a wipeout. core+0x3b0 is the parent
 // motion object and +0x48 selects the active embedded substate, the same shape
@@ -268,16 +264,10 @@ void animation_evaluated(std::uintptr_t component) noexcept {
         const auto holder=reader.pointer(component,0xa0);
         const auto pose=multiplayer::read_native_pose_layout(first_person_read,r->base,holder,512);
         if(!pose.buffer || pose.count!=395) { state().hand_detail.store("pose unavailable"); return; }
-        // Ragdoll drag: the wipeout solver discards body and entity edits, but
-        // the final skeleton response still applies this pose, so the world
-        // placement (joint 1, the AI trajectory) is steered to the follow slot
-        // and the whole body travels with the grip.
-        if(r->plan.ragdoll) {
-            const auto placement=pose.buffer+0x30ULL+0x20;
-            if(!source_writable(placement,12)) state().hand_detail.store("placement not writable");
-            else if(!write_position(placement,r->plan.root_goal)) { fault(); return; }
-            else state().hand_detail.store("dragged on placement");
-        }
+        // The old pose-only drag wrote joint 1 (world placement) here: it moved
+        // the render while the physics stayed behind, and the game snapped back
+        // on release. The drag now drives the wipeout motion state's velocity,
+        // so the game owns the placement and nothing is written here.
         std::array<skateskitch::Joint,395> joints;
         for(const auto i : {0u,1u,7u,42u,43u,44u,45u,46u,47u,48u,49u,50u,275u,276u,277u,278u,283u}) {
             std::array<float,12> bone{};
