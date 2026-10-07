@@ -39,4 +39,13 @@ inline constexpr std::uintptr_t machine_vtable_rva = 0x65e8f40;
 inline constexpr std::uintptr_t falling_vtable_rva = 0x65e8da0;
 inline constexpr std::uintptr_t follow_ragdoll_vtable_rva = 0x65e8e60;
 inline constexpr std::uintptr_t follow_animated_ragdoll_vtable_rva = 0x65e8ed0;
+// The ragdoll motion wrapper: all three ragdoll states call it directly, right
+// after they recompute their velocity and before it is integrated into the
+// position, so a velocity written there is the one the engine's own
+// integration consumes and publishes. Its inputs are a by-value block on the
+// stack, so a normal detour cannot forward it -- relay it with a thunk that
+// only preserves the registers and jumps to the original.
+inline constexpr std::uintptr_t ragdoll_motion_wrapper_rva = 0x477fce0;
+inline constexpr std::array<unsigned char, 16> ragdoll_motion_wrapper_prologue{
+    0x48,0x81,0xec,0x88,0x00,0x00,0x00,0x0f,0xb6,0x84,0x24,0x00,0x01,0x00,0x00,0xc5};
 } // namespace dingosdk::game::build::v20260929::offboard_drag
