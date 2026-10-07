@@ -130,7 +130,7 @@ struct State {
     // resolve the chain by name, watch the candidate value bytes through a
     // bail, and can hold one byte overwritten to find which one is live.
     bool ragdoll_config_pending{}, ragdoll_bools_pending{};
-    bool ragdoll_watch_pending{}, ragdoll_refs_pending{};
+    bool ragdoll_watch_pending{}, ragdoll_refs_pending{}, ragdoll_data_pending{};
     unsigned ragdoll_watch_seconds{30};
     bool ragdoll_stop_pending{};
     bool ragdoll_set_pending{};
@@ -1387,6 +1387,60 @@ void ragdoll_refs_dump(Ptr base, Ptr client) {
     const auto spots = ragdoll_reference_spots(base, client, true);
     set_status(std::format("Ragdoll: {} reference spot(s) in the log.", spots.size()));
 }
+// The +0x28 runtime-data field holds a tagged offset, not an address (e.g.
+// 0x160b002 -> 0x160b000, ~22 MB in, which is not mapped). Try the plausible
+// bases and report which one lands in readable memory, so the live value can be
+// located without guessing twice.
+void ragdoll_data_dump(Ptr base, Ptr client) {
+    (void)client;
+    bool faulted{};
+    const auto config = ragdoll_config_asset(base, faulted);
+    for (const char *name : ragdoll_bool_names) {
+        const auto asset = ragdoll_lookup_bool(base, name, faulted);
+        if (!asset) continue;
+        std::uint64_t tagged{};
+        if (!memory::peek(asset + 0x28, tagged)) continue;
+        const auto offset = static_cast<Ptr>(tagged & ~std::uint64_t{7});
+        logging::log(logging::Level::info, logging::Channel::skater,
+            "Ragdoll: {} asset={:#x} +0x28 raw={:#x} offset={:#x}", name, asset, tagged, offset);
+        const std::array<std::pair<const char *, Ptr>, 6> candidates{{
+            {"absolute", offset},
+            {"asset+", asset + offset},
+            {"module+", base + offset},
+            {"0x10000000+", 0x10000000ULL + offset},
+            {"0x40000000+", 0x40000000ULL + offset},
+            {"0x4a000000+", 0x4a000000ULL + offset}}};
+        for (const auto &[label, address] : candidates) {
+            std::array<std::uint8_t, 24> bytes{};
+            if (!memory::peek_bytes(address, bytes.data(), bytes.size())) continue;
+            std::string text;
+            for (const auto byte : bytes) text += std::format("{:02x} ", byte);
+            logging::log(logging::Level::info, logging::Channel::skater,
+                "Ragdoll:   {} {:#x}: {}", label, address, text);
+        }
+        if (config) {
+            std::array<std::uint8_t, 24> bytes{};
+            const auto address = config + offset;
+            if (memory::peek_bytes(address, bytes.data(), bytes.size())) {
+                std::string text;
+                for (const auto byte : bytes) text += std::format("{:02x} ", byte);
+                logging::log(logging::Level::info, logging::Channel::skater,
+                    "Ragdoll:   config+ {:#x}: {}", address, text);
+            }
+        }
+        for (const auto field : {std::uintptr_t{0x00}, std::uintptr_t{0x08}}) {
+            Ptr target{};
+            if (!memory::peek(asset + field, target) || target < 0x10000) continue;
+            std::array<std::uint8_t, 32> bytes{};
+            if (!memory::peek_bytes(target, bytes.data(), bytes.size())) continue;
+            std::string text;
+            for (const auto byte : bytes) text += std::format("{:02x} ", byte);
+            logging::log(logging::Level::info, logging::Channel::skater,
+                "Ragdoll:   shared+{:#x} -> {:#x}: {}", field, target, text);
+        }
+    }
+    set_status("Ragdoll: the +0x28 candidate locations are in the log.");
+}
 void ragdoll_watch(Ptr base, Ptr client, unsigned seconds) {
     auto &s = state();
     Local local;
@@ -1770,6 +1824,11 @@ void request_ragdoll_refs() {
     std::lock_guard lock(s.mutex);
     s.ragdoll_refs_pending = true;
 }
+void request_ragdoll_data() {
+    auto &s = state();
+    std::lock_guard lock(s.mutex);
+    s.ragdoll_data_pending = true;
+}
 void request_ragdoll_watch(unsigned seconds) {
     auto &s = state();
     std::lock_guard lock(s.mutex);
@@ -1812,7 +1871,7 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
         bool want_trace{}, want_trace_off{}, want_derive{}, want_hand_attach{}, want_hand_detach{};
         bool want_morph_find{}, want_morph_unclamp{}, want_morph_clamp{};
         bool want_ragdoll_config{}, want_ragdoll_bools{}, want_ragdoll_watch{}, want_ragdoll_set{},
-            want_ragdoll_stop{}, want_ragdoll_refs{};
+            want_ragdoll_stop{}, want_ragdoll_refs{}, want_ragdoll_data{};
         unsigned ragdoll_watch_seconds{30};
         std::string ragdoll_field;
         unsigned ragdoll_value{};
@@ -1851,6 +1910,7 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
             want_ragdoll_bools = s.ragdoll_bools_pending;
             want_ragdoll_watch = s.ragdoll_watch_pending;
             want_ragdoll_refs = s.ragdoll_refs_pending;
+            want_ragdoll_data = s.ragdoll_data_pending;
             want_ragdoll_set = s.ragdoll_set_pending;
             want_ragdoll_stop = s.ragdoll_stop_pending;
             ragdoll_watch_seconds = s.ragdoll_watch_seconds;
@@ -1878,6 +1938,7 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
             s.morph_find_pending = s.morph_unclamp_pending = s.morph_clamp_pending = false;
             s.ragdoll_config_pending = s.ragdoll_bools_pending = s.ragdoll_watch_pending = false;
             s.ragdoll_refs_pending = false;
+            s.ragdoll_data_pending = false;
             s.ragdoll_set_pending = s.ragdoll_stop_pending = false;
         }
         if (want_poke_stop) stop_poke(true);
@@ -1938,6 +1999,7 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
         if (want_ragdoll_config) ragdoll_config_dump(base);
         if (want_ragdoll_bools) ragdoll_bools_dump(base);
         if (want_ragdoll_refs) ragdoll_refs_dump(base, client);
+        if (want_ragdoll_data) ragdoll_data_dump(base, client);
         if (want_ragdoll_watch) ragdoll_watch(base, client, ragdoll_watch_seconds);
         if (want_ragdoll_set)
             ragdoll_set(base, ragdoll_field, ragdoll_value, ragdoll_hold_seconds, ragdoll_data_location,
