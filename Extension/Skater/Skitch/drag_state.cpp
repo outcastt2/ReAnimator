@@ -193,7 +193,11 @@ void apply_context_write(const char* tag) noexcept {
     constexpr float pull = 0.2f;
     std::array<float, 4> moved = primary;
     for (std::size_t i = 0; i < 3; ++i) moved[i] = primary[i] + (goal[i] - primary[i]) * pull;
-    if (!write_bytes(context + 0x7a0, moved.data(), sizeof(float) * 3)) return;
+    if (!write_bytes(context + 0x7a0, moved.data(), sizeof(float) * 3)) {
+        write_note("Drag state: write skipped, context 0x%llx 7a0 not writable.",
+            static_cast<unsigned long long>(context + 0x7a0));
+        return;
+    }
     // Keep the two copies at their own offsets from the primary.
     std::array<float, 3> adjusted_a{}, adjusted_b{};
     for (std::size_t i = 0; i < 3; ++i) {
