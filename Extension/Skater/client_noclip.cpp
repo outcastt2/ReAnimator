@@ -11,6 +11,7 @@
 #include "Engine/Game/Build/20260929/skater_entities.h"
 #include "free_flight.h"
 #include "Skitch/player_skitch.h"
+#include "Skitch/drag_state.h"
 #include <cmath>
 
 namespace dingosdk::client_source::detail {
@@ -457,6 +458,11 @@ void noclip_physics_update(std::uintptr_t core) {
     noclip_apply_velocity(core);
     trainer_apply_jump_scale(core);
     trainer_push_speed(core);
+    // The ragdoll drag uses the same lever as the jump scaling: the native
+    // velocity has just been computed and the state's position integration
+    // follows, so replacing the velocity here carries the bail through the
+    // engine's own placement publish.
+    player_skitch::drag_state_apply(core);
 }
 bool noclip_motion_target(std::uintptr_t rig, std::uintptr_t context,
     const std::array<float,16>* supplied, std::array<float,16>& target) noexcept {

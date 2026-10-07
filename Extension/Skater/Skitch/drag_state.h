@@ -4,15 +4,15 @@
 
 namespace dingosdk::player_skitch {
 // Native ragdoll drag. The bail's motion states (Falling, FollowRagdoll,
-// FollowAnimatedRagdoll) are animation-driven and recompute their position from
-// the offboard machine's context every update, so no external write to their
-// fields survives -- the reason the whole-body drag had to live in the render
-// pose. This hooks the three state updates: the original runs first, keeping
-// all of its bookkeeping, transitions and its own published placement intact,
-// and then, while a drag goal is published, the state's velocity and position
-// and the machine's published placement are replaced with the tether motion.
-// The core, the render placement and the camera then follow the engine's own
-// placement channel instead of a render-only write.
+// FollowAnimatedRagdoll) are animation-driven: every update recomputes the
+// velocity from the offboard machine's context, integrates it into the state's
+// position and publishes that to the machine -- which is why the whole-body
+// drag had to live in the render pose. This takes the lever the engine itself
+// uses (the same one the flight jump-scaling uses): from the physics-step hook,
+// inside the state's own update and before its position integration, the tether
+// velocity is written into the active ragdoll state. The engine's own
+// integration and placement publish then carry the body, so the core, the
+// render placement and the camera follow -- no render-only write.
 bool start_drag_state(std::uintptr_t base) noexcept;
 bool drag_state_available() noexcept;
 // Console arm switch: while armed, a published goal takes over the bail motion.
@@ -26,5 +26,8 @@ bool drag_state_active() noexcept;
 void drag_state_goal(float x, float y, float z, float vx, float vy, float vz) noexcept;
 void drag_state_release() noexcept;
 void drag_state_probe(unsigned seconds) noexcept;
+// Called from the physics-step hook (client_noclip) with the local physics
+// core, in the animation update order, before the state's position integration.
+void drag_state_apply(std::uintptr_t core) noexcept;
 std::string drag_state_status();
 } // namespace dingosdk::player_skitch

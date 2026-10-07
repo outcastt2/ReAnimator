@@ -31,4 +31,12 @@ inline constexpr std::uintptr_t machine_publish_offset = 0xd30;
 inline constexpr std::uintptr_t state_velocity_offset = 0x10;
 inline constexpr std::uintptr_t state_position_offset = 0x30;
 inline constexpr std::uintptr_t context_dt_offset = 0x17ec;
+// The physics core stores the offboard machine at +0x3b0; its own vtable is
+// 0x65e8f40 (the constructor sets it), and the three ragdoll substates carry
+// these vtables, whose +0x18 entry is the motion update the machine dispatches.
+inline constexpr std::uintptr_t core_machine_offset = 0x3b0;
+inline constexpr std::uintptr_t machine_vtable_rva = 0x65e8f40;
+inline constexpr std::uintptr_t falling_vtable_rva = 0x65e8da0;
+inline constexpr std::uintptr_t follow_ragdoll_vtable_rva = 0x65e8e60;
+inline constexpr std::uintptr_t follow_animated_ragdoll_vtable_rva = 0x65e8ed0;
 } // namespace dingosdk::game::build::v20260929::offboard_drag
