@@ -54,6 +54,34 @@ bool write_bytes(std::uintptr_t address, const void* source, std::size_t size) n
     return WriteProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(address), source, size, &written) &&
            written == size;
 }
+// The context is the address the machine constructor received, core+0x3c0,
+// stored at machine+8 (see the wipeout notes: the member updates read
+// [machine+8], which the constructor sets from rdx = core+0x3c0). Read it from
+// machine+8 first; fall back to the address itself if that slot is unusable.
+std::uintptr_t read_context(std::uintptr_t core) noexcept {
+    std::uintptr_t machine{}, context{};
+    if (memory::peek(core + core_machine_offset, machine) && machine >= 0x10000) {
+        memory::peek(machine + machine_context_offset, context);
+        if (context >= 0x10000) return context;
+    }
+    return core + 0x3c0 >= 0x10000 ? core + 0x3c0 : 0;
+}
+// Rate-limited note, only while the probe runs: names the guard that stopped
+// the write instead of failing silently.
+void write_note(const char* format, ...) noexcept {
+    auto& s = shared();
+    const auto now = GetTickCount64();
+    if (s.probe_until.load(std::memory_order_relaxed) <= now) return;
+    static std::atomic<std::uint64_t> last_log{};
+    auto previous = last_log.load(std::memory_order_relaxed);
+    if (now - previous < 500 || !last_log.compare_exchange_strong(previous, now)) return;
+    char message[256]{};
+    va_list arguments;
+    va_start(arguments, format);
+    std::vsnprintf(message, sizeof(message), format, arguments);
+    va_end(arguments);
+    logging::write(logging::Level::info, logging::Channel::runtime, message);
+}
 void probe_line(const char* tag) noexcept {
     auto& s = shared();
     const auto now = GetTickCount64();
@@ -77,13 +105,18 @@ void probe_line(const char* tag) noexcept {
             "Drag state ctx[{}]: no base/core yet (base=0x{:x} core=0x{:x}).", tag, base, core);
         return;
     }
-    std::uintptr_t machine{}, machine_vtable{}, active{}, active_vtable{}, context{};
+    std::uintptr_t machine{}, machine_vtable{}, active{}, active_vtable{};
     memory::peek(core + core_machine_offset, machine);
     if (machine >= 0x10000) memory::peek(machine, machine_vtable);
     if (machine >= 0x10000) memory::peek(machine + machine_active_offset, active);
     if (active >= 0x10000) memory::peek(active, active_vtable);
-    memory::peek(core + 0x3c0, context);
-    if (context < 0x10000 && machine >= 0x10000) memory::peek(machine + machine_context_offset, context);
+    // Raw context sources for the log: [machine+8] is the documented slot (the
+    // constructor stored core+0x3c0 there); [core+0x3c0] is the first field of
+    // the context itself, so reading it as a pointer is only a fallback check.
+    std::uintptr_t raw_core{}, raw_machine{};
+    memory::peek(core + 0x3c0, raw_core);
+    if (machine >= 0x10000) memory::peek(machine + machine_context_offset, raw_machine);
+    const auto context = read_context(core);
     const bool machine_ok = machine_vtable == base + machine_vtable_rva;
     const bool ragdoll = is_ragdoll_vtable(base, active_vtable);
     const std::array<std::uintptr_t, 7> fields{0x7a0, 0x7b0, 0x7c0, 0x7d0, 0x7e0, 0x7f0, 0x830};
@@ -104,11 +137,13 @@ void probe_line(const char* tag) noexcept {
     s.dumps.fetch_add(1, std::memory_order_relaxed);
     s.last_state.store(active, std::memory_order_relaxed);
     logging::log(logging::Level::info, logging::Channel::runtime,
-        "Drag state ctx[{}]: phys={} core=0x{:x} machine=0x{:x} mvt=0x{:x}{} active=0x{:x} avt=0x{:x}{} | "
-        "v=({:.1f},{:.1f},{:.1f}) p=({:.1f},{:.1f},{:.1f}) pub=({:.1f},{:.1f},{:.1f}) |{}",
+        "Drag state ctx[{}]: phys={} core=0x{:x} machine=0x{:x} mvt=0x{:x}{} active=0x{:x} avt=0x{:x}{} "
+        "ctx=0x{:x} c3c0=0x{:x} m8=0x{:x} | v=({:.1f},{:.1f},{:.1f}) p=({:.1f},{:.1f},{:.1f}) "
+        "pub=({:.1f},{:.1f},{:.1f}) |{}",
         tag, observed_physics_state(), core, machine, machine_vtable,
         machine_ok ? "" : " (expected 0x" + std::to_string(base + machine_vtable_rva) + ")",
         active, active_vtable, ragdoll ? " RAGDOLL" : "",
+        context, raw_core, raw_machine,
         state_velocity[0], state_velocity[1], state_velocity[2],
         state_position[0], state_position[1], state_position[2],
         published[0], published[1], published[2], body);
@@ -117,7 +152,7 @@ void probe_line(const char* tag) noexcept {
 // published to machine+0xd30, with two copies at 7c0 and 830. Writing it from
 // the animation point (after the ragdoll evaluation has written it, before the
 // next step's state update reads it) is the one place a drag can land.
-void apply_context_write() noexcept {
+void apply_context_write(const char* tag) noexcept {
     auto& s = shared();
     // `active` is the tether plan's own ragdoll flag: drag_state_goal is only
     // published while the grip holds a ragdoll plan, so this is the bail
@@ -129,15 +164,30 @@ void apply_context_write() noexcept {
     if (now > s.lease_until.load(std::memory_order_relaxed)) return;
     const auto base = s.base.load(std::memory_order_relaxed);
     const auto core = s.core.load(std::memory_order_relaxed);
-    if (!base || core < 0x10000) return;
-    std::uintptr_t context{};
-    memory::peek(core + 0x3c0, context);
-    if (context < 0x10000) return;
+    if (!base || core < 0x10000) {
+        write_note("Drag state: write skipped, no base/core yet (base=0x%llx core=0x%llx).",
+            static_cast<unsigned long long>(base), static_cast<unsigned long long>(core));
+        return;
+    }
+    const auto context = read_context(core);
+    if (!context) {
+        write_note("Drag state: write skipped, no context (core=0x%llx).",
+            static_cast<unsigned long long>(core));
+        return;
+    }
     std::array<float, 4> primary{}, copy_a{}, copy_b{};
     if (!memory::peek(context + 0x7a0, primary) || !memory::peek(context + 0x7c0, copy_a) ||
-        !memory::peek(context + 0x830, copy_b)) return;
+        !memory::peek(context + 0x830, copy_b)) {
+        write_note("Drag state: write skipped, context 0x%llx fields unreadable.",
+            static_cast<unsigned long long>(context));
+        return;
+    }
     for (const auto value : primary)
-        if (!std::isfinite(value) || std::abs(value) > 100000.f) return;
+        if (!std::isfinite(value) || std::abs(value) > 100000.f) {
+            write_note("Drag state: write skipped, non-finite position (%.1f,%.1f,%.1f).",
+                primary[0], primary[1], primary[2]);
+            return;
+        }
     std::array<float, 3> goal{};
     for (std::size_t i = 0; i < 3; ++i) goal[i] = s.goal[i].load(std::memory_order_relaxed);
     constexpr float pull = 0.2f;
@@ -158,8 +208,8 @@ void apply_context_write() noexcept {
         auto previous = last_log.load(std::memory_order_relaxed);
         if (now - previous >= 250 && last_log.compare_exchange_strong(previous, now)) {
             logging::log(logging::Level::info, logging::Channel::runtime,
-                "Drag state WRITE: context 7a0 ({:.1f},{:.1f},{:.1f}) -> ({:.1f},{:.1f},{:.1f}) goal ({:.1f},{:.1f},{:.1f})",
-                primary[0], primary[1], primary[2], moved[0], moved[1], moved[2], goal[0], goal[1], goal[2]);
+                "Drag state WRITE[{}]: context 7a0 ({:.1f},{:.1f},{:.1f}) -> ({:.1f},{:.1f},{:.1f}) goal ({:.1f},{:.1f},{:.1f})",
+                tag, primary[0], primary[1], primary[2], moved[0], moved[1], moved[2], goal[0], goal[1], goal[2]);
         }
     }
 }
@@ -199,14 +249,14 @@ void drag_state_probe(unsigned seconds) noexcept {
 void drag_state_apply(std::uintptr_t core) noexcept {
     auto& s = shared();
     if (core >= 0x10000) s.core.store(core, std::memory_order_relaxed);
-    apply_context_write();
+    apply_context_write("P");
     probe_line("P");
 }
 // Animation point: the same dump from the animation callback, so the two
 // timestamps per frame show where the evaluation writes the context. The drag
 // write goes here too: this point runs after the ragdoll evaluation.
 void drag_state_animation_probe() noexcept {
-    apply_context_write();
+    apply_context_write("A");
     probe_line("A");
 }
 std::string drag_state_status() {
@@ -228,7 +278,8 @@ bool start_drag_state(std::uintptr_t base) noexcept {
     auto& s = shared();
     if (s.ready.load()) return true;
     try {
-        const std::array<std::pair<std::uintptr_t, std::uintptr_t>, 3> contracts{{
+        const std::array<std::pair<std::uintptr_t, std::uintptr_t>, 4> contracts{{
+            {follow_trajectory_vtable_rva, follow_trajectory_update_rva},
             {falling_vtable_rva, falling_update_rva},
             {follow_ragdoll_vtable_rva, follow_ragdoll_update_rva},
             {follow_animated_ragdoll_vtable_rva, follow_animated_ragdoll_update_rva}}};
