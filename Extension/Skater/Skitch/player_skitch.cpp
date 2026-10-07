@@ -1,4 +1,5 @@
 #include "player_skitch.h"
+#include "drag_state.h"
 #include "../client_source_spawn_internal.h"
 #include "../no_bail.h"
 #include "Extension/Multiplayer/Remote/native_pose_layout.h"
@@ -264,6 +265,14 @@ void tick(std::uintptr_t base,std::uintptr_t client,const multiplayer::NativeFra
         const auto plan=s.tow.update(world,local_id,now,bodies.root,playable,ragdoll,held,candidates,steering,was_attached && s.hand_side.load()==1);
         s.detail=std::string(s.tow.status());
         s.grip_active.store(plan.has_value());
+        // The native drag state owns the bail motion when armed: publish the
+        // tether follow slot for the engine's own placement channel and let the
+        // lease lapse on release, so the native motion resumes without a snap.
+        if(plan && plan->ragdoll && drag_state_armed())
+            drag_state_goal(plan->root_goal[0],plan->root_goal[1],plan->root_goal[2],
+                plan->target_velocity[0],plan->target_velocity[1],plan->target_velocity[2]);
+        else
+            drag_state_release();
         const bool dragging=plan && plan->ragdoll;
         if(dragging!=s.ragdoll_active) {
             s.ragdoll_active=dragging;
@@ -332,7 +341,10 @@ void animation_evaluated(std::uintptr_t component) noexcept {
         const auto holder=reader.pointer(component,0xa0);
         const auto pose=multiplayer::read_native_pose_layout(first_person_read,r->base,holder,512);
         if(!pose.buffer || pose.count!=395) { state().hand_detail.store("pose unavailable"); return; }
-        drag_placement(r->base,component,r->plan.ragdoll,&r->plan.root_goal);
+        // With the native drag state armed it drives the engine's own placement
+        // channel; the render-pose write stands down (and fades out if it was
+        // already engaged) so the two do not both move the body.
+        drag_placement(r->base,component,r->plan.ragdoll && !drag_state_armed(),&r->plan.root_goal);
         std::array<skateskitch::Joint,395> joints;
         for(const auto i : {0u,1u,7u,42u,43u,44u,45u,46u,47u,48u,49u,50u,275u,276u,277u,278u,283u}) {
             std::array<float,12> bone{};

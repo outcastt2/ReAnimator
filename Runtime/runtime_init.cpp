@@ -11,6 +11,7 @@
 #include "Engine/Vfs/mod_catalog.h"
 #include "Extension/Boot/offline_boot.h"
 #include "Extension/Skater/camera_observer.h"
+#include "Extension/Skater/Skitch/drag_state.h"
 #include "Extension/Progression/entitlement_request_hook.h"
 #include "Extension/Skater/skater_observer.h"
 #include "Extension/UI/NativeMenu/native_menu.h"
@@ -368,6 +369,8 @@ extern "C" __declspec(dllexport) BOOL WINAPI DingoSDKDebugInitialize() {
         const bool camera_hook = dingosdk::start_camera_observer(r.base);
         record("{\"event\":\"camera_observer_initialized\",\"active\":" + std::string(camera_hook ? "true" : "false") + "}");
         (void)dingosdk::start_no_bail(r.base);
+        const bool drag_state = dingosdk::player_skitch::start_drag_state(r.base);
+        record("{\"event\":\"drag_state_initialized\",\"active\":" + std::string(drag_state ? "true" : "false") + "}");
         const bool noclip_velocity = dingosdk::start_client_noclip_velocity(r.base);
         record("{\"event\":\"noclip_velocity_initialized\",\"active\":" + std::string(noclip_velocity ? "true" : "false") + "}");
         const bool loading_screens = dingosdk::loading_screen::start(r.base);

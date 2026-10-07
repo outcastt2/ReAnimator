@@ -108,6 +108,7 @@ add_library(dingosdk_runtime SHARED
     Extension/Skater/Skitch/player_skitch.cpp
     Extension/Skater/Skitch/hip_targets.cpp
     Extension/Skater/Skitch/tow_controller.cpp
+    Extension/Skater/Skitch/drag_state.cpp
     Extension/Skater/client_first_person.cpp
     Extension/Skater/client_debug.cpp
     Extension/Skater/ai_skaters.cpp

@@ -3,6 +3,7 @@
 #include "Extension/Profile/local_profile_runtime.h"
 #include "ai_skaters.h"
 #include "Skitch/player_skitch.h"
+#include "Skitch/drag_state.h"
 #include "effect_attach.h"
 #include "custom_animation.h"
 #include "prop_attach.h"
@@ -482,6 +483,47 @@ void register_movement_commands(Commands &registry) {
             "ragdoll nobail on|off | ragdoll off");
     };
     registry.add(std::move(ragdoll));
+
+    // Native ragdoll drag: the bail motion states (Falling, FollowRagdoll,
+    // FollowAnimatedRagdoll) are animation-driven and recompute their position
+    // from the context every update, so the render-pose drag could only move
+    // what is drawn. This hooks the three state updates and, while armed,
+    // replaces the motion with the tether follow slot through the engine's own
+    // placement channel -- the core, the render placement and the camera follow.
+    auto dragstate = action("dragstate",
+        "Native ragdoll drag: dragstate on | dragstate off | dragstate status | dragstate probe [seconds]",
+        Group::gameplay, {argument("mode", Type::text, true), argument("seconds", Type::text, true)});
+    dragstate.execution = Execution::local;
+    dragstate.inspect = [](const Model &) {
+        return State{true, {}, {}, dingosdk::player_skitch::drag_state_status(), false};
+    };
+    dragstate.run = [](const Model &, const Values &args, const Output &out) {
+        const auto text = [&](std::size_t index) -> std::string {
+            if (index >= args.size() || !std::holds_alternative<std::string>(args[index])) return {};
+            return lower(std::get<std::string>(args[index]));
+        };
+        const auto mode = text(0);
+        if (mode == "on" || mode == "off") {
+            const bool on = mode == "on";
+            dingosdk::player_skitch::set_drag_state(on);
+            out(on ? "Drag state: armed. Skitch a player, hold the grab, bail: the tether motion now drives the "
+                     "ragdoll through the engine's own placement channel (camera follows)."
+                   : "Drag state: off. Bail motion returns to the native ragdoll states.");
+            return;
+        }
+        if (mode == "probe") {
+            unsigned seconds = 20;
+            try {
+                if (const auto value = text(1); !value.empty()) seconds = static_cast<unsigned>(std::stoul(value));
+            } catch (...) {
+            }
+            dingosdk::player_skitch::drag_state_probe(seconds);
+            out("Drag state: logging the driven position against the goal for " + std::to_string(seconds) + "s.");
+            return;
+        }
+        out(dingosdk::player_skitch::drag_state_status());
+    };
+    registry.add(std::move(dragstate));
 
     // Route B: overwrite the local skater's pose with a baked custom animation.
     auto poseanim = action("poseanim",
