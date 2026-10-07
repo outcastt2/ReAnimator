@@ -6,6 +6,7 @@
 #include "Engine/Game/Build/addresses.h"
 #include "Engine/Game/Build/20260929/offboard_drag.h"
 #include "Engine/Game/Build/20260929/no_bail.h"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -29,7 +30,7 @@ struct Shared {
     std::array<std::atomic<float>, 3> goal{};
     std::array<std::atomic<float>, 3> goal_velocity{};
     std::atomic<std::uint64_t> dumps{};
-    std::atomic<std::uint64_t> pulls{};
+    std::atomic<std::uint64_t> motion_pulls{};
     std::atomic<std::uint64_t> probe_until{};
     std::atomic<std::uintptr_t> last_state{};
 };
@@ -38,21 +39,6 @@ Shared& shared() { static Shared value; return value; }
 bool is_ragdoll_vtable(std::uintptr_t base, std::uintptr_t vtable) noexcept {
     return vtable == base + falling_vtable_rva || vtable == base + follow_ragdoll_vtable_rva ||
            vtable == base + follow_animated_ragdoll_vtable_rva;
-}
-bool writable(std::uintptr_t address, std::size_t size) noexcept {
-    MEMORY_BASIC_INFORMATION page{};
-    if (!VirtualQuery(reinterpret_cast<const void*>(address), &page, sizeof(page)) ||
-        page.State != MEM_COMMIT || (page.Protect & (PAGE_GUARD | PAGE_NOACCESS)) ||
-        !(page.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)))
-        return false;
-    const auto base = reinterpret_cast<std::uintptr_t>(page.BaseAddress);
-    return address >= base && address - base <= page.RegionSize - size;
-}
-bool write_bytes(std::uintptr_t address, const void* source, std::size_t size) noexcept {
-    if (!writable(address, size)) return false;
-    SIZE_T written{};
-    return WriteProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(address), source, size, &written) &&
-           written == size;
 }
 // The context is the address the machine constructor received, core+0x3c0,
 // stored at machine+8 (see the wipeout notes: the member updates read
@@ -66,21 +52,18 @@ std::uintptr_t read_context(std::uintptr_t core) noexcept {
     }
     return core + 0x3c0 >= 0x10000 ? core + 0x3c0 : 0;
 }
-// Rate-limited note, only while the probe runs: names the guard that stopped
-// the write instead of failing silently.
-void write_note(const char* format, ...) noexcept {
+// Rate-limited motion log, only while the probe runs.
+void motion_log(std::uintptr_t member, const std::array<float, 3>& from,
+    const std::array<float, 3>& to, const std::array<float, 3>& goal) noexcept {
     auto& s = shared();
     const auto now = GetTickCount64();
     if (s.probe_until.load(std::memory_order_relaxed) <= now) return;
     static std::atomic<std::uint64_t> last_log{};
     auto previous = last_log.load(std::memory_order_relaxed);
-    if (now - previous < 500 || !last_log.compare_exchange_strong(previous, now)) return;
-    char message[256]{};
-    va_list arguments;
-    va_start(arguments, format);
-    std::vsnprintf(message, sizeof(message), format, arguments);
-    va_end(arguments);
-    logging::write(logging::Level::info, logging::Channel::runtime, message);
+    if (now - previous < 250 || !last_log.compare_exchange_strong(previous, now)) return;
+    logging::log(logging::Level::info, logging::Channel::runtime,
+        "Drag state MOTION: member=0x{:x} target ({:.1f},{:.1f},{:.1f}) -> ({:.1f},{:.1f},{:.1f}) goal ({:.1f},{:.1f},{:.1f})",
+        member, from[0], from[1], from[2], to[0], to[1], to[2], goal[0], goal[1], goal[2]);
 }
 void probe_line(const char* tag) noexcept {
     auto& s = shared();
@@ -148,83 +131,62 @@ void probe_line(const char* tag) noexcept {
         state_position[0], state_position[1], state_position[2],
         published[0], published[1], published[2], body);
 }
-// The live ragdoll source: the context's 7a0 is the world position that gets
-// published to machine+0xd30, with two copies at 7c0 and 830. Writing it from
-// the animation point (after the ragdoll evaluation has written it, before the
-// next step's state update reads it) is the one place a drag can land.
-void apply_context_write(const char* tag) noexcept {
+} // namespace
+
+// The engine's own root drive. Every offboard state update calls skater_motion
+// (0x4776a80) with the target transform its native spring pulls the skater's
+// root toward -- the ground and ragdoll states included. While the grip holds a
+// ragdoll plan, replace the translation with a bounded step toward the tether
+// follow slot: the engine itself carries the root, and the camera with it,
+// instead of a placement write the evaluation overwrites in-frame.
+bool drag_state_motion(std::uintptr_t rig, std::uintptr_t context,
+    const std::array<float, 16>* supplied, std::array<float, 16>& target) noexcept {
     auto& s = shared();
     // `active` is the tether plan's own ragdoll flag: drag_state_goal is only
     // published while the grip holds a ragdoll plan, so this is the bail
     // condition. (The selector's observed state is the caller's remapped
     // offboard value -- 504 for both walking and a wipeout -- so it cannot gate
     // this.)
-    if (!s.armed.load(std::memory_order_relaxed) || !s.active.load(std::memory_order_relaxed)) return;
+    if (!s.armed.load(std::memory_order_relaxed) || !s.active.load(std::memory_order_relaxed)) return false;
     const auto now = GetTickCount64();
-    if (now > s.lease_until.load(std::memory_order_relaxed)) return;
-    const auto base = s.base.load(std::memory_order_relaxed);
+    if (now > s.lease_until.load(std::memory_order_relaxed)) return false;
     const auto core = s.core.load(std::memory_order_relaxed);
-    if (!base || core < 0x10000) {
-        write_note("Drag state: write skipped, no base/core yet (base=0x%llx core=0x%llx).",
-            static_cast<unsigned long long>(base), static_cast<unsigned long long>(core));
-        return;
-    }
-    const auto context = read_context(core);
-    if (!context) {
-        write_note("Drag state: write skipped, no context (core=0x%llx).",
-            static_cast<unsigned long long>(core));
-        return;
-    }
-    std::array<float, 4> primary{}, copy_a{}, copy_b{};
-    if (!memory::peek(context + 0x7a0, primary) || !memory::peek(context + 0x7c0, copy_a) ||
-        !memory::peek(context + 0x830, copy_b)) {
-        write_note("Drag state: write skipped, context 0x%llx fields unreadable.",
-            static_cast<unsigned long long>(context));
-        return;
-    }
-    // The position is three floats followed by an unused float that is always
-    // NaN in the context, so only the first three components can be validated.
-    for (std::size_t i = 0; i < 3; ++i) {
-        const auto value = primary[i];
-        if (!std::isfinite(value) || std::abs(value) > 100000.f) {
-            write_note("Drag state: write skipped, non-finite position (%.1f,%.1f,%.1f).",
-                primary[0], primary[1], primary[2]);
-            return;
-        }
-    }
+    if (core < 0x10000 || !supplied) return false;
+    // Identity: the rig wrapper links back to the context and to the core.
+    std::uintptr_t linked{};
+    if (!memory::peek(rig, linked) || linked != context) return false;
+    if (!memory::peek(rig + 0x4630, linked) || linked != core) return false;
+    target = *supplied;
+    const std::array<float, 3> from{target[12], target[13], target[14]};
+    for (const auto value : from)
+        if (!std::isfinite(value) || std::abs(value) > 100000.f) return false;
     std::array<float, 3> goal{};
     for (std::size_t i = 0; i < 3; ++i) goal[i] = s.goal[i].load(std::memory_order_relaxed);
-    constexpr float pull = 0.2f;
-    std::array<float, 4> moved = primary;
-    for (std::size_t i = 0; i < 3; ++i) moved[i] = primary[i] + (goal[i] - primary[i]) * pull;
-    if (!write_bytes(context + 0x7a0, moved.data(), sizeof(float) * 3)) {
-        write_note("Drag state: write skipped, context 0x%llx 7a0 not writable.",
-            static_cast<unsigned long long>(context + 0x7a0));
-        return;
+    std::array<float, 3> delta{};
+    for (std::size_t i = 0; i < 3; ++i) delta[i] = goal[i] - from[i];
+    const float distance = std::sqrt(delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]);
+    if (!std::isfinite(distance) || distance > 60.f) return false;
+    // The native drive moves the root toward this target over the step, so a
+    // step of speed*dt drags the body at that speed; dt comes from the context
+    // so the speed stays frame-rate independent.
+    float dt = 1.f / 60.f;
+    memory::peek(context + context_dt_offset, dt);
+    if (!std::isfinite(dt) || dt <= 0.f || dt > 0.5f) dt = 1.f / 60.f;
+    constexpr float drag_speed = 2.5f;
+    const float step = std::min(distance, drag_speed * dt);
+    if (distance > 1e-4f) {
+        const float scale = step / distance;
+        for (std::size_t i = 0; i < 3; ++i) target[12 + i] = from[i] + delta[i] * scale;
     }
-    // Keep the two copies at their own offsets from the primary.
-    std::array<float, 3> adjusted_a{}, adjusted_b{};
-    bool copy_a_ok = true, copy_b_ok = true;
-    for (std::size_t i = 0; i < 3; ++i) {
-        copy_a_ok = copy_a_ok && std::isfinite(copy_a[i]);
-        copy_b_ok = copy_b_ok && std::isfinite(copy_b[i]);
-        adjusted_a[i] = moved[i] + (copy_a[i] - primary[i]);
-        adjusted_b[i] = moved[i] + (copy_b[i] - primary[i]);
-    }
-    if (copy_a_ok) (void)write_bytes(context + 0x7c0, adjusted_a.data(), sizeof(float) * 3);
-    if (copy_b_ok) (void)write_bytes(context + 0x830, adjusted_b.data(), sizeof(float) * 3);
-    s.pulls.fetch_add(1, std::memory_order_relaxed);
-    if (s.probe_until.load(std::memory_order_relaxed) > now) {
-        static std::atomic<std::uint64_t> last_log{};
-        auto previous = last_log.load(std::memory_order_relaxed);
-        if (now - previous >= 250 && last_log.compare_exchange_strong(previous, now)) {
-            logging::log(logging::Level::info, logging::Channel::runtime,
-                "Drag state WRITE[{}]: context 7a0 ({:.1f},{:.1f},{:.1f}) -> ({:.1f},{:.1f},{:.1f}) goal ({:.1f},{:.1f},{:.1f})",
-                tag, primary[0], primary[1], primary[2], moved[0], moved[1], moved[2], goal[0], goal[1], goal[2]);
-        }
-    }
+    // The active member identifies which state's motion call this was.
+    std::uintptr_t machine{}, active{};
+    if (memory::peek(core + core_machine_offset, machine) && machine >= 0x10000)
+        memory::peek(machine + machine_active_offset, active);
+    const auto member = active >= machine && machine >= 0x10000 ? active - machine : 0;
+    s.motion_pulls.fetch_add(1, std::memory_order_relaxed);
+    motion_log(member, from, {target[12], target[13], target[14]}, goal);
+    return true;
 }
-} // namespace
 
 bool drag_state_available() noexcept { return shared().ready.load(std::memory_order_acquire); }
 bool drag_state_armed() noexcept { return shared().armed.load(std::memory_order_relaxed); }
@@ -260,26 +222,21 @@ void drag_state_probe(unsigned seconds) noexcept {
 void drag_state_apply(std::uintptr_t core) noexcept {
     auto& s = shared();
     if (core >= 0x10000) s.core.store(core, std::memory_order_relaxed);
-    apply_context_write("P");
     probe_line("P");
 }
 // Animation point: the same dump from the animation callback, so the two
-// timestamps per frame show where the evaluation writes the context. The drag
-// write goes here too: this point runs after the ragdoll evaluation.
-void drag_state_animation_probe() noexcept {
-    apply_context_write("A");
-    probe_line("A");
-}
+// timestamps per frame show where the evaluation writes the context.
+void drag_state_animation_probe() noexcept { probe_line("A"); }
 std::string drag_state_status() {
     auto& s = shared();
     if (!s.ready.load(std::memory_order_acquire)) return "Drag state: unavailable (state contracts did not match)";
     char buffer[256]{};
     std::snprintf(buffer, sizeof(buffer),
-        "Drag state: %s, %s, probe %s, %llu dumps, %llu pulls, state=0x%llx",
+        "Drag state: %s, %s, probe %s, %llu dumps, %llu motion pulls, state=0x%llx",
         s.armed.load() ? "armed" : "off", s.active.load() ? "plan" : "no plan",
         s.probe_until.load(std::memory_order_relaxed) > GetTickCount64() ? "on" : "off",
         static_cast<unsigned long long>(s.dumps.load(std::memory_order_relaxed)),
-        static_cast<unsigned long long>(s.pulls.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(s.motion_pulls.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(s.last_state.load(std::memory_order_relaxed)));
     return buffer;
 }
