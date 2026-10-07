@@ -332,6 +332,7 @@ void drag_placement(std::uintptr_t base, std::uintptr_t component, bool active,
     if(!write_position(placement,eased) && active) fault();
 }
 void animation_evaluated(std::uintptr_t component) noexcept {
+    drag_state_animation_probe();
     const auto r=request(); if(!r || r->component!=component) return;
     state().hand_attempts.fetch_add(1);
     try {
