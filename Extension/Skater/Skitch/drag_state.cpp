@@ -157,7 +157,13 @@ bool drag_state_motion(std::uintptr_t rig, std::uintptr_t context,
     if (!memory::peek(rig, linked) || linked != context) return false;
     if (!memory::peek(rig + 0x4630, linked) || linked != core) return false;
     target = *supplied;
-    const std::array<float, 3> from{target[12], target[13], target[14]};
+    // The drive derives the rig velocity from (target - previous target)/dt, so
+    // a constant offset cancels after one step. Advance from the rig's previous
+    // target instead, exactly like the flight's root + velocity*step: the drive
+    // then moves the rig at `drag_speed` toward the goal every step.
+    std::array<float, 4> previous{};
+    if (!memory::peek(rig + 0x4750, previous)) return false;
+    const std::array<float, 3> from{previous[0], previous[1], previous[2]};
     for (const auto value : from)
         if (!std::isfinite(value) || std::abs(value) > 100000.f) return false;
     std::array<float, 3> goal{};
