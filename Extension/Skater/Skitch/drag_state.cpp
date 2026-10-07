@@ -119,10 +119,14 @@ void probe_line(const char* tag) noexcept {
 // next step's state update reads it) is the one place a drag can land.
 void apply_context_write() noexcept {
     auto& s = shared();
+    // `active` is the tether plan's own ragdoll flag: drag_state_goal is only
+    // published while the grip holds a ragdoll plan, so this is the bail
+    // condition. (The selector's observed state is the caller's remapped
+    // offboard value -- 504 for both walking and a wipeout -- so it cannot gate
+    // this.)
     if (!s.armed.load(std::memory_order_relaxed) || !s.active.load(std::memory_order_relaxed)) return;
     const auto now = GetTickCount64();
     if (now > s.lease_until.load(std::memory_order_relaxed)) return;
-    if (observed_physics_state() != addr::no_bail::wipeout_physics_state) return;
     const auto base = s.base.load(std::memory_order_relaxed);
     const auto core = s.core.load(std::memory_order_relaxed);
     if (!base || core < 0x10000) return;
