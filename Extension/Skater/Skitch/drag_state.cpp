@@ -182,12 +182,16 @@ void apply_context_write(const char* tag) noexcept {
             static_cast<unsigned long long>(context));
         return;
     }
-    for (const auto value : primary)
+    // The position is three floats followed by an unused float that is always
+    // NaN in the context, so only the first three components can be validated.
+    for (std::size_t i = 0; i < 3; ++i) {
+        const auto value = primary[i];
         if (!std::isfinite(value) || std::abs(value) > 100000.f) {
             write_note("Drag state: write skipped, non-finite position (%.1f,%.1f,%.1f).",
                 primary[0], primary[1], primary[2]);
             return;
         }
+    }
     std::array<float, 3> goal{};
     for (std::size_t i = 0; i < 3; ++i) goal[i] = s.goal[i].load(std::memory_order_relaxed);
     constexpr float pull = 0.2f;
@@ -200,12 +204,15 @@ void apply_context_write(const char* tag) noexcept {
     }
     // Keep the two copies at their own offsets from the primary.
     std::array<float, 3> adjusted_a{}, adjusted_b{};
+    bool copy_a_ok = true, copy_b_ok = true;
     for (std::size_t i = 0; i < 3; ++i) {
+        copy_a_ok = copy_a_ok && std::isfinite(copy_a[i]);
+        copy_b_ok = copy_b_ok && std::isfinite(copy_b[i]);
         adjusted_a[i] = moved[i] + (copy_a[i] - primary[i]);
         adjusted_b[i] = moved[i] + (copy_b[i] - primary[i]);
     }
-    (void)write_bytes(context + 0x7c0, adjusted_a.data(), sizeof(float) * 3);
-    (void)write_bytes(context + 0x830, adjusted_b.data(), sizeof(float) * 3);
+    if (copy_a_ok) (void)write_bytes(context + 0x7c0, adjusted_a.data(), sizeof(float) * 3);
+    if (copy_b_ok) (void)write_bytes(context + 0x830, adjusted_b.data(), sizeof(float) * 3);
     s.pulls.fetch_add(1, std::memory_order_relaxed);
     if (s.probe_until.load(std::memory_order_relaxed) > now) {
         static std::atomic<std::uint64_t> last_log{};
