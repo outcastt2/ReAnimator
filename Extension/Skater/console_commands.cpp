@@ -443,6 +443,11 @@ void register_movement_commands(Commands &registry) {
             out("Ragdoll: resolving the named physics bool assets (see the log)...");
             return;
         }
+        if (mode == "refs") {
+            skater::request_ragdoll_refs();
+            out("Ragdoll: scanning the animation instance for references to the ragdoll bool assets (see the log).");
+            return;
+        }
         if (mode == "watch") {
             const auto seconds = number(1, 30u);
             skater::request_ragdoll_watch(seconds);
@@ -478,7 +483,7 @@ void register_movement_commands(Commands &registry) {
                    : "Ragdoll: grip no longer suppresses wipeouts (a bail becomes a ragdoll again).");
             return;
         }
-        out("usage: ragdoll | ragdoll config | ragdoll bools | ragdoll watch [seconds] | "
+        out("usage: ragdoll | ragdoll config | ragdoll bools | ragdoll refs | ragdoll watch [seconds] | "
             "ragdoll set <field|index> <0|1> [seconds] | ragdoll setdata <field|index> <0|1> <offset> | "
             "ragdoll nobail on|off | ragdoll off");
     };

@@ -130,7 +130,7 @@ struct State {
     // resolve the chain by name, watch the candidate value bytes through a
     // bail, and can hold one byte overwritten to find which one is live.
     bool ragdoll_config_pending{}, ragdoll_bools_pending{};
-    bool ragdoll_watch_pending{};
+    bool ragdoll_watch_pending{}, ragdoll_refs_pending{};
     unsigned ragdoll_watch_seconds{30};
     bool ragdoll_stop_pending{};
     bool ragdoll_set_pending{};
@@ -1328,6 +1328,65 @@ void ragdoll_bools_dump(Ptr base) {
     }
     set_status("Ragdoll: the named bool images are in the log.");
 }
+// The live value of a graph bool is not in its asset image: the animation
+// instance holds a reference to the asset and the value lives beside it (the
+// same shape the hand-props probe found for gesture parameters). Scan the local
+// skater's animation instance for references to every ragdoll bool asset and
+// return the reference addresses; the words beside each one hold the live byte.
+std::vector<Ptr> ragdoll_reference_spots(Ptr base, Ptr client, bool log) {
+    std::vector<Ptr> spots;
+    Local local;
+    if (!resolve_local(base, client, local)) return spots;
+    std::vector<std::pair<std::string, Ptr>> targets;
+    bool faulted{};
+    if (const auto config = ragdoll_config_asset(base, faulted)) {
+        for (const auto &field : ragdoll_fields) {
+            const auto target = pointer(config + field.offset);
+            if (target) targets.push_back({field.name, target});
+        }
+    }
+    for (const char *name : ragdoll_bool_names) {
+        const auto asset = ragdoll_lookup_bool(base, name, faulted);
+        if (asset) targets.push_back({name, asset});
+    }
+    const std::array<std::pair<const char *, Ptr>, 4> regions{{
+        {"anim", local.component}, {"holder", local.holder},
+        {"rig", local.rig}, {"definition", local.definition}}};
+    const std::array<std::size_t, 4> sizes{{0x200, 0x400, 0x4000, 0x200}};
+    for (std::size_t r = 0; r < regions.size(); ++r) {
+        const auto address = regions[r].second;
+        if (!address) continue;
+        for (std::size_t offset = 0; offset + 8 <= sizes[r]; offset += 8) {
+            Ptr word{};
+            if (!memory::peek(address + offset, word) || word < 0x10000) continue;
+            for (const auto &target : targets) {
+                if (word != target.second) continue;
+                const auto spot = address + offset;
+                spots.push_back(spot);
+                if (log && spots.size() <= 60) {
+                    std::string words;
+                    for (std::size_t i = 1; i <= 8; ++i) {
+                        std::uint32_t value{};
+                        words += memory::peek(spot + i * 4, value)
+                            ? std::format(" {:08x}", value) : std::string(" --------");
+                    }
+                    logging::log(logging::Level::info, logging::Channel::skater,
+                        "Ragdoll: {} referenced in {} +{:#x} ({:#x}); beside:{}",
+                        target.first, regions[r].first, offset, spot, words);
+                }
+                break;
+            }
+        }
+    }
+    if (log)
+        logging::log(logging::Level::info, logging::Channel::skater,
+            "Ragdoll: {} reference spot(s) over {} target asset(s).", spots.size(), targets.size());
+    return spots;
+}
+void ragdoll_refs_dump(Ptr base, Ptr client) {
+    const auto spots = ragdoll_reference_spots(base, client, true);
+    set_status(std::format("Ragdoll: {} reference spot(s) in the log.", spots.size()));
+}
 void ragdoll_watch(Ptr base, Ptr client, unsigned seconds) {
     auto &s = state();
     Local local;
@@ -1360,6 +1419,10 @@ void ragdoll_watch(Ptr base, Ptr client, unsigned seconds) {
         const auto instance = ragdoll_instance(asset);
         if (instance) add_region(s, std::string("inst ") + name, instance, 0x40);
     }
+    // The live byte sits beside the animation instance's reference to the bool
+    // asset, so watch the words after every reference the scan finds.
+    for (const auto &spot : ragdoll_reference_spots(base, client, false))
+        add_region(s, std::format("ref {:#x}", spot), spot + 4, 0x24);
     if (s.words.empty()) {
         set_status("Ragdoll: nothing to watch; the config asset is not loaded.");
         return;
@@ -1702,6 +1765,11 @@ void request_ragdoll_bools() {
     std::lock_guard lock(s.mutex);
     s.ragdoll_bools_pending = true;
 }
+void request_ragdoll_refs() {
+    auto &s = state();
+    std::lock_guard lock(s.mutex);
+    s.ragdoll_refs_pending = true;
+}
 void request_ragdoll_watch(unsigned seconds) {
     auto &s = state();
     std::lock_guard lock(s.mutex);
@@ -1744,7 +1812,7 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
         bool want_trace{}, want_trace_off{}, want_derive{}, want_hand_attach{}, want_hand_detach{};
         bool want_morph_find{}, want_morph_unclamp{}, want_morph_clamp{};
         bool want_ragdoll_config{}, want_ragdoll_bools{}, want_ragdoll_watch{}, want_ragdoll_set{},
-            want_ragdoll_stop{};
+            want_ragdoll_stop{}, want_ragdoll_refs{};
         unsigned ragdoll_watch_seconds{30};
         std::string ragdoll_field;
         unsigned ragdoll_value{};
@@ -1782,6 +1850,7 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
             want_ragdoll_config = s.ragdoll_config_pending;
             want_ragdoll_bools = s.ragdoll_bools_pending;
             want_ragdoll_watch = s.ragdoll_watch_pending;
+            want_ragdoll_refs = s.ragdoll_refs_pending;
             want_ragdoll_set = s.ragdoll_set_pending;
             want_ragdoll_stop = s.ragdoll_stop_pending;
             ragdoll_watch_seconds = s.ragdoll_watch_seconds;
@@ -1808,6 +1877,7 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
             s.hand_attach_pending = s.hand_detach_pending = false;
             s.morph_find_pending = s.morph_unclamp_pending = s.morph_clamp_pending = false;
             s.ragdoll_config_pending = s.ragdoll_bools_pending = s.ragdoll_watch_pending = false;
+            s.ragdoll_refs_pending = false;
             s.ragdoll_set_pending = s.ragdoll_stop_pending = false;
         }
         if (want_poke_stop) stop_poke(true);
@@ -1867,6 +1937,7 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
         if (want_ragdoll_stop) ragdoll_stop(true);
         if (want_ragdoll_config) ragdoll_config_dump(base);
         if (want_ragdoll_bools) ragdoll_bools_dump(base);
+        if (want_ragdoll_refs) ragdoll_refs_dump(base, client);
         if (want_ragdoll_watch) ragdoll_watch(base, client, ragdoll_watch_seconds);
         if (want_ragdoll_set)
             ragdoll_set(base, ragdoll_field, ragdoll_value, ragdoll_hold_seconds, ragdoll_data_location,

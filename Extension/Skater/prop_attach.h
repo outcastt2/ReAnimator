@@ -81,6 +81,7 @@ void request_morph_clamp();
 // writes it back.
 void request_ragdoll_config();
 void request_ragdoll_bools();
+void request_ragdoll_refs();
 void request_ragdoll_watch(unsigned seconds);
 void request_ragdoll_set(std::string field, unsigned value, unsigned seconds, bool use_data = false,
                          std::size_t data_offset = 0);
