@@ -179,11 +179,12 @@ bool drag_state_motion(std::uintptr_t rig, std::uintptr_t context,
     memory::peek(context + context_dt_offset, dt);
     if (!std::isfinite(dt) || dt <= 0.f || dt > 0.5f) dt = 1.f / 60.f;
     constexpr float drag_speed = 2.5f;
+    // Always write from the previous target -- never fall back to the state's
+    // own supplied position. At the goal the step is zero and the target must
+    // hold there; falling back would snap the drive to the ragdoll every frame.
     const float step = std::min(distance, drag_speed * dt);
-    if (distance > 1e-4f) {
-        const float scale = step / distance;
-        for (std::size_t i = 0; i < 3; ++i) target[12 + i] = from[i] + delta[i] * scale;
-    }
+    const float scale = distance > 1e-4f ? step / distance : 0.f;
+    for (std::size_t i = 0; i < 3; ++i) target[12 + i] = from[i] + delta[i] * scale;
     // The active member identifies which state's motion call this was.
     std::uintptr_t machine{}, active{};
     if (memory::peek(core + core_machine_offset, machine) && machine >= 0x10000)
@@ -223,6 +224,9 @@ void drag_state_release() noexcept {
 void drag_state_probe(unsigned seconds) noexcept {
     auto& s = shared();
     s.probe_until.store(GetTickCount64() + static_cast<std::uint64_t>(seconds) * 1000, std::memory_order_relaxed);
+}
+bool drag_state_probing() noexcept {
+    return shared().probe_until.load(std::memory_order_relaxed) > GetTickCount64();
 }
 // Physics-step point: caches the local core and dumps the wipeout context.
 void drag_state_apply(std::uintptr_t core) noexcept {

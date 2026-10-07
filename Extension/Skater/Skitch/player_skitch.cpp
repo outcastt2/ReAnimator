@@ -330,6 +330,31 @@ void drag_placement(std::uintptr_t base, std::uintptr_t component, bool active,
         current[1]+(target[1]-current[1])*blend,
         current[2]+(target[2]-current[2])*blend};
     if(!write_position(placement,eased) && active) fault();
+    // The entity root is the camera target. Move it with the body so the camera
+    // follows the drag instead of watching it slide away.
+    std::uintptr_t collection{};
+    if(!first_person_read(component+0x18,&collection,sizeof(collection)) || !collection) return;
+    std::uint8_t layout[3]{};
+    if(!first_person_read(collection+8,layout,sizeof(layout)) ||
+        layout[0]>128 || layout[1]>128 || layout[2]>32) return;
+    const auto offset=0x10+(static_cast<std::uintptr_t>(layout[1])+2*static_cast<std::uintptr_t>(layout[2]))*0x20;
+    const auto entity_position=collection+offset+0x30;
+    std::array<float,3> entity{};
+    if(!first_person_read(entity_position,entity.data(),sizeof(entity)) || !source_writable(entity_position,12)) return;
+    const std::array<float,3> entity_eased{
+        entity[0]+(target[0]-entity[0])*blend,
+        entity[1]+(target[1]-entity[1])*blend,
+        entity[2]+(target[2]-entity[2])*blend};
+    (void)write_position(entity_position,entity_eased);
+    if(active && drag_state_probing()) {
+        static std::atomic<std::uint64_t> last{};
+        auto previous=last.load(std::memory_order_relaxed);
+        if(now_ms-previous>=500 && last.compare_exchange_strong(previous,now_ms))
+            logging::log(logging::Level::info,logging::Channel::runtime,
+                "Skitch drag: entity ({:.1f},{:.1f},{:.1f}) -> ({:.1f},{:.1f},{:.1f}) goal ({:.1f},{:.1f},{:.1f})",
+                entity[0],entity[1],entity[2],entity_eased[0],entity_eased[1],entity_eased[2],
+                target[0],target[1],target[2]);
+    }
 }
 void animation_evaluated(std::uintptr_t component) noexcept {
     drag_state_animation_probe();
@@ -342,10 +367,11 @@ void animation_evaluated(std::uintptr_t component) noexcept {
         const auto holder=reader.pointer(component,0xa0);
         const auto pose=multiplayer::read_native_pose_layout(first_person_read,r->base,holder,512);
         if(!pose.buffer || pose.count!=395) { state().hand_detail.store("pose unavailable"); return; }
-        // With the native drag state armed it drives the engine's own placement
-        // channel; the render-pose write stands down (and fades out if it was
-        // already engaged) so the two do not both move the body.
-        drag_placement(r->base,component,r->plan.ragdoll && !drag_state_armed(),&r->plan.root_goal);
+        // The render-pose placement and the entity root are both eased to the
+        // follow slot while a ragdoll plan is held, so the body and the camera
+        // move together; the native motion pull (dragstate) runs alongside and
+        // fades back to the game's own placement on release.
+        drag_placement(r->base,component,r->plan.ragdoll,&r->plan.root_goal);
         std::array<skateskitch::Joint,395> joints;
         for(const auto i : {0u,1u,7u,42u,43u,44u,45u,46u,47u,48u,49u,50u,275u,276u,277u,278u,283u}) {
             std::array<float,12> bone{};

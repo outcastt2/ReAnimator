@@ -28,6 +28,8 @@ bool drag_state_active() noexcept;
 void drag_state_goal(float x, float y, float z, float vx, float vy, float vz) noexcept;
 void drag_state_release() noexcept;
 void drag_state_probe(unsigned seconds) noexcept;
+// True while the diagnostic probe window is open.
+bool drag_state_probing() noexcept;
 // Called from the physics-step hook (client_noclip) with the local core.
 void drag_state_apply(std::uintptr_t core) noexcept;
 // Called from the animation callback (player_skitch::animation_evaluated).
