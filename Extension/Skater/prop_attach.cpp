@@ -1471,6 +1471,21 @@ void ragdoll_watch(Ptr base, Ptr client, unsigned seconds) {
     // asset, so watch the words after every reference the scan finds.
     for (const auto &spot : ragdoll_reference_spots(base, client, false))
         add_region(s, std::format("ref {:#x}", spot), spot + 4, 0x24);
+    // What actually moves when a car punts a ragdolled body: the entity
+    // transform (the camera target) and the physics core. If an external impact
+    // moves these, they are the physical master a drag should push.
+    const auto core = local.component ? pointer(local.component + 0x70) : 0;
+    if (core) add_region(s, "core", core, 0x200);
+    if (local.entity) {
+        const auto collection = pointer(local.entity + 0x70);
+        std::uint8_t layout[3]{};
+        if (collection && memory::peek(collection + 8, layout) && layout[0] <= 128 && layout[1] <= 128 &&
+            layout[2] <= 32) {
+            const auto offset =
+                0x10 + (static_cast<Ptr>(layout[1]) + 2 * static_cast<Ptr>(layout[2])) * 0x20;
+            add_region(s, "entity", collection + offset, 0x40);
+        }
+    }
     if (s.words.empty()) {
         set_status("Ragdoll: nothing to watch; the config asset is not loaded.");
         return;
