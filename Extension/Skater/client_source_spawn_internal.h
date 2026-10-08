@@ -169,7 +169,7 @@ struct SourceCameraSnapshot {
     std::uint8_t input_active{}, view_enabled{};
 };
 struct NoclipBodies {
-    std::uintptr_t core{}, context{}, rig_wrapper{};
+    std::uintptr_t core{}, context{}, rig_wrapper{}, rig_physics{}, rig_parts{};
     float seconds{}, board_height{};
     bool offboard{};
     std::array<float, 3> root{}; // Entity root: the camera target and the idle motion target.
