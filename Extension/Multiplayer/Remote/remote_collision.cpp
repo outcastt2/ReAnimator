@@ -104,6 +104,13 @@ struct Slot {
     Part skater, board;
     std::uint64_t updated_at{}, retry_at{};
 };
+struct TetherPusher {
+    std::uintptr_t world{}, context{};
+    Part part;
+    float phase{};
+    std::uint64_t last_at{}, logged_at{};
+};
+TetherPusher& tether_pusher() { static TetherPusher value; return value; }
 PeerStorage<Slot> &slots() { static auto *value = new PeerStorage<Slot>; return *value; }
 std::atomic<bool> enabled{true};
 std::uint64_t failures{};
@@ -268,6 +275,75 @@ void update_remote_collision(std::uintptr_t base, std::uintptr_t context, const 
         if (s.board.created) {
             if (pose.board.empty()) switch_off(n, s.board);
             else move_part(n, s.board, pose.board.front().position, pose.board.front().rotation, now);
+        }
+    } catch (...) {}
+}
+
+void update_skitch_collision_pusher(std::uintptr_t base, std::uintptr_t context,
+    const std::array<float, 3> &root, const std::array<float, 3> &goal, bool active,
+    bool diagnostic, std::uint64_t now) noexcept {
+    auto &p = tether_pusher();
+    try {
+        active = active && enabled.load(std::memory_order_relaxed);
+        if (!active && !p.part.solid) return;
+        if (!resolve(base)) return;
+        const auto &n = natives();
+        const auto world = current_world(n);
+        if (!world) return;
+        if (p.world != world || p.context != context) {
+            if (p.world == world) switch_off(n, p.part);
+            p = {};
+            p.world = world;
+            p.context = context;
+        }
+        if (!active) {
+            switch_off(n, p.part);
+            p.phase = 0;
+            p.last_at = 0;
+            return;
+        }
+        for (const auto value : root)
+            if (!std::isfinite(value) || std::abs(value) > 100000.f) return;
+        for (const auto value : goal)
+            if (!std::isfinite(value) || std::abs(value) > 100000.f) return;
+        if (!p.part.created) {
+            // Match the retail remote-character proxy's collision masks, but
+            // make it a compact invisible ram instead of a full skater capsule.
+            alignas(16) const float a[4]{0.f, 0.15f, 0.f, 0.f};
+            alignas(16) const float b[4]{0.f, 0.75f, 0.f, 0.f};
+            if (!create_part(n, world, p.part, a, b, 0.24f)) return;
+        }
+        const float dx = goal[0] - root[0], dz = goal[2] - root[2];
+        const float distance = std::hypot(dx, dz);
+        if (!std::isfinite(distance) || distance < 0.1f || distance > 24.f) {
+            switch_off(n, p.part);
+            p.phase = 0;
+            p.last_at = 0;
+            return;
+        }
+        const float dir_x = dx / distance, dir_z = dz / distance;
+        if (!p.part.solid) {
+            // Start just behind the ragdoll. Repeated passes create a real
+            // solver contact; the capsule has no renderer and no visible model.
+            p.phase = 0.f;
+            p.last_at = now;
+        } else if (p.last_at && now > p.last_at) {
+            const float dt = std::min(0.1f, static_cast<float>(now - p.last_at) * 1e-6f);
+            p.phase += 5.f * dt;
+            if (p.phase > 1.55f) p.phase = 0.f;
+        }
+        p.last_at = now;
+        const std::array<float, 3> pusher_position{
+            root[0] - dir_x * 1.05f + dir_x * p.phase,
+            root[1],
+            root[2] - dir_z * 1.05f + dir_z * p.phase};
+        move_part(n, p.part, pusher_position, {0.f, 0.f, 0.f, 1.f}, now);
+        if (diagnostic && now - p.logged_at >= 500000) {
+            p.logged_at = now;
+            logging::log(logging::Level::info, logging::Channel::runtime,
+                "Skitch collision pusher: root=({:.1f},{:.1f},{:.1f}) pusher=({:.1f},{:.1f},{:.1f}) phase={:.2f} slot=({:.1f},{:.1f},{:.1f})",
+                root[0], root[1], root[2], pusher_position[0], pusher_position[1], pusher_position[2],
+                p.phase, goal[0], goal[1], goal[2]);
         }
     } catch (...) {}
 }

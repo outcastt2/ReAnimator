@@ -8,7 +8,6 @@
 #include "Engine/Game/Build/20260929/engine.h"
 #include "Engine/Game/Build/20260929/no_bail.h"
 #include "Engine/Game/Build/20260929/offboard_flight.h"
-#include "Engine/Game/Build/20260929/remote_collision.h"
 #include "Engine/Game/Build/20260929/skater_entities.h"
 #include "free_flight.h"
 #include "Skitch/player_skitch.h"
@@ -18,102 +17,6 @@
 namespace dingosdk::client_source::detail {
 namespace {
 namespace entities = addr::skater_entities;
-using PhysicsBodyValid = bool (*)(const void*);
-using PhysicsSetVector = void (*)(void*, const float*);
-using PhysicsTouch = void (*)(void*);
-struct PhysicsHandle {
-    std::uintptr_t world{};
-    std::uint32_t index{0xffffffff}, generation{};
-};
-static_assert(sizeof(PhysicsHandle) == 16);
-struct SkaterPhysicsApi {
-    PhysicsBodyValid valid{};
-    PhysicsSetVector set_velocity{};
-    PhysicsTouch wake{};
-    bool ready{};
-};
-SkaterPhysicsApi& skater_physics_api() {
-    static SkaterPhysicsApi value;
-    return value;
-}
-std::once_flag& skater_physics_api_once() {
-    static std::once_flag value;
-    return value;
-}
-bool resolve_skater_physics_api(std::uintptr_t base) noexcept {
-    auto& api = skater_physics_api();
-    try {
-        std::call_once(skater_physics_api_once(), [&] {
-            using namespace addr::remote_collision;
-            std::array<unsigned char, 32> valid_bytes{}, velocity_bytes{}, wake_bytes{};
-            if (!memory::read(base + body_valid.rva, valid_bytes) || valid_bytes != body_valid.bytes ||
-                !memory::read(base + set_linear_velocity.rva, velocity_bytes) ||
-                velocity_bytes != set_linear_velocity.bytes ||
-                !memory::read(base + wake_body.rva, wake_bytes) || wake_bytes != wake_body.bytes) return;
-            api.valid = reinterpret_cast<PhysicsBodyValid>(base + body_valid.rva);
-            api.set_velocity = reinterpret_cast<PhysicsSetVector>(base + set_linear_velocity.rva);
-            api.wake = reinterpret_cast<PhysicsTouch>(base + wake_body.rva);
-            api.ready = true;
-        });
-    } catch (...) { return false; }
-    return api.ready;
-}
-bool native_body_velocity(std::uintptr_t base, std::uintptr_t body,
-    const std::array<float, 3>& velocity, PhysicsHandle* observed = nullptr) noexcept {
-    if (!resolve_skater_physics_api(base)) return false;
-    PhysicsHandle handle{};
-    if (!memory::peek(body, handle) || !handle.world || handle.index == 0xffffffffu) return false;
-    if (observed) *observed = handle;
-    const auto& api = skater_physics_api();
-    alignas(16) const float value[4]{velocity[0], velocity[1], velocity[2], 0.f};
-    __try {
-        if (!api.valid(&handle)) return false;
-        api.set_velocity(&handle, value);
-        api.wake(&handle);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-}
-bool safe_native_body_valid(const PhysicsHandle* handle) noexcept {
-    const auto& api = skater_physics_api();
-    if (!api.ready || !api.valid) return false;
-    __try { return api.valid(handle); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-}
-void log_native_body_handles(std::uintptr_t base, std::uintptr_t body) noexcept {
-    if (!player_skitch::drag_state_probing() || !resolve_skater_physics_api(base)) return;
-    static std::atomic<std::uintptr_t> scanned_body{};
-    auto previous = scanned_body.load(std::memory_order_relaxed);
-    if (previous == body || !scanned_body.compare_exchange_strong(previous, body)) return;
-    unsigned inline_handles = 0, pointed_handles = 0;
-    for (std::uintptr_t offset = 0; offset + sizeof(PhysicsHandle) <= 0x130; offset += 8) {
-        PhysicsHandle candidate{};
-        if (memory::peek(body + offset, candidate) && candidate.world && candidate.index != 0xffffffffu &&
-            safe_native_body_valid(&candidate)) {
-            ++inline_handles;
-            logging::log(logging::Level::info, logging::Channel::runtime,
-                "Skitch native handle: inline body+0x{:x} world=0x{:x} index={} generation={}",
-                offset, candidate.world, candidate.index, candidate.generation);
-        }
-        std::uintptr_t pointer{};
-        if (!memory::peek(body + offset, pointer) || pointer < 0x10000) continue;
-        if (!memory::peek(pointer, candidate) || !candidate.world || candidate.index == 0xffffffffu ||
-            !safe_native_body_valid(&candidate)) continue;
-        ++pointed_handles;
-        logging::log(logging::Level::info, logging::Channel::runtime,
-            "Skitch native handle: pointer body+0x{:x} -> 0x{:x}, world=0x{:x} index={} generation={}",
-            offset, pointer, candidate.world, candidate.index, candidate.generation);
-    }
-    std::array<std::uint8_t, 0x50> bytes{};
-    if (memory::peek_bytes(body, bytes.data(), bytes.size())) {
-        std::string text;
-        for (const auto byte : bytes) text += std::format("{:02x} ", byte);
-        logging::log(logging::Level::info, logging::Channel::runtime,
-            "Skitch native handle: root record 0x{:x} first 0x50: {}", body, text);
-    }
-    logging::log(logging::Level::info, logging::Channel::runtime,
-        "Skitch native handle: scan complete body=0x{:x} inline={} pointed={}",
-        body, inline_handles, pointed_handles);
-}
 // Physics bodies already verified writable (a VirtualQuery each), so the
 // every-frame and every-simulation-step body reads below skip that system call.
 // A body at a new address, and every body once a second, is checked again.
@@ -181,7 +84,6 @@ NoclipBodies debug_noclip_bodies(std::uintptr_t base, std::uintptr_t client, std
     const auto board = reader.pointer(reader.pointer(result.core, 0x430), 0x18);
     result.rig_wrapper = reader.pointer(result.core, 0x438);
     const auto rig = reader.pointer(result.rig_wrapper, 0x2f10);
-    result.rig_physics = rig;
     result.context = reader.pointer(result.core, 0x3c0);
     source_require(reader.pointer(result.rig_wrapper) == result.context && reader.pointer(result.rig_wrapper, 0x4630) == result.core,
         "Skater motion ownership changed.");
@@ -191,7 +93,6 @@ NoclipBodies debug_noclip_bodies(std::uintptr_t base, std::uintptr_t client, std
     source_require(reader.pointer(board) == base + spawn::board_physics_vtable && reader.pointer(rig) == base + spawn::rig_physics_vtable,
         "Unsupported board or skeleton physics.");
     const auto board_parts = reader.pointer(board, 0x20), rig_parts = reader.pointer(rig, 0x20);
-    result.rig_parts = rig_parts;
     source_require(reader.value<std::uint32_t>(board_parts, 0) == 9 && reader.value<std::uint32_t>(rig_parts, 0) == 26,
         "Unsupported physics body layout.");
     for (std::size_t i = 0; i < result.parts.size(); ++i) {
@@ -273,65 +174,10 @@ void noclip_apply_velocity(std::uintptr_t core) noexcept {
                 reader.verify();
             } else if (bodies.seconds > 0) {
                 if (drag) {
-                    // The ragdoll is a jointed physics sim: pushing limbs only
-                    // flops limbs, and the joints hold the mass at the root body
-                    // -- the one the context and camera follow. Find the rig body
-                    // nearest the wipeout root (context+0x7a0) and drive just
-                    // that: an invisible pull at the harness, no board needed.
-                    std::array<float, 4> root{};
-                    source_require(memory::peek(bodies.context + 0x7a0, root),
-                        "Skitch wipeout root unreadable.");
-                    source_require(std::isfinite(root[0]) && std::isfinite(root[2]) &&
-                        std::abs(root[0]) <= 100000.f && std::abs(root[2]) <= 100000.f,
-                        "Skitch wipeout root is invalid.");
-                    source_require(bodies.rig_parts != 0 && bodies.rig_physics != 0,
-                        "Skitch skeleton bodies are unavailable.");
-                    std::uintptr_t hips{};
-                    float best = 3.0f;
-                    std::array<float, 3> hips_velocity{};
-                    for (std::size_t j = 1; j <= 26; ++j) {
-                        const auto body = bodies.rig_parts + j * 0x130;
-                        std::uintptr_t owner{};
-                        std::array<float, 4> translation{};
-                        std::array<float, 3> velocity{};
-                        if (!memory::peek(body + 0x10, owner) || owner != bodies.rig_physics) continue;
-                        if (!memory::peek(body + 0x50, translation) || !memory::peek(body + 0x70, velocity)) continue;
-                        if (!std::isfinite(translation[0]) || !std::isfinite(translation[2])) continue;
-                        const float d = std::hypot(translation[0] - root[0], translation[2] - root[2]);
-                        if (!std::isfinite(d) || d >= best) continue;
-                        best = d;
-                        hips = body;
-                        hips_velocity = velocity;
-                    }
-                    source_require(hips != 0, "Skitch ragdoll root body not found.");
-                    const float dx = skitch->plan.root_goal[0] - root[0];
-                    const float dz = skitch->plan.root_goal[2] - root[2];
-                    const float distance = std::hypot(dx, dz);
-                    constexpr float drag_gain = 6.0f;      // 1/s
-                    constexpr float max_drag_speed = 6.0f; // m/s
-                    float wanted_x = 0, wanted_z = 0;
-                    if (distance > 0.05f) {
-                        const float speed = std::min(max_drag_speed, distance * drag_gain);
-                        wanted_x = dx / distance * speed;
-                        wanted_z = dz / distance * speed;
-                    }
-                    std::array<float, 3> desired{wanted_x, hips_velocity[1], wanted_z};
+                    // The FBPhysics contact pusher is updated from the skitch
+                    // client tick. Rig body records are animation-owned caches,
+                    // not FBPhysics handles; do not write their velocities.
                     reader.verify();
-                    log_native_body_handles(state.trial.base, hips);
-                    PhysicsHandle handle{};
-                    const bool applied = native_body_velocity(state.trial.base, hips, desired, &handle);
-                    static std::atomic<std::uint64_t> last{};
-                    const auto now = GetTickCount64();
-                    auto previous = last.load(std::memory_order_relaxed);
-                    if (player_skitch::drag_state_probing() && now - previous >= 250 &&
-                        last.compare_exchange_strong(previous, now)) {
-                        logging::log(logging::Level::info, logging::Channel::runtime,
-                            "Skitch native impulse: body=0x{:x} world=0x{:x} index={} generation={} valid_api={} applied={} near_root={:.2f} v=({:.2f},{:.2f},{:.2f})",
-                            hips, handle.world, handle.index, handle.generation,
-                            resolve_skater_physics_api(state.trial.base) ? 1 : 0, applied ? 1 : 0,
-                            best, desired[0], desired[1], desired[2]);
-                    }
-                    if (applied) player_skitch::note_physics_step();
                 } else {
                     const auto current = reader.value<std::array<float,3>>(bodies.parts[0], 0x70);
                     const auto delta = skateskitch::tow_velocity_delta(bodies.root, current, skitch->plan, bodies.seconds);

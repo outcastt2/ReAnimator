@@ -1,5 +1,6 @@
 #pragma once
 #include "Extension/Multiplayer/Net/protocol.h"
+#include <array>
 #include <cstdint>
 #include <string>
 
@@ -18,6 +19,12 @@ bool local_allows_player_collision(std::uintptr_t base, std::uintptr_t local_ent
 // is the local skater's game context; a new one (a level load) means a new physics world.
 void update_remote_collision(std::uintptr_t base, std::uintptr_t context, const Pose &pose, bool solid,
                              std::uint64_t now_us) noexcept;
+// Local ragdoll tether: moves an invisible keyframed FBPhysics capsule from
+// behind the bailed skater toward the tether goal. The collision solver, rather
+// than a cached velocity write, applies the contact impulse to the skater.
+void update_skitch_collision_pusher(std::uintptr_t base, std::uintptr_t context,
+    const std::array<float, 3> &root, const std::array<float, 3> &goal, bool active,
+    bool diagnostic, std::uint64_t now_us) noexcept;
 // Client thread, for the current PeerScope slot: the player's skater is gone. Its capsules stop
 // colliding and wait, still allocated, for the slot's next player.
 void clear_remote_collision(std::uintptr_t base) noexcept;

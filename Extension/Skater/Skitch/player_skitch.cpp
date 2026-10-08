@@ -3,6 +3,7 @@
 #include "../client_source_spawn_internal.h"
 #include "../no_bail.h"
 #include "Extension/Multiplayer/Remote/native_pose_layout.h"
+#include "Extension/Multiplayer/Remote/remote_collision.h"
 #include "Engine/Core/Platform/memory.h"
 #include "Engine/Game/Build/addresses.h"
 #include "Engine/Game/Build/20260929/engine.h"
@@ -265,6 +266,31 @@ void tick(std::uintptr_t base,std::uintptr_t client,const multiplayer::NativeFra
         const auto plan=s.tow.update(world,local_id,now,bodies.root,playable,ragdoll,held,candidates,steering,was_attached && s.hand_side.load()==1);
         s.detail=std::string(s.tow.status());
         s.grip_active.store(plan.has_value());
+        // A keyframed FBPhysics capsule is the actual, invisible contact pusher.
+        // Put it behind the bailed skater and sweep it toward the tether slot;
+        // the world solver generates the contact response instead of us writing
+        // animation-owned rig/body caches.
+        std::array<float, 3> pusher_root=bodies.root;
+        if(plan && plan->ragdoll) {
+            std::array<float, 4> ragdoll_root{};
+            if(memory::peek(bodies.context+0x7a0,ragdoll_root) &&
+                std::isfinite(ragdoll_root[0]) && std::isfinite(ragdoll_root[1]) &&
+                std::isfinite(ragdoll_root[2]))
+                pusher_root={ragdoll_root[0],ragdoll_root[1],ragdoll_root[2]};
+        }
+        const bool player_collision=multiplayer::local_allows_player_collision(base,local.entity);
+        const bool pusher_active=plan && plan->ragdoll && player_collision;
+        if(plan && plan->ragdoll && !player_collision && drag_state_probing()) {
+            static std::atomic<std::uint64_t> last_collision_warning{};
+            const auto warning_now=GetTickCount64();
+            auto previous=last_collision_warning.load(std::memory_order_relaxed);
+            if(warning_now-previous>=2000 && last_collision_warning.compare_exchange_strong(previous,warning_now))
+                logging::log(logging::Level::warning,logging::Channel::runtime,
+                    "Skitch contact pusher inactive: enable the game's player collision setting (playercollision) first.");
+        }
+        multiplayer::update_skitch_collision_pusher(base,bodies.context,pusher_root,
+            plan && plan->ragdoll ? plan->root_goal : pusher_root,pusher_active,
+            drag_state_probing(),GetTickCount64());
         // The native drag state owns the bail motion when armed: publish the
         // tether follow slot for the engine's own placement channel and let the
         // lease lapse on release, so the native motion resumes without a snap.
