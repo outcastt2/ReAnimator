@@ -76,6 +76,9 @@ void Store::seed_object_inventory(const std::vector<std::string>& keys) {
 }
 void Store::reconcile_inventory(const std::vector<std::string>& cosmetics, const std::vector<std::string>& objects) {
     std::lock_guard lock(mutex_);
+    // Revoke every listed key, unconditionally: the catalog only lists classes
+    // the unlock policy does not cover, so an item granted by an earlier build
+    // cannot stay owned after the policy changes.
     const auto cosmetic_inventory = value_.customization.value("inventory", dingosdk::Json::object());
     const auto object_inventory =
         value_.extensions.value("object_dropper", dingosdk::Json::object()).value("inventory", dingosdk::Json::object());
@@ -180,6 +183,18 @@ void Store::save_up_velocity_binding(std::uint32_t combo) {
     std::lock_guard lock(mutex_);
     Update update(*this);
     update.json(value_.settings, {"bindings", "up_velocity"}) = combo;
+    update.commit();
+}
+
+std::uint32_t Store::skitch_key_binding() const {
+    std::lock_guard lock(mutex_);
+    return profile::skitch_key_binding(value_);
+}
+void Store::save_skitch_key_binding(std::uint32_t key) {
+    require(key <= 255, "Unsupported Skitch virtual-key code");
+    std::lock_guard lock(mutex_);
+    Update update(*this);
+    update.json(value_.settings, {"bindings", "skitch_key"}) = key;
     update.commit();
 }
 

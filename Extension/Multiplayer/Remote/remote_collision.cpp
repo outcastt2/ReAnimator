@@ -104,6 +104,15 @@ struct Slot {
     Part skater, board;
     std::uint64_t updated_at{}, retry_at{};
 };
+struct TetherPusher {
+    std::uintptr_t world{}, context{};
+    Part part;
+    float phase{};
+    std::array<float, 3> last_root{};
+    bool have_root{};
+    std::uint64_t last_at{}, logged_at{};
+};
+TetherPusher& tether_pusher() { static TetherPusher value; return value; }
 PeerStorage<Slot> &slots() { static auto *value = new PeerStorage<Slot>; return *value; }
 std::atomic<bool> enabled{true};
 std::uint64_t failures{};
@@ -270,6 +279,186 @@ void update_remote_collision(std::uintptr_t base, std::uintptr_t context, const 
             else move_part(n, s.board, pose.board.front().position, pose.board.front().rotation, now);
         }
     } catch (...) {}
+}
+
+void update_skitch_collision_pusher(std::uintptr_t base, std::uintptr_t context,
+    const std::array<float, 3> &root, const std::array<float, 3> &goal, bool active,
+    int hand_side, bool diagnostic, std::uint64_t now) noexcept {
+    auto &p = tether_pusher();
+    try {
+        active = active && enabled.load(std::memory_order_relaxed);
+        if (!active && !p.part.solid) return;
+        if (!resolve(base)) return;
+        const auto &n = natives();
+        const auto world = current_world(n);
+        if (!world) return;
+        if (p.world != world || p.context != context) {
+            if (p.world == world) switch_off(n, p.part);
+            p = {};
+            p.world = world;
+            p.context = context;
+        }
+        if (!active) {
+            switch_off(n, p.part);
+            p.phase = 0;
+            p.last_at = 0;
+            p.have_root = false;
+            return;
+        }
+        for (const auto value : root)
+            if (!std::isfinite(value) || std::abs(value) > 100000.f) return;
+        for (const auto value : goal)
+            if (!std::isfinite(value) || std::abs(value) > 100000.f) return;
+        if (!p.part.created) {
+            // Match retail's proxy collision masks, but use a compact capsule
+            // near upper-body/arm height rather than a torso-sized ram.
+            alignas(16) const float a[4]{0.f, 0.f, 0.f, 0.f};
+            alignas(16) const float b[4]{0.f, 0.30f, 0.f, 0.f};
+            if (!create_part(n, world, p.part, a, b, 0.16f)) return;
+        }
+        const float dx = goal[0] - root[0], dy = goal[1] - root[1], dz = goal[2] - root[2];
+        const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (!std::isfinite(distance) || distance < 0.18f || distance > 24.f) {
+            switch_off(n, p.part);
+            p.phase = 0;
+            p.last_at = 0;
+            p.have_root = false;
+            return;
+        }
+        const float dir_x = dx / distance, dir_y = dy / distance, dir_z = dz / distance;
+        float dt = 1.f / 60.f;
+        if (p.last_at && now > p.last_at)
+            dt = std::min(0.1f, static_cast<float>(now - p.last_at) * 1e-6f);
+        float root_speed_toward = 0.f;
+        if (p.have_root && dt > 1e-4f) {
+            const float root_vx = (root[0] - p.last_root[0]) / dt;
+            const float root_vy = (root[1] - p.last_root[1]) / dt;
+            const float root_vz = (root[2] - p.last_root[2]) / dt;
+            root_speed_toward = root_vx * dir_x + root_vy * dir_y + root_vz * dir_z;
+            if (!std::isfinite(root_speed_toward)) root_speed_toward = 0.f;
+        }
+        // A damped contact speed: reduce pressure as the root closes on the
+        // slot or is already moving toward it. This keeps the pusher from
+        // flinging the whole body past the attached player.
+        constexpr float tether_gain = 0.9f;
+        constexpr float damping = 0.9f;
+        constexpr float max_speed = 0.9f;
+        const float sweep_speed = std::clamp(distance * tether_gain - root_speed_toward * damping,
+            0.15f, max_speed);
+        if (!p.part.solid) {
+            // Start just behind and to the reaching side. A short, slow feed
+            // makes a solver contact without the old full-body hammer stroke.
+            p.phase = 0.f;
+            p.last_at = now;
+        } else if (p.last_at && now > p.last_at) {
+            p.phase += sweep_speed * dt;
+            if (p.phase > 0.28f) {
+                p.phase = 0.f;
+                // Reset to the start of the next short push without creating a
+                // high-speed reverse velocity for the keyframed body.
+                p.part.last_at = 0;
+            }
+        }
+        p.last_at = now;
+        p.last_root = root;
+        p.have_root = true;
+        const float side = hand_side == 1 ? 1.f : hand_side == 0 ? -1.f : 0.f;
+        const float perp_x = dir_z * side * 0.24f;
+        const float perp_z = -dir_x * side * 0.24f;
+        const std::array<float, 3> pusher_position{
+            root[0] - dir_x * 0.70f + dir_x * p.phase + perp_x,
+            root[1] - dir_y * 0.70f + dir_y * p.phase + 0.72f,
+            root[2] - dir_z * 0.70f + dir_z * p.phase + perp_z};
+        move_part(n, p.part, pusher_position, {0.f, 0.f, 0.f, 1.f}, now);
+        if (diagnostic && now - p.logged_at >= 500000) {
+            p.logged_at = now;
+            logging::log(logging::Level::info, logging::Channel::runtime,
+                "Skitch collision tether: root=({:.1f},{:.1f},{:.1f}) pusher=({:.1f},{:.1f},{:.1f}) phase={:.2f} speed={:.2f} side={} slot=({:.1f},{:.1f},{:.1f}) error={:.2f} root-speed={:.2f}",
+                root[0], root[1], root[2], pusher_position[0], pusher_position[1], pusher_position[2],
+                p.phase, sweep_speed, hand_side, goal[0], goal[1], goal[2], distance, root_speed_toward);
+        }
+    } catch (...) {}
+}
+
+void probe_local_ragdoll_handles(std::uintptr_t base, std::uintptr_t entity) noexcept {
+    static std::atomic<std::uintptr_t> scanned_entity{};
+    if (!entity || !resolve(base)) return;
+    const auto &n = natives();
+    const auto world = current_world(n);
+    if (!world) return;
+    auto previous = scanned_entity.load(std::memory_order_relaxed);
+    if (previous == entity || !scanned_entity.compare_exchange_strong(previous, entity)) return;
+    std::uintptr_t collection{};
+    std::uint8_t count{};
+    if (!memory::peek(entity + 0x70, collection) || collection < 0x10000 ||
+        !memory::peek(collection + 8, count) || count > 64) {
+        logging::log(logging::Level::info, logging::Channel::runtime,
+            "Skitch solver probe: local component collection unavailable.");
+        return;
+    }
+    unsigned ragdoll_objects{}, valid_handles{};
+    constexpr std::uintptr_t ragdoll_vtable = 0x6176088; // FBCorePhysicsRagdoll ctor vtable
+    constexpr std::uintptr_t ragdoll_owner_method = 0x00f97280; // lazily creates owner+0x48 ragdoll object
+    for (std::uint32_t i = 0; i < count; ++i) {
+        std::uintptr_t component{}, vtable{};
+        if (!memory::peek(collection + 0x20 + std::uintptr_t{i} * 0x20, component) || component < 0x10000 ||
+            !memory::peek(component, vtable)) continue;
+        bool is_ragdoll_owner = false;
+        if (vtable >= 0x10000) {
+            for (std::uintptr_t slot = 0; slot < 0x200; slot += sizeof(std::uintptr_t)) {
+                std::uintptr_t method{};
+                if (memory::peek(vtable + slot, method) && method == base + ragdoll_owner_method) {
+                    is_ragdoll_owner = true;
+                    break;
+                }
+            }
+        }
+        std::array<std::uintptr_t, 4> candidates{};
+        unsigned candidate_count{};
+        if (vtable == base + ragdoll_vtable) candidates[candidate_count++] = component;
+        std::uintptr_t child{};
+        if (memory::peek(component + 0x48, child) && child >= 0x10000) {
+            std::uintptr_t child_vtable{};
+            if (memory::peek(child, child_vtable) && child_vtable == base + ragdoll_vtable)
+                candidates[candidate_count++] = child;
+        }
+        if (!candidate_count && is_ragdoll_owner) {
+            std::uintptr_t child_vtable{};
+            if (child >= 0x10000) (void)memory::peek(child, child_vtable);
+            logging::log(logging::Level::info, logging::Channel::runtime,
+                "Skitch solver probe: ragdoll owner component[{}]=0x{:x} table=0x{:x} instance=0x{:x} instance-vtable=0x{:x}",
+                i, component, vtable, child, child_vtable);
+            continue;
+        }
+        if (!candidate_count) continue;
+        for (unsigned c = 0; c < candidate_count; ++c) {
+            const auto object = candidates[c];
+            ++ragdoll_objects;
+            logging::log(logging::Level::info, logging::Channel::runtime,
+                "Skitch solver probe: FBCorePhysicsRagdoll object=0x{:x} component[{}]=0x{:x} table={} owner-vtable=0x{:x}",
+                object, i, component, c ? "component+0x48" : "component", vtable);
+            // The native constructor initializes its embedded PhysicsBodyHandle
+            // slots at +0x00..+0x110 and joint handles later in the object. Scan
+            // aligned slots read-only and only report handles validated by the
+            // current FBPhysicsWorld.
+            for (std::uintptr_t offset = 0; offset + sizeof(Handle) <= 0x370; offset += 0x10) {
+                Handle handle{};
+                if (!memory::peek(object + offset, handle) || handle.world != world ||
+                    handle.index == 0xffffffffu) continue;
+                bool valid{};
+                __try { valid = n.body_valid(&handle); }
+                __except (EXCEPTION_EXECUTE_HANDLER) { valid = false; }
+                if (!valid) continue;
+                ++valid_handles;
+                logging::log(logging::Level::info, logging::Channel::runtime,
+                    "Skitch solver probe: body handle +0x{:03x} world=0x{:x} index={} generation={}",
+                    offset, handle.world, handle.index, handle.generation);
+            }
+        }
+    }
+    logging::log(logging::Level::info, logging::Channel::runtime,
+        "Skitch solver probe: scanned {} component(s), found {} FBCorePhysicsRagdoll object(s), {} valid body/joint handles.",
+        count, ragdoll_objects, valid_handles);
 }
 
 void clear_remote_collision(std::uintptr_t base) noexcept {

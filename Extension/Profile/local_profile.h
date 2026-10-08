@@ -28,6 +28,25 @@ inline constexpr std::string_view unlock_bus_stops_option = "ReSkate.UnlockBusSt
 inline constexpr std::string_view unlock_cosmetics_option = "ReSkate.UnlockCosmetics";
 inline constexpr std::string_view unlock_objects_option = "ReSkate.UnlockObjects";
 inline constexpr std::string_view hide_challenges_option = "ReSkate.HideChallenges";
+// The SkateSkitch unlocker extends the upstream open-catalogue unlock to two
+// classes in full: gestures and build items are seeded owned whether or not
+// their source is currently open (most are tier rewards). Every other kind of
+// cosmetic keeps the upstream ReSkate behaviour -- the open catalogue, base
+// game and mods alike, is unlocked when UnlockCosmetics is on, and reserved
+// items (past seasons, Skate Pass) stay locked. Note that unowned items are
+// absent from the game's wardrobe, not shown locked, so "reserved stays
+// locked" really means "reserved is not there".
+inline constexpr bool unlock_gesture_items = true;
+inline constexpr bool unlock_build_items = true;
+// Reserved cosmetics other than gestures. Off is the upstream behaviour and
+// also hides the entitlement-granted collab packs ("Own_Own_..."), which the
+// open content cache cannot describe; on unlocks everything, which is what
+// SkateSkitch did before this was split.
+inline constexpr bool unlock_reserved_cosmetics = false;
+// Cosmetic slots the character wears nothing in, whatever preset is saved. One
+// boolean per slot name, so a slot is hidden by policy rather than by editing the
+// presets themselves and losing the ability to put the item back.
+inline constexpr std::string_view hide_slot_prefix = "ReSkate.HideSlot.";
 inline constexpr std::array<std::string_view, 4> neighborhood_ids{
     "neighbourhood_rank_entertainment", "neighbourhood_rank_financial",
     "neighbourhood_rank_historic", "neighbourhood_rank_stadium"};
@@ -115,6 +134,7 @@ GraphicsControls graphics_controls(const Snapshot&);
 std::uint32_t noclip_binding(const Snapshot&);
 std::uint32_t forward_velocity_binding(const Snapshot&);
 std::uint32_t up_velocity_binding(const Snapshot&);
+std::uint32_t skitch_key_binding(const Snapshot&);
 std::vector<std::string> challenge_completed_criteria(const Snapshot&, std::string_view);
 std::string encode(const Snapshot&);
 Snapshot decode(std::string_view);
@@ -183,6 +203,8 @@ public:
     void save_forward_velocity_binding(std::uint32_t);
     std::uint32_t up_velocity_binding() const;
     void save_up_velocity_binding(std::uint32_t);
+    std::uint32_t skitch_key_binding() const;
+    void save_skitch_key_binding(std::uint32_t);
     void save_world_layer_choice(unsigned layer, std::string_view mode);
     void restore_world_layers(WorldMap map);
     std::uint64_t begin_challenge(std::string_view id);

@@ -1,6 +1,7 @@
 #include "Extension/Console/commands.h"
 #include "named_settings.h"
 #include "gameplay_settings_override.h"
+#include "Extension/Customization/local_customization_runtime.h"
 #include "Extension/Profile/local_profile_runtime.h"
 #include <format>
 namespace dingosdk::console {
@@ -13,6 +14,14 @@ const NamedSettingModel *named_model(const Model &model, std::size_t index, std:
     for (const auto &setting : model.engine_settings)
         if (equal(setting.name, name)) return &setting;
     return nullptr;
+}
+std::string join(const std::vector<std::string> &values) {
+    std::string result;
+    for (const auto &value : values) {
+        if (!result.empty()) result += ", ";
+        result += value;
+    }
+    return result;
 }
 }
 void register_settings_commands(Commands &registry) {
@@ -121,5 +130,61 @@ void register_settings_commands(Commands &registry) {
         out("Menu scale reset.");
     };
     registry.add(std::move(menu));
+
+    // Wearing nothing in a slot is a policy over the whole character rather than an edit to one
+    // preset, so the saved outfits stay wearable. The game renders an empty asset as nothing,
+    // which is the state its own unworn slots are already in.
+    // Both arguments are optional so that a bare "hideslot" can report; the registry
+    // rejects a call whose arity does not match, before run() is ever reached.
+    auto hide_on = argument("0|1", Type::boolean, true);
+    auto hideslot = action("hideslot",
+        "Hide a cosmetic slot on every outfit: hideslot shoes, hideslot shoes 0, hideslot clear",
+        Group::gameplay, {argument("slot", Type::text, true), std::move(hide_on)});
+    hideslot.execution = Execution::local;
+    hideslot.inspect = [](const Model &) {
+        const auto known = !profile_runtime::cosmetic_slot_names().empty();
+        if (!known)
+            return State{false, std::nullopt,
+                "Load a level first: the slot names come from the character's recipe.",
+                "No slots hidden.", false};
+        const auto hidden = join(profile_runtime::hidden_cosmetic_slots());
+        return State{true, hidden.empty() ? std::optional<std::string>{} : std::optional{hidden},
+            {}, hidden.empty() ? "No slots hidden." : "Takes effect when the outfit next loads.", false};
+    };
+    hideslot.run = [](const Model &, const Values &args, const Output &out) {
+        // Omitted optional arguments leave Values short, so arity is the size.
+        if (args.empty()) {
+            const auto hidden = join(profile_runtime::hidden_cosmetic_slots());
+            out(hidden.empty() ? "No slots hidden." : "Hidden: " + hidden);
+            return;
+        }
+        const auto slot = std::get<std::string>(args[0]);
+        if (lower(slot) == "list") {
+            out("Slots: " + join(profile_runtime::cosmetic_slot_names()));
+            return;
+        }
+        if (lower(slot) == "clear") {
+            for (const auto& name : profile_runtime::hidden_cosmetic_slots())
+                profile_runtime::set_cosmetic_slot_hidden(name, false);
+            out("All slots shown again. Takes effect when the outfit next loads.");
+            return;
+        }
+        const bool hide = args.size() < 2 || std::get<bool>(args[1]);
+        // Logged as well as printed: the console only logs its errors, so without this
+        // there is no record in the log that the command ran at all.
+        if (!profile_runtime::set_cosmetic_slot_hidden(slot, hide)) {
+            profile_runtime::cosmetic_diagnostic("hide_slot", "unknown_slot", slot);
+            out("error: Unknown slot \"" + slot + "\". Try: hideslot list");
+            return;
+        }
+        profile_runtime::cosmetic_diagnostic("hide_slot", hide ? "hidden" : "shown", slot);
+        out(std::format("{} {}. Takes effect when the outfit next loads.", slot, hide ? "hidden" : "shown"));
+    };
+    hideslot.reset = [](const Model &, const Output &out) {
+        for (const auto& name : profile_runtime::hidden_cosmetic_slots())
+            profile_runtime::set_cosmetic_slot_hidden(name, false);
+        out("All slots shown again. Takes effect when the outfit next loads.");
+    };
+    registry.add(std::move(hideslot));
 }
 } // namespace dingosdk::console
