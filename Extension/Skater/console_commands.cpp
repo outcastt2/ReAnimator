@@ -213,6 +213,21 @@ void register_movement_commands(Commands &registry) {
         out(saved ? local_profile_controller_bindings().status : "error: Invalid binding or save failed.");
     };
     registry.add(std::move(up_bind));
+    auto skitch_key_argument = argument("virtual_key", Type::unsigned_integer);
+    skitch_key_argument.minimum = 0;
+    skitch_key_argument.maximum = 255;
+    auto skitch_key_bind = action("bind skitchkey",
+        "Bind the keyboard key for player skitching; 0 disables the keyboard key (controller LB+RB remains)",
+        Group::movement, {skitch_key_argument});
+    skitch_key_bind.inspect = [](const Model &m) {
+        return State{m.bindings.available, {}, "Controller bindings are unavailable.", {}, false};
+    };
+    skitch_key_bind.run = [](const Model &, const Values &args, const Output &out) {
+        const auto key = static_cast<std::uint32_t>(std::get<std::uint64_t>(args[0]));
+        const bool saved = set_local_skitch_key_binding(key);
+        out(saved ? local_profile_controller_bindings().status : "error: Invalid key or save failed.");
+    };
+    registry.add(std::move(skitch_key_bind));
 
     // Prototype: spawn a native effect blueprint and keep it on the skater's head.
     // The blueprint must already be loaded (wear a costume that uses it).

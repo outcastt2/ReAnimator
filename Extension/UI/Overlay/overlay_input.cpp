@@ -1,4 +1,5 @@
 #include "Extension/Skater/Skitch/tow_controller.h"
+#include "Extension/Profile/local_profile_runtime.h"
 #include "Engine/Core/Platform/launcher_support.h"
 #include "Engine/Core/Log/logging.h"
 #include "overlay_internal.h"
@@ -406,7 +407,8 @@ extern "C" void DingoSDKOverlayReadSkitchInput(bool* active, bool* held, float* 
     const auto sample = read_controller_sample();
     *active = true;
     if(sample.device) *steering=skateskitch::skitch_steering_axis(static_cast<float>(sample.pad.sThumbLX)/32768.f);
-    *held = (GetAsyncKeyState('V') & 0x8000) != 0 ||
+    const auto skitch_key = dingosdk::local_profile_skitch_key_binding();
+    *held = (skitch_key && (GetAsyncKeyState(static_cast<int>(skitch_key)) & 0x8000) != 0) ||
         (sample.device && (sample.pad.wButtons & (XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER)) ==
             (XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER));
 }

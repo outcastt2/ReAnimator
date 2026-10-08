@@ -186,6 +186,18 @@ void Store::save_up_velocity_binding(std::uint32_t combo) {
     update.commit();
 }
 
+std::uint32_t Store::skitch_key_binding() const {
+    std::lock_guard lock(mutex_);
+    return profile::skitch_key_binding(value_);
+}
+void Store::save_skitch_key_binding(std::uint32_t key) {
+    require(key <= 255, "Unsupported Skitch virtual-key code");
+    std::lock_guard lock(mutex_);
+    Update update(*this);
+    update.json(value_.settings, {"bindings", "skitch_key"}) = key;
+    update.commit();
+}
+
 void Store::save_graphics_controls(const GraphicsControls& c) {
     require(valid_graphics_controls(c), "Invalid graphics controls");
     std::lock_guard lock(mutex_);

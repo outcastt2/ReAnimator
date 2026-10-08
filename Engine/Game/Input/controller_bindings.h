@@ -25,6 +25,7 @@ struct ControllerBindingsModel {
     std::uint32_t noclip_combo{};
     std::uint32_t forward_velocity_combo{};
     std::uint32_t up_velocity_combo{};
+    std::uint32_t skitch_key{'V'}; // virtual-key code; zero disables keyboard Skitch
     std::string status;
 };
 inline std::string controller_combo_label(std::uint32_t value, ControllerStyle style = ControllerStyle::xbox) {

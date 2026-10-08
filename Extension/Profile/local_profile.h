@@ -134,6 +134,7 @@ GraphicsControls graphics_controls(const Snapshot&);
 std::uint32_t noclip_binding(const Snapshot&);
 std::uint32_t forward_velocity_binding(const Snapshot&);
 std::uint32_t up_velocity_binding(const Snapshot&);
+std::uint32_t skitch_key_binding(const Snapshot&);
 std::vector<std::string> challenge_completed_criteria(const Snapshot&, std::string_view);
 std::string encode(const Snapshot&);
 Snapshot decode(std::string_view);
@@ -202,6 +203,8 @@ public:
     void save_forward_velocity_binding(std::uint32_t);
     std::uint32_t up_velocity_binding() const;
     void save_up_velocity_binding(std::uint32_t);
+    std::uint32_t skitch_key_binding() const;
+    void save_skitch_key_binding(std::uint32_t);
     void save_world_layer_choice(unsigned layer, std::string_view mode);
     void restore_world_layers(WorldMap map);
     std::uint64_t begin_challenge(std::string_view id);
