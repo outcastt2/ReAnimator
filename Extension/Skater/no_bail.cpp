@@ -167,6 +167,19 @@ bool suppress_cause(std::uintptr_t causes, std::int32_t reason, std::uintptr_t c
 void record_cause(std::uintptr_t causes, std::int32_t reason, float magnitude) {
     const auto caller = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
     const bool protect = suppress_cause(causes, reason, caller);
+    // Log every impact the engine records (rate-limited): the reason and
+    // magnitude are the impact's fingerprint, and a bus hit on a bailed skater
+    // is the reaction we want to reproduce. Caller is an RVA for comparison
+    // against the verified impact call sites.
+    static std::atomic<std::uint64_t> last{};
+    const auto now = GetTickCount64();
+    auto previous = last.load(std::memory_order_relaxed);
+    if (now - previous >= 200 && last.compare_exchange_strong(previous, now)) {
+        const auto base = protection().base;
+        logging::log(logging::Level::info, logging::Channel::runtime,
+            "No bail: cause reason={} magnitude={:.3f} caller={:#x} protected={}",
+            reason, magnitude, caller > base ? caller - base : caller, protect ? 1 : 0);
+    }
     // Do not force the native recovery/stumble predicate (recovery_predicate). Its
     // result is also exported to animation at +0x9e, even without a collision.
     // Stop new causes before they reach either the wipeout or runout decision;
@@ -219,6 +232,11 @@ std::uint32_t choose_state(std::uintptr_t selector, std::uint32_t current) {
             if (chosen == wipeout_physics_state) w.wipeouts.fetch_add(1, std::memory_order_relaxed);
         }
     }
+    // What the physics thinks the skater is doing, for consumers outside this
+    // file: walking (504) and a ground wipeout (300) are on foot, everything
+    // else is riding. The watch above is the trainer's windowed view of the same
+    // thing; this one is always current, which is what the animation layer needs.
+    observed_state().store(chosen, std::memory_order_relaxed);
     return chosen;
 }
 // Set once by a consumer that needs to write a pose after the engine's own

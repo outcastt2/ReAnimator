@@ -67,6 +67,9 @@ struct SkateMenu {
     int recording_bind = 0;
     ControllerComboCapture bind_capture;
     double bind_capture_until = 0;
+    bool recording_skitch_key{};
+    std::array<bool, 256> skitch_keys_down{};
+    double skitch_key_capture_until{};
     int last_menu_frame = -1;
     // Live while the scale slider is held; the saved value is authoritative otherwise.
     float scale = default_menu_scale;

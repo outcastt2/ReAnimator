@@ -1,5 +1,6 @@
 #include "Engine/Core/Platform/launcher_support.h"
 #include "skate_menu_internal.h"
+#include "input_capture.h"
 #include "Engine/Core/Profiling/profiler.h"
 #include "Extension/Music/local_music_playback.h"
 #include "Extension/Profile/local_profile_runtime.h"
@@ -124,6 +125,54 @@ void binds_page(SkateMenu& menu, const Model& model, const CallbacksV3& callback
         row(2, "Forward Boost", model.bindings.forward_velocity_combo);
         row(3, "Up Boost", model.bindings.up_velocity_combo);
         ImGui::EndTable();
+    }
+    // The keyboard Skitch key sits immediately below the controller boost
+    // bindings. LB+RB remains as a controller alternative; this changes only
+    // the keyboard key (default V).
+    field(menu, "Skitch keyboard key");
+    const auto skitch_key_label = menu.recording_skitch_key ? std::string("Press a key...") :
+        model.bindings.skitch_key ? dingosdk::launcher::key_name(model.bindings.skitch_key) : std::string("Not bound");
+    const float clear_width = ImGui::CalcTextSize("Clear").x + ImGui::GetStyle().FramePadding.x * 2;
+    if (ImGui::Button((skitch_key_label + "###skitch-key").c_str(), ImVec2(
+            ImGui::GetContentRegionAvail().x - clear_width - ImGui::GetStyle().ItemSpacing.x, 0))) {
+        menu.recording_skitch_key = true;
+        menu.recording_bind = 0;
+        menu.skitch_key_capture_until = ImGui::GetTime() + 30;
+        menu.feedback.clear();
+        dingosdk::overlay::detail::OverlayInputAccess access;
+        for (int key = 0; key < 256; ++key)
+            menu.skitch_keys_down[key] = (GetAsyncKeyState(key) & 0x8000) != 0;
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!model.bindings.available || menu.recording_skitch_key || model.bindings.skitch_key == 0);
+    if (ImGui::Button("Clear##skitch-key", ImVec2(-1, 0)))
+        send_console(menu, callbacks, "bind skitchkey 0");
+    ImGui::EndDisabled();
+    if (menu.recording_skitch_key) {
+        dingosdk::overlay::detail::OverlayInputAccess access;
+        if (!available || ImGui::GetTime() >= menu.skitch_key_capture_until) {
+            menu.recording_skitch_key = false;
+            feedback(menu, "Key capture cancelled. The current binding is unchanged.");
+        } else if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
+            menu.recording_skitch_key = false;
+        } else {
+            for (int key = 1; key < 256; ++key) {
+                const bool down = (GetAsyncKeyState(key) & 0x8000) != 0;
+                const bool pressed = down && !menu.skitch_keys_down[key];
+                menu.skitch_keys_down[key] = down;
+                if (!pressed || key == VK_LBUTTON || key == VK_RBUTTON || key == VK_MBUTTON ||
+                    key == VK_SHIFT || key == VK_CONTROL || key == VK_MENU ||
+                    key == VK_LSHIFT || key == VK_RSHIFT || key == VK_LCONTROL || key == VK_RCONTROL ||
+                    key == VK_LMENU || key == VK_RMENU) continue;
+                menu.recording_skitch_key = false;
+                send_console(menu, callbacks, "bind skitchkey " + std::to_string(key));
+                break;
+            }
+        }
+        if (menu.recording_skitch_key) {
+            note("Press a keyboard key to bind Skitch. Escape cancels; mouse buttons and modifiers are ignored.");
+            if (ImGui::SmallButton("Cancel key binding")) menu.recording_skitch_key = false;
+        }
     }
     ImGui::EndDisabled();
     if (menu.recording_bind) {

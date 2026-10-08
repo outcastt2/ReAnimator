@@ -11,6 +11,7 @@
 #include "Engine/Vfs/mod_catalog.h"
 #include "Extension/Boot/offline_boot.h"
 #include "Extension/Skater/camera_observer.h"
+
 #include "Extension/Progression/entitlement_request_hook.h"
 #include "Extension/Skater/skater_observer.h"
 #include "Extension/UI/NativeMenu/native_menu.h"

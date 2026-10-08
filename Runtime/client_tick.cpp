@@ -1,3 +1,5 @@
+#include "Extension/Skater/Gestures/board_gesture.h"
+#include "Extension/Skater/Gestures/board_gesture_routes.h"
 #include "runtime_internal.h"
 #include "Extension/Customization/developer_hoodie.h"
 #include "Extension/Customization/developer_board.h"
@@ -24,6 +26,7 @@
 #include "Extension/Skater/ai_skaters.h"
 #include "Extension/Skater/effect_attach.h"
 #include "Extension/Skater/custom_animation.h"
+#include "Extension/Skater/prop_attach.h"
 #include "Extension/Skater/client_source_spawn.h"
 #include "Extension/Skater/skater_slot_override.h"
 #include "Extension/Throwdowns/native_throwdowns.h"
@@ -262,6 +265,8 @@ void update_model(std::uintptr_t client, TickState& frame) {
     frame.game_type = game_type;
     // Prototype effect attach: keep a spawned effect on the skater's head.
     if (state == 13 || state == 21) dingosdk::skater::tick_effect_attach(r.base, client);
+    // Hand props: find the gesture items whose props follow a custom pose.
+    if (state == 13 || state == 21) dingosdk::skater::tick_prop_attach(r.base, client);
     // Route B: custom animation playback on the local skater.
     if (state == 13 || state == 21) dingosdk::skater::tick_pose_playback(r.base, client);
     // Some two dozen native reads: one result serves the whole tick.
@@ -1001,6 +1006,9 @@ void tick(std::uintptr_t client, std::uintptr_t update) {
                 dingosdk::overlay::notify(dingosdk::overlay::NoticeLevel::warning, "Map not installed", std::move(notice));
         }
         dingosdk::multiplayer::refresh_identity_lists();
+        const bool gesture_mounted=multiplayer_ready && dingosdk::board_gesture::mounted(r.base,client);
+        dingosdk::board_gesture::tick(r.base,gesture_mounted);
+        dingosdk::board_gesture::routes::tick(r.base,dingosdk::board_gesture::enabled(),gesture_mounted);
         dingosdk::tick_local_developer_hoodie(r.base, client, multiplayer_ready);
         dingosdk::tick_local_developer_board(r.base, client, multiplayer_ready);
         // The session spawns and places skaters and can teleport: check the camera again.

@@ -4,6 +4,12 @@
 namespace dingosdk {
 using namespace profile_runtime;
 namespace profile_runtime { std::string binding_feedback; }
+namespace {
+std::atomic<std::uint32_t>& skitch_key_cache() {
+    static std::atomic<std::uint32_t> value{'V'};
+    return value;
+}
+}
 ControllerBindingsModel local_profile_controller_bindings() {
     auto& s = local_runtime(); std::lock_guard lock(s.native_mutex);
     ControllerBindingsModel result;
@@ -12,6 +18,8 @@ ControllerBindingsModel local_profile_controller_bindings() {
     result.noclip_combo = s.store->noclip_binding();
     result.forward_velocity_combo = s.store->forward_velocity_binding();
     result.up_velocity_combo = s.store->up_velocity_binding();
+    result.skitch_key = s.store->skitch_key_binding();
+    skitch_key_cache().store(result.skitch_key, std::memory_order_release);
     result.available = true;
     return result;
 }
@@ -46,6 +54,22 @@ bool set_local_up_velocity_binding(std::uint32_t combo) {
         dingosdk::logging::event(dingosdk::logging::Channel::profile, dingosdk::Json{{"event","controller_binding_saved"},{"action","up_velocity"},{"combo",combo}}.dump().c_str());
         return true;
     } catch (...) { binding_feedback = "Could not save the binding. See the console log."; return false; }
+}
+std::uint32_t local_profile_skitch_key_binding() noexcept {
+    return skitch_key_cache().load(std::memory_order_acquire);
+}
+
+bool set_local_skitch_key_binding(std::uint32_t key) {
+    auto& s = local_runtime(); std::lock_guard lock(s.native_mutex);
+    if (!s.active || !s.store || key > 255) return false;
+    try {
+        s.store->save_skitch_key_binding(key);
+        skitch_key_cache().store(key, std::memory_order_release);
+        binding_feedback = key ? "Skitch key saved." : "Skitch keyboard key cleared; controller LB+RB remains available.";
+        dingosdk::logging::event(dingosdk::logging::Channel::profile,
+            dingosdk::Json{{"event","controller_binding_saved"},{"action","skitch_key"},{"key",key}}.dump().c_str());
+        return true;
+    } catch (...) { binding_feedback = "Could not save the Skitch key. See the console log."; return false; }
 }
 
 namespace profile_runtime {

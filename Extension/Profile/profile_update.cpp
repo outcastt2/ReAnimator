@@ -70,6 +70,7 @@ void Store::Update::encode(Json& patch) {
         (void)world_controls(value); (void)graphics_controls(value); (void)profile::noclip_binding(value);
         (void)profile::forward_velocity_binding(value);
         (void)profile::up_velocity_binding(value);
+        (void)profile::skitch_key_binding(value);
         remove("player_settings", [](const Json& row) { return row[0] != "options"; });
         auto residual = value.settings;
         const auto flatten = [&](auto&& self, Json& node, const std::string& scope) -> void {

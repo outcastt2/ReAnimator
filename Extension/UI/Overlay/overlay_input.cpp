@@ -1,3 +1,5 @@
+#include "Extension/Skater/Skitch/tow_controller.h"
+#include "Extension/Profile/local_profile_runtime.h"
 #include "Engine/Core/Platform/launcher_support.h"
 #include "Engine/Core/Log/logging.h"
 #include "overlay_internal.h"
@@ -395,6 +397,21 @@ dingosdk::overlay::FlightInput read_player_flight_controller() {
 }
 }
 
+extern "C" void DingoSDKOverlayReadSkitchInput(bool* active, bool* held, float* steering) {
+    if (!active || !held || !steering) return;
+    struct PreserveError { DWORD value = GetLastError(); ~PreserveError() { SetLastError(value); } } preserve;
+    *active = false; *held = false; *steering=0;
+    const auto& s = state(); const HWND window = s.window.load();
+    if (!window || s.stop.load() || s.failed.load() || interactive_visible(s) || !game_window_foreground(window)) return;
+    OverlayInputAccess access;
+    const auto sample = read_controller_sample();
+    *active = true;
+    if(sample.device) *steering=skateskitch::skitch_steering_axis(static_cast<float>(sample.pad.sThumbLX)/32768.f);
+    const auto skitch_key = dingosdk::local_profile_skitch_key_binding();
+    *held = (skitch_key && (GetAsyncKeyState(static_cast<int>(skitch_key)) & 0x8000) != 0) ||
+        (sample.device && (sample.pad.wButtons & (XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER)) ==
+            (XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER));
+}
 extern "C" void DingoSDKOverlayReadControllerInput(dingosdk::ControllerInput* output, bool allow_menu) {
     if (!output) return;
     struct PreserveError { DWORD value = GetLastError(); ~PreserveError() { SetLastError(value); } } preserve_error;
