@@ -1246,7 +1246,10 @@ constexpr const char *ragdoll_bool_names[] = {
     "bool.anim.is.offboardragdollfollowingground",
 };
 constexpr Ptr ragdoll_default_offset = 0x70;    // BoolAsset.Default, one byte
-constexpr Ptr ragdoll_instance_pointer = 0x28;  // exported-instance pointer in the image
+constexpr Ptr ragdoll_instance_pointer = 0x28;  // tagged arena offset in the image
+// The +0x28 field is an offset into the graph-data arena (0x1494001 resolves to
+// 0x11494000, an object whose fields carry self-pointers), not an address.
+constexpr Ptr ragdoll_arena_base = 0x10000000;
 
 Ptr ragdoll_config_asset(Ptr base, bool &faulted) {
     return find_named_asset(base, "animation/dingo/skatercorephysicsragdollconfig", faulted);
@@ -1265,13 +1268,17 @@ std::string ragdoll_asset_name(Ptr asset) {
         return {};
     return buffer.data();
 }
-// The exported instance pointer, when it looks like one: the tagged low bits are
-// masked off the same way the phone probe does it.
+// The exported-instance pointer, when it looks like one: the tagged low bits are
+// masked off the same way the phone probe does it. The remaining value is an
+// offset into the graph-data arena (small, ~17-21 MB) or occasionally a real
+// pointer; both are handled.
 Ptr ragdoll_instance(Ptr asset) {
     Ptr data{};
     if (!memory::peek(asset + ragdoll_instance_pointer, data)) return 0;
     const auto cleaned = static_cast<Ptr>(data) & ~Ptr{7};
-    return cleaned >= 0x10000 ? cleaned : 0;
+    if (cleaned < 0x10000) return 0;
+    if (cleaned < 0x8000000) return ragdoll_arena_base + cleaned;
+    return cleaned;
 }
 void ragdoll_byte_dump(Ptr address, std::size_t bytes, const std::string &label) {
     for (std::size_t offset = 0; offset < bytes; offset += 0x10) {
@@ -1387,59 +1394,37 @@ void ragdoll_refs_dump(Ptr base, Ptr client) {
     const auto spots = ragdoll_reference_spots(base, client, true);
     set_status(std::format("Ragdoll: {} reference spot(s) in the log.", spots.size()));
 }
-// The +0x28 runtime-data field holds a tagged offset, not an address (e.g.
-// 0x160b002 -> 0x160b000, ~22 MB in, which is not mapped). Try the plausible
-// bases and report which one lands in readable memory, so the live value can be
-// located without guessing twice.
+// The +0x28 runtime-data field holds an offset into the graph-data arena at
+// 0x10000000 (0x1494001 -> 0x11494000), and the arena objects carry
+// self-pointers that make them easy to recognise. Dump the full object for
+// every ragdoll bool so the live value field can be identified.
 void ragdoll_data_dump(Ptr base, Ptr client) {
     (void)client;
     bool faulted{};
-    const auto config = ragdoll_config_asset(base, faulted);
+    std::vector<std::pair<std::string, Ptr>> targets;
+    if (const auto config = ragdoll_config_asset(base, faulted))
+        for (const auto &field : ragdoll_fields) {
+            const auto target = pointer(config + field.offset);
+            if (target) targets.push_back({field.name, target});
+        }
     for (const char *name : ragdoll_bool_names) {
         const auto asset = ragdoll_lookup_bool(base, name, faulted);
-        if (!asset) continue;
+        if (asset) targets.push_back({name, asset});
+    }
+    std::vector<Ptr> seen;
+    for (const auto &[label, asset] : targets) {
         std::uint64_t tagged{};
         if (!memory::peek(asset + 0x28, tagged)) continue;
         const auto offset = static_cast<Ptr>(tagged & ~std::uint64_t{7});
+        if (!offset || offset >= 0x8000000) continue;
+        const auto address = ragdoll_arena_base + offset;
+        if (std::find(seen.begin(), seen.end(), address) != seen.end()) continue;
+        seen.push_back(address);
         logging::log(logging::Level::info, logging::Channel::skater,
-            "Ragdoll: {} asset={:#x} +0x28 raw={:#x} offset={:#x}", name, asset, tagged, offset);
-        const std::array<std::pair<const char *, Ptr>, 6> candidates{{
-            {"absolute", offset},
-            {"asset+", asset + offset},
-            {"module+", base + offset},
-            {"0x10000000+", 0x10000000ULL + offset},
-            {"0x40000000+", 0x40000000ULL + offset},
-            {"0x4a000000+", 0x4a000000ULL + offset}}};
-        for (const auto &[label, address] : candidates) {
-            std::array<std::uint8_t, 24> bytes{};
-            if (!memory::peek_bytes(address, bytes.data(), bytes.size())) continue;
-            std::string text;
-            for (const auto byte : bytes) text += std::format("{:02x} ", byte);
-            logging::log(logging::Level::info, logging::Channel::skater,
-                "Ragdoll:   {} {:#x}: {}", label, address, text);
-        }
-        if (config) {
-            std::array<std::uint8_t, 24> bytes{};
-            const auto address = config + offset;
-            if (memory::peek_bytes(address, bytes.data(), bytes.size())) {
-                std::string text;
-                for (const auto byte : bytes) text += std::format("{:02x} ", byte);
-                logging::log(logging::Level::info, logging::Channel::skater,
-                    "Ragdoll:   config+ {:#x}: {}", address, text);
-            }
-        }
-        for (const auto field : {std::uintptr_t{0x00}, std::uintptr_t{0x08}}) {
-            Ptr target{};
-            if (!memory::peek(asset + field, target) || target < 0x10000) continue;
-            std::array<std::uint8_t, 32> bytes{};
-            if (!memory::peek_bytes(target, bytes.data(), bytes.size())) continue;
-            std::string text;
-            for (const auto byte : bytes) text += std::format("{:02x} ", byte);
-            logging::log(logging::Level::info, logging::Channel::skater,
-                "Ragdoll:   shared+{:#x} -> {:#x}: {}", field, target, text);
-        }
+            "Ragdoll: {} -> arena {:#x} (offset {:#x})", label, address, offset);
+        ragdoll_byte_dump(address, 0x80, label);
     }
-    set_status("Ragdoll: the +0x28 candidate locations are in the log.");
+    set_status(std::format("Ragdoll: {} arena object(s) dumped.", seen.size()));
 }
 void ragdoll_watch(Ptr base, Ptr client, unsigned seconds) {
     auto &s = state();
@@ -1463,7 +1448,7 @@ void ragdoll_watch(Ptr base, Ptr client, unsigned seconds) {
             if (!target) continue;
             add_region(s, std::string("bool ") + field.name, target, 0x80, true);
             const auto instance = ragdoll_instance(target);
-            if (instance) add_region(s, std::string("inst ") + field.name, instance, 0x40);
+            if (instance) add_region(s, std::string("data ") + field.name, instance, 0x80);
         }
     }
     for (const char *name : ragdoll_bool_names) {
@@ -1471,7 +1456,7 @@ void ragdoll_watch(Ptr base, Ptr client, unsigned seconds) {
         if (!asset) continue;
         add_region(s, std::string("bool ") + name, asset, 0x80, true);
         const auto instance = ragdoll_instance(asset);
-        if (instance) add_region(s, std::string("inst ") + name, instance, 0x40);
+        if (instance) add_region(s, std::string("data ") + name, instance, 0x80);
     }
     // The live byte sits beside the animation instance's reference to the bool
     // asset, so watch the words after every reference the scan finds.
