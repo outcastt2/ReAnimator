@@ -106,6 +106,9 @@ add_library(dingosdk_runtime SHARED
     Extension/Skater/client_first_person.cpp
     Extension/Skater/client_debug.cpp
     Extension/Skater/ai_skaters.cpp
+    Extension/Skater/effect_attach.cpp
+    Extension/Skater/custom_animation.cpp
+    Extension/Skater/pose_layers.cpp
     Extension/Skater/no_bail.cpp
     Extension/Skater/physics_tuning.cpp
     Extension/Multiplayer/Remote/remote_collision.cpp

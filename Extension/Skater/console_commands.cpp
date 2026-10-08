@@ -1,7 +1,10 @@
 #include "Extension/Console/commands.h"
 #include "Extension/Profile/local_profile_runtime.h"
 #include "ai_skaters.h"
+#include "effect_attach.h"
+#include "custom_animation.h"
 #include <format>
+#include <string>
 namespace dingosdk::console {
 void register_movement_commands(Commands &registry) {
     using Debug = overlay::DebugAction;
@@ -168,6 +171,106 @@ void register_movement_commands(Commands &registry) {
         out(saved ? local_profile_controller_bindings().status : "error: Invalid binding or save failed.");
     };
     registry.add(std::move(up_bind));
+
+    // Prototype: spawn a native effect blueprint and keep it on the skater's head.
+    // The blueprint must already be loaded (wear a costume that uses it).
+    auto headfx = action("headfx",
+        "Attach a loaded native effect blueprint to the skater's head; 'headfx off' detaches",
+        Group::movement, {argument("blueprint", Type::text, true), argument("offset", Type::number, true)});
+    headfx.execution = Execution::local;
+    headfx.inspect = [](const Model &) {
+        return State{true, {}, {}, skater::effect_attach_status(), false};
+    };
+    headfx.run = [](const Model &, const Values &args, const Output &out) {
+        if (args.empty()) { out(skater::effect_attach_status()); return; }
+        const auto name = std::get<std::string>(args[0]);
+        if (lower(name) == "off") {
+            skater::request_effect_attach_off();
+            out("Detaching effect...");
+            return;
+        }
+        const float offset = args.size() > 1 ? static_cast<float>(std::get<double>(args[1])) : 0.0f;
+        skater::request_effect_attach(name, offset);
+        out("Attaching " + name + "... (the result appears in the log)");
+    };
+    registry.add(std::move(headfx));
+
+    auto findasset = action("findasset", "Report whether a named asset is loaded (find_asset is find-only)",
+        Group::movement, {argument("name")});
+    findasset.execution = Execution::local;
+    findasset.run = [](const Model &, const Values &args, const Output &out) {
+        out(skater::asset_loaded_report(std::get<std::string>(args[0])));
+    };
+    registry.add(std::move(findasset));
+
+    // Route B: overwrite the local skater's pose with a baked custom animation.
+    auto poseanim = action("poseanim",
+        "Custom animation: poseanim test | record | off | play | save <path> | mask auto|full|legs | <file>.rska",
+        Group::movement, {argument("clip", Type::text, true), argument("path", Type::text, true)});
+    poseanim.execution = Execution::local;
+    poseanim.inspect = [](const Model &) {
+        return State{true, {}, {},
+                     skater::pose_playback_status() + "  [mask: " + skater::pose_mask_name() + "]", false};
+    };
+    poseanim.run = [](const Model &, const Values &args, const Output &out) {
+        if (args.empty()) {
+            out(skater::pose_playback_status());
+            out("Masking: " + skater::pose_mask_name() + ".");
+            return;
+        }
+        const auto clip = std::get<std::string>(args[0]);
+        if (lower(clip) == "off") { skater::request_pose_playback_stop(); out("Stopping custom animation..."); return; }
+        if (lower(clip) == "mask") {
+            // Which joints the clip is allowed to drive. "auto" hands the legs
+            // and pelvis to the game while riding or moving, so a clip layers on
+            // top of the board stance and the walk cycle.
+            const auto mode = args.size() > 1 ? lower(std::get<std::string>(args[1])) : std::string{};
+            if (mode != "auto" && mode != "full" && mode != "legs") {
+                out("usage: poseanim mask auto|full|legs  (currently " + skater::pose_mask_name() + ")");
+                return;
+            }
+            skater::set_pose_mask(mode == "auto" ? skater::PoseMask::automatic
+                                 : mode == "full" ? skater::PoseMask::full
+                                                  : skater::PoseMask::legs);
+            out(mode == "auto"
+                    ? "Custom animation masking: auto (the game keeps the legs while riding or moving)."
+                    : "Custom animation masking: " + mode + ".");
+            return;
+        }
+        if (lower(clip) == "play") {
+            // "play" alone replays the in-memory recording; "play <name>" loads
+            // the file, which is what a bare name does too.
+            if (args.size() > 1) {
+                const auto name = std::get<std::string>(args[1]);
+                skater::request_pose_playback(name);
+                out("Playing " + name + "...");
+            } else {
+                skater::request_pose_record_playback();
+                out("Playing the recorded pose...");
+            }
+            return;
+        }
+        if (lower(clip) == "save") {
+            const auto path = args.size() > 1 ? std::get<std::string>(args[1]) : std::string{};
+            if (path.empty()) { out("usage: poseanim save <path>"); return; }
+            const auto error = skater::save_recorded_clip(path);
+            out(error.empty() ? "Saved: " + path : "error: " + error);
+            return;
+        }
+        skater::request_pose_playback(clip);
+        out("Starting custom animation " + clip + "...");
+    };
+    registry.add(std::move(poseanim));
+
+    auto dumpskeleton = action("dumpskeleton", "Write the live skater skeleton resource beside the log",
+        Group::movement);
+    dumpskeleton.execution = Execution::local;
+    dumpskeleton.inspect = [](const Model &) { return State{true, {}, {}, {}, false}; };
+    dumpskeleton.run = [](const Model &, const Values &, const Output &out) {
+        skater::request_skeleton_dump();
+        out("Dumping the skeleton...");
+    };
+    registry.add(std::move(dumpskeleton));
 }
 void register_ai_commands(Commands &registry) {
     const auto ready = [](const Model &m) {

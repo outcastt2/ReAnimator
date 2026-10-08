@@ -28,6 +28,10 @@ inline constexpr std::string_view unlock_bus_stops_option = "ReSkate.UnlockBusSt
 inline constexpr std::string_view unlock_cosmetics_option = "ReSkate.UnlockCosmetics";
 inline constexpr std::string_view unlock_objects_option = "ReSkate.UnlockObjects";
 inline constexpr std::string_view hide_challenges_option = "ReSkate.HideChallenges";
+// Cosmetic slots the character wears nothing in, whatever preset is saved. One
+// boolean per slot name, so a slot is hidden by policy rather than by editing the
+// presets themselves and losing the ability to put the item back.
+inline constexpr std::string_view hide_slot_prefix = "ReSkate.HideSlot.";
 inline constexpr std::array<std::string_view, 4> neighborhood_ids{
     "neighbourhood_rank_entertainment", "neighbourhood_rank_financial",
     "neighbourhood_rank_historic", "neighbourhood_rank_stadium"};

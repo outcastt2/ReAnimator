@@ -27,4 +27,17 @@ void watch_physics_state(std::uintptr_t client, std::uintptr_t entity) noexcept;
 PhysicsStateWatch watched_physics_state() noexcept;
 // Stopping flight must not discard the independent manual preference.
 void clear_no_bail_flight() noexcept;
-}
+// The engine's physics state, as last selected by the physics selector hook.
+// 504 is walking on foot, 300 is a ground wipeout, and the engine remaps
+// between them; anything else means the skater is on the board. Published by
+// the hook No Bail installs, so this is free to read.
+std::uint32_t observed_physics_state() noexcept;
+
+// Called after the native post-physics skeleton response has run for a rig.
+// The response applies the engine's constraints to the pose, so a pose written
+// in the animation callback is rewritten; this is the point after which a write
+// survives to the renderer. Runs on the physics thread, in the animation update
+// order. Set once; a null listener removes it.
+using SkeletonResponded = void (*)(std::uintptr_t rig) noexcept;
+void set_skeleton_responded_listener(SkeletonResponded listener) noexcept;
+} // namespace dingosdk
