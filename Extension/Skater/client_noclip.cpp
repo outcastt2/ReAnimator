@@ -176,69 +176,61 @@ void noclip_apply_velocity(std::uintptr_t core) noexcept {
                 reader.verify();
             } else if (bodies.seconds > 0) {
                 if (drag) {
-                    // A contact impulse cannot be written -- the solver produces
-                    // it from a real contact. The player's own board is a
-                    // collider the mod can drive (the riding boost proves it) and
-                    // it already shoves the ragdoll when it touches it, so drive
-                    // it like a bulldozer behind the ragdoll, pressing toward the
-                    // follow slot. The solver does the pushing; the evaluation
-                    // carries the root and the camera the way it does for a bus.
-                    std::array<float, 4> board_position{};
-                    source_require(memory::peek(bodies.parts[0] + 0x50, board_position),
-                        "Skitch board position unreadable.");
-                    source_require(std::isfinite(board_position[0]) && std::isfinite(board_position[2]) &&
-                        std::abs(board_position[0]) <= 100000.f && std::abs(board_position[2]) <= 100000.f,
-                        "Skitch board position is invalid.");
-                    const float root_x = bodies.root[0], root_z = bodies.root[2];
-                    float toward_x = skitch->plan.root_goal[0] - root_x;
-                    float toward_z = skitch->plan.root_goal[2] - root_z;
-                    const float toward = std::hypot(toward_x, toward_z);
-                    float target_x = root_x, target_z = root_z;
-                    if (toward > 0.2f) {
-                        toward_x /= toward;
-                        toward_z /= toward;
-                        // 1.5 m behind the ragdoll, on the far side from the slot.
-                        target_x = root_x - toward_x * 1.5f;
-                        target_z = root_z - toward_z * 1.5f;
+                    // The ragdoll is a jointed physics sim: pushing limbs only
+                    // flops limbs, and the joints hold the mass at the root body
+                    // -- the one the context and camera follow. Find the rig body
+                    // nearest the wipeout root (context+0x7a0) and drive just
+                    // that: an invisible pull at the harness, no board needed.
+                    std::array<float, 4> root{};
+                    source_require(memory::peek(bodies.context + 0x7a0, root),
+                        "Skitch wipeout root unreadable.");
+                    source_require(std::isfinite(root[0]) && std::isfinite(root[2]) &&
+                        std::abs(root[0]) <= 100000.f && std::abs(root[2]) <= 100000.f,
+                        "Skitch wipeout root is invalid.");
+                    source_require(bodies.rig_parts != 0 && bodies.rig_physics != 0,
+                        "Skitch skeleton bodies are unavailable.");
+                    std::uintptr_t hips{};
+                    float best = 3.0f;
+                    std::array<float, 3> hips_velocity{};
+                    std::uint32_t hips_flags{};
+                    for (std::size_t j = 1; j <= 26; ++j) {
+                        const auto body = bodies.rig_parts + j * 0x130;
+                        std::uintptr_t owner{};
+                        std::array<float, 4> translation{};
+                        std::array<float, 3> velocity{};
+                        if (!memory::peek(body + 0x10, owner) || owner != bodies.rig_physics) continue;
+                        if (!memory::peek(body + 0x50, translation) || !memory::peek(body + 0x70, velocity)) continue;
+                        if (!std::isfinite(translation[0]) || !std::isfinite(translation[2])) continue;
+                        const float d = std::hypot(translation[0] - root[0], translation[2] - root[2]);
+                        if (!std::isfinite(d) || d >= best) continue;
+                        best = d;
+                        hips = body;
+                        hips_velocity = velocity;
+                        (void)memory::peek(body + 0x60, hips_flags);
                     }
-                    const float dx = target_x - board_position[0];
-                    const float dz = target_z - board_position[2];
+                    source_require(hips != 0, "Skitch ragdoll root body not found.");
+                    const float dx = skitch->plan.root_goal[0] - root[0];
+                    const float dz = skitch->plan.root_goal[2] - root[2];
                     const float distance = std::hypot(dx, dz);
-                    constexpr float board_gain = 3.0f;
-                    constexpr float max_board_speed = 5.0f;
+                    constexpr float drag_gain = 6.0f;      // 1/s
+                    constexpr float max_drag_speed = 6.0f; // m/s
                     float wanted_x = 0, wanted_z = 0;
-                    if (distance > 0.3f) {
-                        const float speed = std::min(max_board_speed, distance * board_gain);
+                    if (distance > 0.05f) {
+                        const float speed = std::min(max_drag_speed, distance * drag_gain);
                         wanted_x = dx / distance * speed;
                         wanted_z = dz / distance * speed;
-                    } else if (toward > 0.2f) {
-                        // Already behind the ragdoll: keep pressing at the slot.
-                        wanted_x = toward_x * max_board_speed;
-                        wanted_z = toward_z * max_board_speed;
                     }
-                    // Board bodies 0..8: match the whole set to the drive.
-                    std::array<std::array<float, 3>, 9> velocities{};
-                    std::array<std::uint32_t, 9> flags{};
-                    std::array<float, 3> mean{};
-                    for (std::size_t i = 0; i < 9; ++i) {
-                        velocities[i] = reader.value<std::array<float, 3>>(bodies.parts[i], 0x70);
-                        flags[i] = reader.value<std::uint32_t>(bodies.parts[i], 0x60);
-                        for (std::size_t axis = 0; axis < 3; ++axis) mean[axis] += velocities[i][axis];
-                    }
-                    reader.verify();
-                    for (auto &value : mean) value /= 9.f;
-                    const float delta_x = wanted_x - mean[0];
-                    const float delta_z = wanted_z - mean[2];
-                    if (std::hypot(delta_x, delta_z) >= 0.05f) {
-                        for (std::size_t i = 0; i < 9; ++i) {
-                            velocities[i][0] += delta_x;
-                            velocities[i][2] += delta_z;
-                            source_require(std::isfinite(velocities[i][0]) && std::abs(velocities[i][0]) <= 1000 &&
-                                std::isfinite(velocities[i][2]) && std::abs(velocities[i][2]) <= 1000,
-                                "Skitch board push produced an invalid body velocity.");
-                            body_write(bodies.parts[i] + 0x70, velocities[i]);
-                            body_write(bodies.parts[i] + 0x60, flags[i] | 8u);
-                        }
+                    const float delta_x = wanted_x - hips_velocity[0];
+                    const float delta_z = wanted_z - hips_velocity[2];
+                    if (std::hypot(delta_x, delta_z) >= 0.02f) {
+                        hips_velocity[0] += delta_x;
+                        hips_velocity[2] += delta_z;
+                        source_require(std::isfinite(hips_velocity[0]) && std::abs(hips_velocity[0]) <= 1000 &&
+                            std::isfinite(hips_velocity[2]) && std::abs(hips_velocity[2]) <= 1000,
+                            "Skitch ragdoll root push produced an invalid velocity.");
+                        hips_flags |= 8u;
+                        (void)copy_to(hips + 0x70, hips_velocity.data(), sizeof(hips_velocity));
+                        (void)copy_to(hips + 0x60, &hips_flags, sizeof(hips_flags));
                         player_skitch::note_physics_step();
                         if (player_skitch::drag_state_probing()) {
                             static std::atomic<std::uint64_t> last{};
@@ -246,8 +238,8 @@ void noclip_apply_velocity(std::uintptr_t core) noexcept {
                             auto previous = last.load(std::memory_order_relaxed);
                             if (now - previous >= 250 && last.compare_exchange_strong(previous, now))
                                 logging::log(logging::Level::info, logging::Channel::runtime,
-                                    "Skitch drag: board ({:.1f},{:.1f}) -> target ({:.1f},{:.1f}) goal ({:.1f},{:.1f})",
-                                    board_position[0], board_position[2], target_x, target_z,
+                                    "Skitch drag: root body 0x{:x} ({:.2f} m) delta ({:.2f},{:.2f}) goal ({:.1f},{:.1f})",
+                                    hips, best, delta_x, delta_z,
                                     skitch->plan.root_goal[0], skitch->plan.root_goal[2]);
                         }
                     }
