@@ -176,46 +176,12 @@ void noclip_apply_velocity(std::uintptr_t core) noexcept {
                 reader.verify();
             } else if (bodies.seconds > 0) {
                 if (drag) {
-                    // The skater's physics core is the master: a bus moves it and
-                    // the entity, the camera and the ragdoll all follow. Ease its
-                    // world position toward the follow slot -- the same effect an
-                    // impact has -- while the skeleton's limb bodies drift with
-                    // it. The root rig bodies are left alone: writing them makes
-                    // the ragdoll re-derive from the animation and cancels the
-                    // whole push.
-                    std::array<float, 3> core_position{};
-                    source_require(memory::peek(bodies.core + 0x1d0, core_position),
-                        "Skitch core position unreadable.");
-                    source_require(std::isfinite(core_position[0]) && std::isfinite(core_position[2]) &&
-                        std::abs(core_position[0]) <= 100000.f && std::abs(core_position[2]) <= 100000.f,
-                        "Skitch core position is invalid.");
-                    float step_x = skitch->plan.root_goal[0] - core_position[0];
-                    float step_z = skitch->plan.root_goal[2] - core_position[2];
-                    const float core_distance = std::hypot(step_x, step_z);
-                    constexpr float max_core_step = 0.35f; // metres per physics step
-                    if (core_distance > max_core_step) {
-                        step_x *= max_core_step / core_distance;
-                        step_z *= max_core_step / core_distance;
-                    }
-                    if (std::hypot(step_x, step_z) >= 0.005f) {
-                        const auto core_from = core_position;
-                        core_position[0] += step_x;
-                        core_position[2] += step_z;
-                        source_require(copy_to(bodies.core + 0x1d0, core_position.data(), sizeof(core_position)),
-                            "Skitch core write failed.");
-                        player_skitch::note_physics_step();
-                        static std::atomic<std::uint64_t> core_log{};
-                        const auto now = GetTickCount64();
-                        auto previous = core_log.load(std::memory_order_relaxed);
-                        if (player_skitch::drag_state_probing() && now - previous >= 250 &&
-                            core_log.compare_exchange_strong(previous, now))
-                            logging::log(logging::Level::info, logging::Channel::runtime,
-                                "Skitch drag: core ({:.1f},{:.1f},{:.1f}) -> ({:.1f},{:.1f},{:.1f}) goal ({:.1f},{:.1f},{:.1f})",
-                                core_from[0], core_from[1], core_from[2],
-                                core_position[0], core_position[1], core_position[2],
-                                skitch->plan.root_goal[0], skitch->plan.root_goal[1], skitch->plan.root_goal[2]);
-                    }
-                    // The skeleton's limb bodies drift with the core.
+                    // The three rig bodies the riding parts list omits (24..26):
+                    // the bus proves they are simulated, and one of them anchors
+                    // the ragdoll root, so push them toward the follow slot and
+                    // let the simulation carry the context -- and the camera --
+                    // with them. The limbs are left alone: writing the root
+                    // alongside them cancels the whole push.
                     const float dx = skitch->plan.root_goal[0] - bodies.root[0];
                     const float dz = skitch->plan.root_goal[2] - bodies.root[2];
                     const float distance = std::hypot(dx, dz);
@@ -226,11 +192,16 @@ void noclip_apply_velocity(std::uintptr_t core) noexcept {
                         wanted_x = dx / distance * speed;
                         wanted_z = dz / distance * speed;
                     }
+                    source_require(bodies.rig_parts != 0 && bodies.rig_physics != 0,
+                        "Skitch skeleton bodies are unavailable.");
                     std::array<float, 3> mean{};
                     std::size_t count = 0;
-                    for (std::size_t i = 9; i < bodies.parts.size(); ++i) {
+                    for (std::size_t j = 24; j <= 26; ++j) {
+                        const auto body = bodies.rig_parts + j * 0x130;
+                        std::uintptr_t owner{};
                         std::array<float, 3> velocity{};
-                        if (!memory::peek(bodies.parts[i] + 0x70, velocity)) continue;
+                        if (!memory::peek(body + 0x10, owner) || owner != bodies.rig_physics) continue;
+                        if (!memory::peek(body + 0x70, velocity)) continue;
                         for (std::size_t axis = 0; axis < 3; ++axis) mean[axis] += velocity[axis];
                         ++count;
                     }
@@ -239,18 +210,20 @@ void noclip_apply_velocity(std::uintptr_t core) noexcept {
                     const float delta_x = wanted_x - mean[0];
                     const float delta_z = wanted_z - mean[2];
                     if (std::hypot(delta_x, delta_z) >= 0.02f) {
-                        for (std::size_t i = 9; i < bodies.parts.size(); ++i) {
+                        for (std::size_t j = 24; j <= 26; ++j) {
+                            const auto body = bodies.rig_parts + j * 0x130;
+                            std::uintptr_t owner{};
                             std::array<float, 3> velocity{};
                             std::uint32_t flags{};
-                            if (!memory::peek(bodies.parts[i] + 0x70, velocity) ||
-                                !memory::peek(bodies.parts[i] + 0x60, flags)) continue;
+                            if (!memory::peek(body + 0x10, owner) || owner != bodies.rig_physics) continue;
+                            if (!memory::peek(body + 0x70, velocity) || !memory::peek(body + 0x60, flags)) continue;
                             velocity[0] += delta_x;
                             velocity[2] += delta_z;
                             if (!std::isfinite(velocity[0]) || std::abs(velocity[0]) > 1000 ||
                                 !std::isfinite(velocity[2]) || std::abs(velocity[2]) > 1000) continue;
                             flags |= 8u;
-                            (void)copy_to(bodies.parts[i] + 0x70, velocity.data(), sizeof(velocity));
-                            (void)copy_to(bodies.parts[i] + 0x60, &flags, sizeof(flags));
+                            (void)copy_to(body + 0x70, velocity.data(), sizeof(velocity));
+                            (void)copy_to(body + 0x60, &flags, sizeof(flags));
                         }
                         player_skitch::note_physics_step();
                     }

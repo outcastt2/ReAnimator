@@ -81,69 +81,32 @@ void motion_log(std::uintptr_t member, const std::array<float, 3>& from,
         "Drag state MOTION: member=0x{:x} target ({:.1f},{:.1f},{:.1f}) -> ({:.1f},{:.1f},{:.1f}) goal ({:.1f},{:.1f},{:.1f})",
         member, from[0], from[1], from[2], to[0], to[1], to[2], goal[0], goal[1], goal[2]);
 }
-// Called from the velocity dispatcher hook. The update publishes state+0x30 to
-// machine+0xd30 (the engine's own placement channel for a bailed skater), and
-// the motion wrapper integrates the state's velocity right after this hook, so
-// both writes land inside the engine's own chain: ease the placement toward the
-// follow slot and keep the velocity pointed at it.
+// Called from the velocity dispatcher hook, read-only: logs the placement the
+// engine is about to publish (state+0x30 -> machine+0xd30) so the drag can be
+// read off against the goal. The placement is re-anchored from the animation
+// every update, so writes there are discarded; the simulation is the master.
 void drag_state_velocity(std::uintptr_t state, std::uintptr_t machine, std::uintptr_t velocity_out) noexcept {
+    (void)velocity_out;
     auto& s = shared();
     if (!s.armed.load(std::memory_order_relaxed) || !s.active.load(std::memory_order_relaxed)) return;
     const auto now = GetTickCount64();
     if (now > s.lease_until.load(std::memory_order_relaxed)) return;
+    if (s.probe_until.load(std::memory_order_relaxed) <= now) return;
     const auto core = s.core.load(std::memory_order_relaxed);
-    if (core < 0x10000 || !machine || !velocity_out || !state) return;
+    if (core < 0x10000 || !machine || !state) return;
     std::uintptr_t linked{};
     if (!memory::peek(core + core_machine_offset, linked) || linked != machine) return;
-    std::array<float, 3> goal{};
-    for (std::size_t i = 0; i < 3; ++i) goal[i] = s.goal[i].load(std::memory_order_relaxed);
-    constexpr float max_step = 0.35f;   // metres per update
-    constexpr float max_speed = 2.5f;   // m/s added to the velocity
     std::array<float, 4> placement{};
     if (!memory::peek(state + 0x30, placement)) return;
-    for (std::size_t i = 0; i < 3; ++i)
-        if (!std::isfinite(placement[i]) || std::abs(placement[i]) > 100000.f) return;
-    float step_x = goal[0] - placement[0];
-    float step_z = goal[2] - placement[2];
-    const float distance = std::hypot(step_x, step_z);
-    if (!std::isfinite(distance) || distance > 100.f) return;
-    if (distance > max_step) {
-        step_x *= max_step / distance;
-        step_z *= max_step / distance;
-    }
-    if (std::hypot(step_x, step_z) >= 0.005f) {
-        const auto from = placement;
-        placement[0] += step_x;
-        placement[2] += step_z;
-        if (!write_bytes(state + 0x30, placement.data(), sizeof(float) * 3)) return;
-        s.motion_pulls.fetch_add(1, std::memory_order_relaxed);
-        if (s.probe_until.load(std::memory_order_relaxed) > now) {
-            static std::atomic<std::uint64_t> last{};
-            auto previous = last.load(std::memory_order_relaxed);
-            if (now - previous >= 250 && last.compare_exchange_strong(previous, now))
-                logging::log(logging::Level::info, logging::Channel::runtime,
-                    "Skitch drag: placement ({:.1f},{:.1f},{:.1f}) -> ({:.1f},{:.1f},{:.1f}) goal ({:.1f},{:.1f},{:.1f}) state=0x{:x}",
-                    from[0], from[1], from[2], placement[0], placement[1], placement[2],
-                    goal[0], goal[1], goal[2], state);
-        }
-    }
-    // Keep the velocity the wrapper integrates pointed at the slot too.
-    std::array<float, 3> velocity{};
-    if (!memory::peek(velocity_out, velocity)) return;
-    for (const auto value : velocity)
-        if (!std::isfinite(value) || std::abs(value) > 1000.f) return;
-    float delta[2] = {(goal[0] - placement[0]) * 3.0f, (goal[2] - placement[2]) * 3.0f};
-    const float speed = std::hypot(delta[0], delta[1]);
-    if (!std::isfinite(speed)) return;
-    if (speed > max_speed) {
-        delta[0] *= max_speed / speed;
-        delta[1] *= max_speed / speed;
-    }
-    velocity[0] += delta[0];
-    velocity[2] += delta[1];
-    for (const auto value : velocity)
-        if (!std::isfinite(value) || std::abs(value) > 1000.f) return;
-    (void)write_bytes(velocity_out, velocity.data(), sizeof(float) * 3);
+    if (!std::isfinite(placement[0]) || std::abs(placement[0]) > 100000.f) return;
+    static std::atomic<std::uint64_t> last{};
+    auto previous = last.load(std::memory_order_relaxed);
+    if (now - previous < 250 || !last.compare_exchange_strong(previous, now)) return;
+    std::array<float, 3> goal{};
+    for (std::size_t i = 0; i < 3; ++i) goal[i] = s.goal[i].load(std::memory_order_relaxed);
+    logging::log(logging::Level::info, logging::Channel::runtime,
+        "Skitch drag: state placement ({:.1f},{:.1f},{:.1f}) goal ({:.1f},{:.1f},{:.1f})",
+        placement[0], placement[1], placement[2], goal[0], goal[1], goal[2]);
 }
 using DispatchVelocity = void (*)(std::uintptr_t, std::uintptr_t, std::uintptr_t, std::uintptr_t, std::uintptr_t);
 std::atomic<DispatchVelocity>& dispatch_original() noexcept {
