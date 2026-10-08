@@ -398,10 +398,21 @@ void probe_local_ragdoll_handles(std::uintptr_t base, std::uintptr_t entity) noe
     }
     unsigned ragdoll_objects{}, valid_handles{};
     constexpr std::uintptr_t ragdoll_vtable = 0x6176088; // FBCorePhysicsRagdoll ctor vtable
+    constexpr std::uintptr_t ragdoll_owner_method = 0x00f97280; // lazily creates owner+0x48 ragdoll object
     for (std::uint32_t i = 0; i < count; ++i) {
         std::uintptr_t component{}, vtable{};
         if (!memory::peek(collection + 0x20 + std::uintptr_t{i} * 0x20, component) || component < 0x10000 ||
             !memory::peek(component, vtable)) continue;
+        bool is_ragdoll_owner = false;
+        if (vtable >= 0x10000) {
+            for (std::uintptr_t slot = 0; slot < 0x200; slot += sizeof(std::uintptr_t)) {
+                std::uintptr_t method{};
+                if (memory::peek(vtable + slot, method) && method == base + ragdoll_owner_method) {
+                    is_ragdoll_owner = true;
+                    break;
+                }
+            }
+        }
         std::array<std::uintptr_t, 4> candidates{};
         unsigned candidate_count{};
         if (vtable == base + ragdoll_vtable) candidates[candidate_count++] = component;
@@ -411,13 +422,21 @@ void probe_local_ragdoll_handles(std::uintptr_t base, std::uintptr_t entity) noe
             if (memory::peek(child, child_vtable) && child_vtable == base + ragdoll_vtable)
                 candidates[candidate_count++] = child;
         }
+        if (!candidate_count && is_ragdoll_owner) {
+            std::uintptr_t child_vtable{};
+            if (child >= 0x10000) (void)memory::peek(child, child_vtable);
+            logging::log(logging::Level::info, logging::Channel::runtime,
+                "Skitch solver probe: ragdoll owner component[{}]=0x{:x} table=0x{:x} instance=0x{:x} instance-vtable=0x{:x}",
+                i, component, vtable, child, child_vtable);
+            continue;
+        }
         if (!candidate_count) continue;
         for (unsigned c = 0; c < candidate_count; ++c) {
             const auto object = candidates[c];
             ++ragdoll_objects;
             logging::log(logging::Level::info, logging::Channel::runtime,
-                "Skitch solver probe: FBCorePhysicsRagdoll object=0x{:x} component[{}]=0x{:x} table={} ",
-                object, i, component, c ? "component+0x48" : "component");
+                "Skitch solver probe: FBCorePhysicsRagdoll object=0x{:x} component[{}]=0x{:x} table={} owner-vtable=0x{:x}",
+                object, i, component, c ? "component+0x48" : "component", vtable);
             // The native constructor initializes its embedded PhysicsBodyHandle
             // slots at +0x00..+0x110 and joint handles later in the object. Scan
             // aligned slots read-only and only report handles validated by the
