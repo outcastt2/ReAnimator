@@ -150,7 +150,11 @@ std::optional<TowPlan> TowController::update(WorldKey world,std::uint64_t local_
     const float side=left_hand ? -tow_follow_left : tow_follow_left;
     offset_[0]+=(side-offset_[0])*(1-std::exp(-4.f*steering_dt));
     auto slot=offset_; slot[0]-=.65f*steering_offset_;
-    auto goal=sum(hip,rotate(travel_heading_,slot)); goal[1]=root[1];
+    auto goal=sum(hip,rotate(travel_heading_,slot));
+    // Riding tow leaves vertical placement to the skateboard physics. A
+    // ragdolled tow has no board to carry it down ramps, so inherit the leader's
+    // hip height instead of freezing the bail height at acquisition.
+    goal[1]=ragdoll ? hip[1] : root[1];
     auto heading=travel_heading_;
     // Aim each segment at the player immediately ahead. Position lag naturally
     // delays a corner through the line rather than turning every rider at once.
