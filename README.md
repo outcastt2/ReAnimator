@@ -5,8 +5,7 @@ Complete mod pack with custom animations, skitching, ragdoll drag, and all unloc
 ## Features
 - Custom Animations (poseanim) - Play custom .rska animations
 - Player Skitching - Hold V (rebindable) or LB+RB near another player
-- Ragdoll Drag (dragstate on/off) - Physics-driven drag when bailing while skitching
-- Unlocks - All cosmetics, objects, neighborhoods, preset slots, bus stops unlocked
+- Ragdoll Drag (dragstate on/off) - Physics-driven drag when bailing while skitching (Broken WIP)
 
 ## Installation
 1. Install ReSkate
