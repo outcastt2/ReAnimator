@@ -64,4 +64,14 @@ inline constexpr std::uintptr_t follow_animated_ragdoll_vtable_rva = 0x65e8ed0;
 inline constexpr std::uintptr_t ragdoll_motion_wrapper_rva = 0x477fce0;
 inline constexpr std::array<unsigned char, 16> ragdoll_motion_wrapper_prologue{
     0x48,0x81,0xec,0x88,0x00,0x00,0x00,0x0f,0xb6,0x84,0x24,0x00,0x01,0x00,0x00,0xc5};
+// The velocity dispatcher every ragdoll state update calls right after it
+// recomputes its velocity and right before the motion wrapper integrates it:
+// state = rcx, machine = rdx, and the velocity destination (state+0x10) is the
+// fifth argument. A normal detour forwards it, so a velocity added here is
+// consumed by the engine's own integration -- the one write window the ragdoll
+// motion has.
+inline constexpr std::uintptr_t ragdoll_velocity_dispatch_rva = 0x482cf10;
+inline constexpr std::array<unsigned char, 32> ragdoll_velocity_dispatch_prologue{
+    0x40,0x53,0x48,0x81,0xec,0xe0,0x00,0x00,0x00,0x48,0x8b,0xda,0x4d,0x8b,0xd1,0x48,
+    0x8b,0x52,0x08,0x8b,0x8a,0xc0,0x09,0x00,0x00,0x0f,0xba,0xe1,0x0d,0x0f,0x83,0xa4};
 } // namespace dingosdk::game::build::v20260929::offboard_drag

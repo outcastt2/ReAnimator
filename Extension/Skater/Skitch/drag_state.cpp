@@ -1,6 +1,7 @@
 #include "drag_state.h"
 #include "../no_bail.h"
 #include "Engine/Core/Log/logging.h"
+#include "Engine/Core/Hooks/hooks.h"
 #include "Engine/Core/Platform/memory.h"
 #include "Engine/Game/Build/supported_build.h"
 #include "Engine/Game/Build/addresses.h"
@@ -52,6 +53,21 @@ std::uintptr_t read_context(std::uintptr_t core) noexcept {
     }
     return core + 0x3c0 >= 0x10000 ? core + 0x3c0 : 0;
 }
+bool writable(std::uintptr_t address, std::size_t size) noexcept {
+    MEMORY_BASIC_INFORMATION page{};
+    if (!VirtualQuery(reinterpret_cast<const void*>(address), &page, sizeof(page)) ||
+        page.State != MEM_COMMIT || (page.Protect & (PAGE_GUARD | PAGE_NOACCESS)) ||
+        !(page.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)))
+        return false;
+    const auto base = reinterpret_cast<std::uintptr_t>(page.BaseAddress);
+    return address >= base && address - base <= page.RegionSize - size;
+}
+bool write_bytes(std::uintptr_t address, const void* source, std::size_t size) noexcept {
+    if (!writable(address, size)) return false;
+    SIZE_T written{};
+    return WriteProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(address), source, size, &written) &&
+           written == size;
+}
 // Rate-limited motion log, only while the probe runs.
 void motion_log(std::uintptr_t member, const std::array<float, 3>& from,
     const std::array<float, 3>& to, const std::array<float, 3>& goal) noexcept {
@@ -64,6 +80,68 @@ void motion_log(std::uintptr_t member, const std::array<float, 3>& from,
     logging::log(logging::Level::info, logging::Channel::runtime,
         "Drag state MOTION: member=0x{:x} target ({:.1f},{:.1f},{:.1f}) -> ({:.1f},{:.1f},{:.1f}) goal ({:.1f},{:.1f},{:.1f})",
         member, from[0], from[1], from[2], to[0], to[1], to[2], goal[0], goal[1], goal[2]);
+}
+// Called from the velocity dispatcher hook: the engine has just recomputed the
+// active state's velocity and the motion wrapper integrates it next, so adding
+// the drag velocity here is the one write the engine's own integration
+// consumes. The state's position comes from the context's ragdoll root (7a0).
+void drag_state_velocity(std::uintptr_t machine, std::uintptr_t velocity_out) noexcept {
+    auto& s = shared();
+    if (!s.armed.load(std::memory_order_relaxed) || !s.active.load(std::memory_order_relaxed)) return;
+    const auto now = GetTickCount64();
+    if (now > s.lease_until.load(std::memory_order_relaxed)) return;
+    const auto core = s.core.load(std::memory_order_relaxed);
+    if (core < 0x10000 || !machine || !velocity_out) return;
+    std::uintptr_t linked{};
+    if (!memory::peek(core + core_machine_offset, linked) || linked != machine) return;
+    std::uintptr_t context{};
+    if (!memory::peek(machine + machine_context_offset, context) || context < 0x10000) return;
+    std::array<float, 4> position{};
+    std::array<float, 3> velocity{};
+    if (!memory::peek(context + 0x7a0, position) || !memory::peek(velocity_out, velocity)) return;
+    for (std::size_t i = 0; i < 3; ++i)
+        if (!std::isfinite(position[i]) || std::abs(position[i]) > 100000.f) return;
+    for (const auto value : velocity)
+        if (!std::isfinite(value) || std::abs(value) > 1000.f) return;
+    std::array<float, 3> goal{};
+    for (std::size_t i = 0; i < 3; ++i) goal[i] = s.goal[i].load(std::memory_order_relaxed);
+    constexpr float gain = 3.0f;       // spring, 1/s
+    constexpr float max_speed = 2.5f;  // m/s
+    float delta[2] = {(goal[0] - position[0]) * gain, (goal[2] - position[2]) * gain};
+    const float speed = std::hypot(delta[0], delta[1]);
+    if (!std::isfinite(speed)) return;
+    if (speed > max_speed) {
+        delta[0] *= max_speed / speed;
+        delta[1] *= max_speed / speed;
+    }
+    velocity[0] += delta[0];
+    velocity[2] += delta[1];
+    for (const auto value : velocity)
+        if (!std::isfinite(value) || std::abs(value) > 1000.f) return;
+    if (!write_bytes(velocity_out, velocity.data(), sizeof(float) * 3)) return;
+    s.motion_pulls.fetch_add(1, std::memory_order_relaxed);
+    if (s.probe_until.load(std::memory_order_relaxed) > now) {
+        static std::atomic<std::uint64_t> last{};
+        auto previous = last.load(std::memory_order_relaxed);
+        if (now - previous >= 250 && last.compare_exchange_strong(previous, now))
+            logging::log(logging::Level::info, logging::Channel::runtime,
+                "Skitch drag: velocity ({:.2f},{:.2f},{:.2f}) += ({:.2f},0.00,{:.2f}) at ({:.1f},{:.1f},{:.1f})",
+                velocity[0] - delta[0], velocity[1], velocity[2] - delta[1],
+                delta[0], delta[1], position[0], position[1], position[2]);
+    }
+}
+using DispatchVelocity = void (*)(std::uintptr_t, std::uintptr_t, std::uintptr_t, std::uintptr_t, std::uintptr_t);
+std::atomic<DispatchVelocity>& dispatch_original() noexcept {
+    static std::atomic<DispatchVelocity> value{};
+    return value;
+}
+// The dispatcher detour: run the engine's own recompute, then add the drag to
+// the velocity the motion wrapper integrates next.
+void dispatch_velocity_hook(std::uintptr_t state, std::uintptr_t machine, std::uintptr_t block1,
+    std::uintptr_t block2, std::uintptr_t velocity_out) {
+    const auto original = dispatch_original().load(std::memory_order_acquire);
+    if (original) original(state, machine, block1, block2, velocity_out);
+    drag_state_velocity(machine, velocity_out);
 }
 void probe_line(const char* tag) noexcept {
     auto& s = shared();
@@ -267,6 +345,25 @@ bool start_drag_state(std::uintptr_t base) noexcept {
                 logging::write(logging::Level::warning, logging::Channel::skater,
                     "Drag state is unavailable: a ragdoll substate contract did not match.");
                 return false;
+            }
+        }
+        // Hook the ragdoll velocity dispatcher: the one window where a velocity
+        // write is consumed by the engine's own position integration.
+        {
+            std::array<unsigned char, 32> bytes{};
+            if (memory::read(base + ragdoll_velocity_dispatch_rva, bytes) &&
+                bytes == ragdoll_velocity_dispatch_prologue) {
+                auto* target = reinterpret_cast<void*>(base + ragdoll_velocity_dispatch_rva);
+                void* original{};
+                if (hook_prepare(target, reinterpret_cast<void*>(&dispatch_velocity_hook), &original) == HookOk &&
+                    original) {
+                    dispatch_original().store(reinterpret_cast<DispatchVelocity>(original),
+                        std::memory_order_release);
+                    if (hook_enable(target) == HookOk)
+                        logging::write(logging::Level::info, logging::Channel::skater,
+                            "Drag state: the ragdoll velocity window is hooked; the engine's own integration "
+                            "carries the drag.");
+                }
             }
         }
         s.base.store(base, std::memory_order_release);
