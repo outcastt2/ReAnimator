@@ -1,6 +1,6 @@
 ﻿# ReAnimator - Merged (Animation + Skitch)
 
-Custom animations and player skitching combined. No ragdoll drag or unlocks.
+Custom animations and player skitching combined.
 
 ## Features
 - Custom Animations (poseanim) - Play custom .rska animations
