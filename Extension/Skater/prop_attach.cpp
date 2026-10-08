@@ -1331,7 +1331,7 @@ void ragdoll_bools_dump(Ptr base) {
             continue;
         }
         ragdoll_report_target(name, asset);
-        ragdoll_byte_dump(asset, 0x80, name);
+        ragdoll_byte_dump(asset, 0x100, name);
     }
     set_status("Ragdoll: the named bool images are in the log.");
 }
@@ -1346,7 +1346,9 @@ std::vector<Ptr> ragdoll_reference_spots(Ptr base, Ptr client, bool log) {
     if (!resolve_local(base, client, local)) return spots;
     std::vector<std::pair<std::string, Ptr>> targets;
     bool faulted{};
-    if (const auto config = ragdoll_config_asset(base, faulted)) {
+    const auto config = ragdoll_config_asset(base, faulted);
+    if (config) {
+        targets.push_back({"skatercorephysicsragdollconfig", config});
         for (const auto &field : ragdoll_fields) {
             const auto target = pointer(config + field.offset);
             if (target) targets.push_back({field.name, target});
@@ -1356,10 +1358,17 @@ std::vector<Ptr> ragdoll_reference_spots(Ptr base, Ptr client, bool log) {
         const auto asset = ragdoll_lookup_bool(base, name, faulted);
         if (asset) targets.push_back({name, asset});
     }
-    const std::array<std::pair<const char *, Ptr>, 4> regions{{
+    // The animation instance, the physics core, the offboard machine and the
+    // wipeout context: the ragdoll config is read by the physics side, so the
+    // resolved values can live beside a reference in any of them.
+    const auto core = local.component ? pointer(local.component + 0x70) : 0;
+    const auto machine = core ? pointer(core + 0x3b0) : 0;
+    const auto context = machine ? pointer(machine + 8) : 0;
+    const std::array<std::pair<const char *, Ptr>, 7> regions{{
         {"anim", local.component}, {"holder", local.holder},
-        {"rig", local.rig}, {"definition", local.definition}}};
-    const std::array<std::size_t, 4> sizes{{0x200, 0x400, 0x4000, 0x200}};
+        {"rig", local.rig}, {"definition", local.definition},
+        {"core", core}, {"machine", machine}, {"context", context}}};
+    const std::array<std::size_t, 7> sizes{{0x200, 0x400, 0x4000, 0x200, 0x2000, 0xe00, 0x2000}};
     for (std::size_t r = 0; r < regions.size(); ++r) {
         const auto address = regions[r].second;
         if (!address) continue;
