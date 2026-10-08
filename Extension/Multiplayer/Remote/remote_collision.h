@@ -24,7 +24,7 @@ void update_remote_collision(std::uintptr_t base, std::uintptr_t context, const 
 // than a cached velocity write, applies the contact impulse to the skater.
 void update_skitch_collision_pusher(std::uintptr_t base, std::uintptr_t context,
     const std::array<float, 3> &root, const std::array<float, 3> &goal, bool active,
-    bool diagnostic, std::uint64_t now_us) noexcept;
+    int hand_side, bool diagnostic, std::uint64_t now_us) noexcept;
 // Client thread, for the current PeerScope slot: the player's skater is gone. Its capsules stop
 // colliding and wait, still allocated, for the slot's next player.
 void clear_remote_collision(std::uintptr_t base) noexcept;

@@ -108,6 +108,8 @@ struct TetherPusher {
     std::uintptr_t world{}, context{};
     Part part;
     float phase{};
+    std::array<float, 3> last_root{};
+    bool have_root{};
     std::uint64_t last_at{}, logged_at{};
 };
 TetherPusher& tether_pusher() { static TetherPusher value; return value; }
@@ -281,7 +283,7 @@ void update_remote_collision(std::uintptr_t base, std::uintptr_t context, const 
 
 void update_skitch_collision_pusher(std::uintptr_t base, std::uintptr_t context,
     const std::array<float, 3> &root, const std::array<float, 3> &goal, bool active,
-    bool diagnostic, std::uint64_t now) noexcept {
+    int hand_side, bool diagnostic, std::uint64_t now) noexcept {
     auto &p = tether_pusher();
     try {
         active = active && enabled.load(std::memory_order_relaxed);
@@ -300,6 +302,7 @@ void update_skitch_collision_pusher(std::uintptr_t base, std::uintptr_t context,
             switch_off(n, p.part);
             p.phase = 0;
             p.last_at = 0;
+            p.have_root = false;
             return;
         }
         for (const auto value : root)
@@ -307,43 +310,71 @@ void update_skitch_collision_pusher(std::uintptr_t base, std::uintptr_t context,
         for (const auto value : goal)
             if (!std::isfinite(value) || std::abs(value) > 100000.f) return;
         if (!p.part.created) {
-            // Match the retail remote-character proxy's collision masks, but
-            // make it a compact invisible ram instead of a full skater capsule.
-            alignas(16) const float a[4]{0.f, 0.15f, 0.f, 0.f};
-            alignas(16) const float b[4]{0.f, 0.75f, 0.f, 0.f};
-            if (!create_part(n, world, p.part, a, b, 0.24f)) return;
+            // Match retail's proxy collision masks, but use a compact capsule
+            // near upper-body/arm height rather than a torso-sized ram.
+            alignas(16) const float a[4]{0.f, 0.f, 0.f, 0.f};
+            alignas(16) const float b[4]{0.f, 0.30f, 0.f, 0.f};
+            if (!create_part(n, world, p.part, a, b, 0.16f)) return;
         }
         const float dx = goal[0] - root[0], dz = goal[2] - root[2];
         const float distance = std::hypot(dx, dz);
-        if (!std::isfinite(distance) || distance < 0.1f || distance > 24.f) {
+        if (!std::isfinite(distance) || distance < 0.18f || distance > 24.f) {
             switch_off(n, p.part);
             p.phase = 0;
             p.last_at = 0;
+            p.have_root = false;
             return;
         }
         const float dir_x = dx / distance, dir_z = dz / distance;
+        float dt = 1.f / 60.f;
+        if (p.last_at && now > p.last_at)
+            dt = std::min(0.1f, static_cast<float>(now - p.last_at) * 1e-6f);
+        float root_speed_toward = 0.f;
+        if (p.have_root && dt > 1e-4f) {
+            const float root_vx = (root[0] - p.last_root[0]) / dt;
+            const float root_vz = (root[2] - p.last_root[2]) / dt;
+            root_speed_toward = root_vx * dir_x + root_vz * dir_z;
+            if (!std::isfinite(root_speed_toward)) root_speed_toward = 0.f;
+        }
+        // A damped contact speed: reduce pressure as the root closes on the
+        // slot or is already moving toward it. This keeps the pusher from
+        // flinging the whole body past the attached player.
+        constexpr float tether_gain = 1.0f;
+        constexpr float damping = 0.8f;
+        constexpr float max_speed = 1.4f;
+        const float sweep_speed = std::clamp(distance * tether_gain - root_speed_toward * damping,
+            0.25f, max_speed);
         if (!p.part.solid) {
-            // Start just behind the ragdoll. Repeated passes create a real
-            // solver contact; the capsule has no renderer and no visible model.
+            // Start just behind and to the reaching side. A short, slow feed
+            // makes a solver contact without the old full-body hammer stroke.
             p.phase = 0.f;
             p.last_at = now;
         } else if (p.last_at && now > p.last_at) {
-            const float dt = std::min(0.1f, static_cast<float>(now - p.last_at) * 1e-6f);
-            p.phase += 5.f * dt;
-            if (p.phase > 1.55f) p.phase = 0.f;
+            p.phase += sweep_speed * dt;
+            if (p.phase > 0.36f) {
+                p.phase = 0.f;
+                // Reset to the start of the next short push without creating a
+                // high-speed reverse velocity for the keyframed body.
+                p.part.last_at = 0;
+            }
         }
         p.last_at = now;
+        p.last_root = root;
+        p.have_root = true;
+        const float side = hand_side == 1 ? 1.f : hand_side == 0 ? -1.f : 0.f;
+        const float perp_x = dir_z * side * 0.24f;
+        const float perp_z = -dir_x * side * 0.24f;
         const std::array<float, 3> pusher_position{
-            root[0] - dir_x * 1.05f + dir_x * p.phase,
-            root[1],
-            root[2] - dir_z * 1.05f + dir_z * p.phase};
+            root[0] - dir_x * 0.78f + dir_x * p.phase + perp_x,
+            root[1] + 0.48f,
+            root[2] - dir_z * 0.78f + dir_z * p.phase + perp_z};
         move_part(n, p.part, pusher_position, {0.f, 0.f, 0.f, 1.f}, now);
         if (diagnostic && now - p.logged_at >= 500000) {
             p.logged_at = now;
             logging::log(logging::Level::info, logging::Channel::runtime,
-                "Skitch collision pusher: root=({:.1f},{:.1f},{:.1f}) pusher=({:.1f},{:.1f},{:.1f}) phase={:.2f} slot=({:.1f},{:.1f},{:.1f})",
+                "Skitch collision tether: root=({:.1f},{:.1f},{:.1f}) pusher=({:.1f},{:.1f},{:.1f}) phase={:.2f} speed={:.2f} side={} slot=({:.1f},{:.1f},{:.1f})",
                 root[0], root[1], root[2], pusher_position[0], pusher_position[1], pusher_position[2],
-                p.phase, goal[0], goal[1], goal[2]);
+                p.phase, sweep_speed, hand_side, goal[0], goal[1], goal[2]);
         }
     } catch (...) {}
 }

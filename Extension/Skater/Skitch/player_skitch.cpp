@@ -290,7 +290,7 @@ void tick(std::uintptr_t base,std::uintptr_t client,const multiplayer::NativeFra
         }
         multiplayer::update_skitch_collision_pusher(base,bodies.context,pusher_root,
             plan && plan->ragdoll ? plan->root_goal : pusher_root,pusher_active,
-            drag_state_probing(),now); // this tick's clock is microseconds, as remote_collision expects
+            s.hand_side.load(std::memory_order_relaxed),drag_state_probing(),now);
         // The native drag state owns the bail motion when armed: publish the
         // tether follow slot for the engine's own placement channel and let the
         // lease lapse on release, so the native motion resumes without a snap.
