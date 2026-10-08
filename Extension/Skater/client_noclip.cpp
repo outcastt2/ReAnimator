@@ -174,78 +174,48 @@ void noclip_apply_velocity(std::uintptr_t core) noexcept {
                 reader.verify();
             } else if (bodies.seconds > 0) {
                 if (drag) {
-                    // The wipeout rides a fourth embedded state of the same
-                    // motion object the walking flight uses (state vtables near
-                    // 0x65e8c20..0x65e8ed0), and its velocity accumulator is the
-                    // state's +0x10 -- the same field sync_offboard_flight_velocity
-                    // writes for walking. Match the target velocity there and the
-                    // state integrates it: physics, camera and all.
-                    const auto motion = reader.pointer(bodies.core, 0x3b0);
-                    const auto active = motion ? reader.pointer(motion, 0x48) : 0;
-                    source_require(active != 0, "Skitch motion state is unavailable.");
-                    const auto vtable = reader.pointer(active);
-                    source_require(vtable >= state.trial.base + 0x65e8c00 && vtable < state.trial.base + 0x65e9100,
-                        "Skitch motion state is not a flight state.");
-                    // Both wipeout states carry the world position at +0xe0 (the
-                    // air state leaves +0x30 zeroed) and the velocity at +0x10,
-                    // the field the walking flight sync writes. The correction is
-                    // measured against the state's own position, never the pose.
-                    std::array<float, 3> velocity{}, position{};
-                    source_require(reader.raw(active + 0x10, velocity.data(), sizeof(velocity)),
-                        "Skitch motion velocity unreadable.");
-                    source_require(reader.raw(active + 0xe0, position.data(), sizeof(position)),
-                        "Skitch motion position unreadable.");
+                    // The bailed body's own physics bodies are simulated -- a
+                    // bus can punt them -- so drag them the way the riding
+                    // velocity boost drives the board: add a translational delta
+                    // to every skeleton body's velocity and set the dirty flag.
+                    // The engine's own simulation then carries the whole ragdoll
+                    // -- camera, collisions and all -- toward the follow slot,
+                    // while each body keeps its own flailing.
+                    const float dx = skitch->plan.root_goal[0] - bodies.root[0];
+                    const float dz = skitch->plan.root_goal[2] - bodies.root[2];
+                    const float distance = std::hypot(dx, dz);
+                    constexpr float max_drag_speed = 2.5f;
+                    float wanted_x = 0, wanted_z = 0;
+                    if (distance > 0.1f) {
+                        const float speed = std::min(max_drag_speed, distance * 3.0f);
+                        wanted_x = dx / distance * speed;
+                        wanted_z = dz / distance * speed;
+                    }
+                    std::array<std::array<float, 3>, 32> velocities{};
+                    std::array<std::uint32_t, 32> flags{};
+                    std::array<float, 3> mean{};
+                    std::size_t count = 0;
+                    for (std::size_t i = 9; i < bodies.parts.size(); ++i) {
+                        velocities[i] = reader.value<std::array<float, 3>>(bodies.parts[i], 0x70);
+                        flags[i] = reader.value<std::uint32_t>(bodies.parts[i], 0x60);
+                        for (std::size_t axis = 0; axis < 3; ++axis) mean[axis] += velocities[i][axis];
+                        ++count;
+                    }
+                    source_require(count != 0, "Skitch skeleton bodies are unavailable.");
+                    for (auto &value : mean) value /= static_cast<float>(count);
                     reader.verify();
-                    const auto delta =
-                        skateskitch::tow_velocity_delta(position, velocity, skitch->plan, bodies.seconds);
-                    static unsigned drag_rejects{};
-                    if (!delta.has_value()) {
-                        // A transient bad sample (a state switch, a teleport
-                        // frame) must not drop the grip: skip the step.
-                        if (drag_rejects < 3) {
-                            ++drag_rejects;
-                            logging::log(logging::Level::warning, logging::Channel::runtime,
-                                "Player skitch: drag step rejected: pos=({:.2f},{:.2f},{:.2f}) "
-                                "vel=({:.2f},{:.2f},{:.2f}) goal=({:.2f},{:.2f},{:.2f}) dt={:.4f}",
-                                position[0], position[1], position[2], velocity[0], velocity[1], velocity[2],
-                                skitch->plan.root_goal[0], skitch->plan.root_goal[1], skitch->plan.root_goal[2],
-                                bodies.seconds);
+                    const float delta_x = wanted_x - mean[0];
+                    const float delta_z = wanted_z - mean[2];
+                    if (std::hypot(delta_x, delta_z) >= 0.02f) {
+                        for (std::size_t i = 9; i < bodies.parts.size(); ++i) {
+                            velocities[i][0] += delta_x;
+                            velocities[i][2] += delta_z;
+                            source_require(std::isfinite(velocities[i][0]) && std::abs(velocities[i][0]) <= 1000 &&
+                                std::isfinite(velocities[i][2]) && std::abs(velocities[i][2]) <= 1000,
+                                "Skitch drag produced an invalid body velocity.");
+                            body_write(bodies.parts[i] + 0x70, velocities[i]);
+                            body_write(bodies.parts[i] + 0x60, flags[i] | 8u);
                         }
-                    } else {
-                        drag_rejects = 0;
-                        velocity[0] += (*delta)[0];
-                        velocity[2] += (*delta)[2];
-                        // The game places the wipeout from its motion state's own
-                        // position, so translate those fields toward the follow
-                        // slot: a bounded step each frame (the same offset applied
-                        // to both, so whatever +0x30 and +0xe0 encode stays
-                        // consistent), with the velocity accumulator matched too.
-                        float step[2] = { skitch->plan.root_goal[0] - position[0],
-                                          skitch->plan.root_goal[2] - position[2] };
-                        const float distance = std::hypot(step[0], step[1]);
-                        constexpr float max_drag_step = 0.35f; // metres per physics step
-                        if (distance > max_drag_step) {
-                            step[0] *= max_drag_step / distance;
-                            step[1] *= max_drag_step / distance;
-                        }
-                        std::array<float, 3> ground{};
-                        const bool ground_has_position =
-                            reader.raw(active + 0x30, ground.data(), sizeof(ground)) &&
-                            (ground[0] != 0.0f || ground[2] != 0.0f);
-                        ground[0] += step[0];
-                        ground[2] += step[1];
-                        position[0] += step[0];
-                        position[2] += step[1];
-                        reader.verify();
-                        bool moved = copy_to(active + 0xe0, position.data(), sizeof(position));
-                        // The air state leaves +0x30 zeroed; only translate it
-                        // when it holds a real position.
-                        if (ground_has_position)
-                            moved = copy_to(active + 0x30, ground.data(), sizeof(ground)) && moved;
-                        std::array<float, 3> written{};
-                        source_require(moved && copy_to(active + 0x10, velocity.data(), sizeof(velocity)) &&
-                            memory::peek_bytes(active + 0x10, written.data(), sizeof(written)) && written == velocity,
-                            "Skitch motion write failed.");
                         player_skitch::note_physics_step();
                     }
                 } else {

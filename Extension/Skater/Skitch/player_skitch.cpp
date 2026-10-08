@@ -367,11 +367,10 @@ void animation_evaluated(std::uintptr_t component) noexcept {
         const auto holder=reader.pointer(component,0xa0);
         const auto pose=multiplayer::read_native_pose_layout(first_person_read,r->base,holder,512);
         if(!pose.buffer || pose.count!=395) { state().hand_detail.store("pose unavailable"); return; }
-        // The render-pose placement and the entity root are both eased to the
-        // follow slot while a ragdoll plan is held, so the body and the camera
-        // move together; the native motion pull (dragstate) runs alongside and
-        // fades back to the game's own placement on release.
-        drag_placement(r->base,component,r->plan.ragdoll,&r->plan.root_goal);
+        // The drag now pushes the ragdoll's own physics bodies from the physics
+        // hook, so the render-pose placement stays out of the way: with the
+        // bodies driven by the engine, the pose and the camera follow natively.
+        drag_placement(r->base,component,false,&r->plan.root_goal);
         std::array<skateskitch::Joint,395> joints;
         for(const auto i : {0u,1u,7u,42u,43u,44u,45u,46u,47u,48u,49u,50u,275u,276u,277u,278u,283u}) {
             std::array<float,12> bone{};
