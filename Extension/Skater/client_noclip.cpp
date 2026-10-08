@@ -73,6 +73,47 @@ bool native_body_velocity(std::uintptr_t base, std::uintptr_t body,
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
+bool safe_native_body_valid(const PhysicsHandle* handle) noexcept {
+    const auto& api = skater_physics_api();
+    if (!api.ready || !api.valid) return false;
+    __try { return api.valid(handle); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+void log_native_body_handles(std::uintptr_t base, std::uintptr_t body) noexcept {
+    if (!player_skitch::drag_state_probing() || !resolve_skater_physics_api(base)) return;
+    static std::atomic<std::uintptr_t> scanned_body{};
+    auto previous = scanned_body.load(std::memory_order_relaxed);
+    if (previous == body || !scanned_body.compare_exchange_strong(previous, body)) return;
+    unsigned inline_handles = 0, pointed_handles = 0;
+    for (std::uintptr_t offset = 0; offset + sizeof(PhysicsHandle) <= 0x130; offset += 8) {
+        PhysicsHandle candidate{};
+        if (memory::peek(body + offset, candidate) && candidate.world && candidate.index != 0xffffffffu &&
+            safe_native_body_valid(&candidate)) {
+            ++inline_handles;
+            logging::log(logging::Level::info, logging::Channel::runtime,
+                "Skitch native handle: inline body+0x{:x} world=0x{:x} index={} generation={}",
+                offset, candidate.world, candidate.index, candidate.generation);
+        }
+        std::uintptr_t pointer{};
+        if (!memory::peek(body + offset, pointer) || pointer < 0x10000) continue;
+        if (!memory::peek(pointer, candidate) || !candidate.world || candidate.index == 0xffffffffu ||
+            !safe_native_body_valid(&candidate)) continue;
+        ++pointed_handles;
+        logging::log(logging::Level::info, logging::Channel::runtime,
+            "Skitch native handle: pointer body+0x{:x} -> 0x{:x}, world=0x{:x} index={} generation={}",
+            offset, pointer, candidate.world, candidate.index, candidate.generation);
+    }
+    std::array<std::uint8_t, 0x50> bytes{};
+    if (memory::peek_bytes(body, bytes.data(), bytes.size())) {
+        std::string text;
+        for (const auto byte : bytes) text += std::format("{:02x} ", byte);
+        logging::log(logging::Level::info, logging::Channel::runtime,
+            "Skitch native handle: root record 0x{:x} first 0x50: {}", body, text);
+    }
+    logging::log(logging::Level::info, logging::Channel::runtime,
+        "Skitch native handle: scan complete body=0x{:x} inline={} pointed={}",
+        body, inline_handles, pointed_handles);
+}
 // Physics bodies already verified writable (a VirtualQuery each), so the
 // every-frame and every-simulation-step body reads below skip that system call.
 // A body at a new address, and every body once a second, is checked again.
@@ -276,6 +317,7 @@ void noclip_apply_velocity(std::uintptr_t core) noexcept {
                     }
                     std::array<float, 3> desired{wanted_x, hips_velocity[1], wanted_z};
                     reader.verify();
+                    log_native_body_handles(state.trial.base, hips);
                     PhysicsHandle handle{};
                     const bool applied = native_body_velocity(state.trial.base, hips, desired, &handle);
                     static std::atomic<std::uint64_t> last{};
