@@ -1,6 +1,6 @@
 ﻿# ReAnimator - Main Testing
 
-Complete mod pack with custom animations, skitching, ragdoll drag, and all unlocks enabled.
+Custom Animations and Skitching in one pack. This is for testing and will have unfinished features. Please use the Merged Branch if you want AIO mod.
 
 ## Features
 - Custom Animations (poseanim) - Play custom .rska animations
