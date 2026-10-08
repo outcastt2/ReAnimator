@@ -8,6 +8,7 @@
 #include "Engine/Game/Build/20260929/engine.h"
 #include "Engine/Game/Build/20260929/no_bail.h"
 #include "Engine/Game/Build/20260929/offboard_flight.h"
+#include "Engine/Game/Build/20260929/remote_collision.h"
 #include "Engine/Game/Build/20260929/skater_entities.h"
 #include "free_flight.h"
 #include "Skitch/player_skitch.h"
@@ -17,6 +18,61 @@
 namespace dingosdk::client_source::detail {
 namespace {
 namespace entities = addr::skater_entities;
+using PhysicsBodyValid = bool (*)(const void*);
+using PhysicsSetVector = void (*)(void*, const float*);
+using PhysicsTouch = void (*)(void*);
+struct PhysicsHandle {
+    std::uintptr_t world{};
+    std::uint32_t index{0xffffffff}, generation{};
+};
+static_assert(sizeof(PhysicsHandle) == 16);
+struct SkaterPhysicsApi {
+    PhysicsBodyValid valid{};
+    PhysicsSetVector set_velocity{};
+    PhysicsTouch wake{};
+    bool ready{};
+};
+SkaterPhysicsApi& skater_physics_api() {
+    static SkaterPhysicsApi value;
+    return value;
+}
+std::once_flag& skater_physics_api_once() {
+    static std::once_flag value;
+    return value;
+}
+bool resolve_skater_physics_api(std::uintptr_t base) noexcept {
+    auto& api = skater_physics_api();
+    try {
+        std::call_once(skater_physics_api_once(), [&] {
+            using namespace addr::remote_collision;
+            std::array<unsigned char, 32> valid_bytes{}, velocity_bytes{}, wake_bytes{};
+            if (!memory::read(base + body_valid.rva, valid_bytes) || valid_bytes != body_valid.bytes ||
+                !memory::read(base + set_linear_velocity.rva, velocity_bytes) ||
+                velocity_bytes != set_linear_velocity.bytes ||
+                !memory::read(base + wake_body.rva, wake_bytes) || wake_bytes != wake_body.bytes) return;
+            api.valid = reinterpret_cast<PhysicsBodyValid>(base + body_valid.rva);
+            api.set_velocity = reinterpret_cast<PhysicsSetVector>(base + set_linear_velocity.rva);
+            api.wake = reinterpret_cast<PhysicsTouch>(base + wake_body.rva);
+            api.ready = true;
+        });
+    } catch (...) { return false; }
+    return api.ready;
+}
+bool native_body_velocity(std::uintptr_t base, std::uintptr_t body,
+    const std::array<float, 3>& velocity, PhysicsHandle* observed = nullptr) noexcept {
+    if (!resolve_skater_physics_api(base)) return false;
+    PhysicsHandle handle{};
+    if (!memory::peek(body, handle) || !handle.world || handle.index == 0xffffffffu) return false;
+    if (observed) *observed = handle;
+    const auto& api = skater_physics_api();
+    alignas(16) const float value[4]{velocity[0], velocity[1], velocity[2], 0.f};
+    __try {
+        if (!api.valid(&handle)) return false;
+        api.set_velocity(&handle, value);
+        api.wake(&handle);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
 // Physics bodies already verified writable (a VirtualQuery each), so the
 // every-frame and every-simulation-step body reads below skip that system call.
 // A body at a new address, and every body once a second, is checked again.
@@ -192,7 +248,6 @@ void noclip_apply_velocity(std::uintptr_t core) noexcept {
                     std::uintptr_t hips{};
                     float best = 3.0f;
                     std::array<float, 3> hips_velocity{};
-                    std::uint32_t hips_flags{};
                     for (std::size_t j = 1; j <= 26; ++j) {
                         const auto body = bodies.rig_parts + j * 0x130;
                         std::uintptr_t owner{};
@@ -206,7 +261,6 @@ void noclip_apply_velocity(std::uintptr_t core) noexcept {
                         best = d;
                         hips = body;
                         hips_velocity = velocity;
-                        (void)memory::peek(body + 0x60, hips_flags);
                     }
                     source_require(hips != 0, "Skitch ragdoll root body not found.");
                     const float dx = skitch->plan.root_goal[0] - root[0];
@@ -220,29 +274,22 @@ void noclip_apply_velocity(std::uintptr_t core) noexcept {
                         wanted_x = dx / distance * speed;
                         wanted_z = dz / distance * speed;
                     }
-                    const float delta_x = wanted_x - hips_velocity[0];
-                    const float delta_z = wanted_z - hips_velocity[2];
-                    if (std::hypot(delta_x, delta_z) >= 0.02f) {
-                        hips_velocity[0] += delta_x;
-                        hips_velocity[2] += delta_z;
-                        source_require(std::isfinite(hips_velocity[0]) && std::abs(hips_velocity[0]) <= 1000 &&
-                            std::isfinite(hips_velocity[2]) && std::abs(hips_velocity[2]) <= 1000,
-                            "Skitch ragdoll root push produced an invalid velocity.");
-                        hips_flags |= 8u;
-                        (void)copy_to(hips + 0x70, hips_velocity.data(), sizeof(hips_velocity));
-                        (void)copy_to(hips + 0x60, &hips_flags, sizeof(hips_flags));
-                        player_skitch::note_physics_step();
-                        if (player_skitch::drag_state_probing()) {
-                            static std::atomic<std::uint64_t> last{};
-                            const auto now = GetTickCount64();
-                            auto previous = last.load(std::memory_order_relaxed);
-                            if (now - previous >= 250 && last.compare_exchange_strong(previous, now))
-                                logging::log(logging::Level::info, logging::Channel::runtime,
-                                    "Skitch drag: root body 0x{:x} ({:.2f} m) delta ({:.2f},{:.2f}) goal ({:.1f},{:.1f})",
-                                    hips, best, delta_x, delta_z,
-                                    skitch->plan.root_goal[0], skitch->plan.root_goal[2]);
-                        }
+                    std::array<float, 3> desired{wanted_x, hips_velocity[1], wanted_z};
+                    reader.verify();
+                    PhysicsHandle handle{};
+                    const bool applied = native_body_velocity(state.trial.base, hips, desired, &handle);
+                    static std::atomic<std::uint64_t> last{};
+                    const auto now = GetTickCount64();
+                    auto previous = last.load(std::memory_order_relaxed);
+                    if (player_skitch::drag_state_probing() && now - previous >= 250 &&
+                        last.compare_exchange_strong(previous, now)) {
+                        logging::log(logging::Level::info, logging::Channel::runtime,
+                            "Skitch native impulse: body=0x{:x} world=0x{:x} index={} generation={} valid_api={} applied={} near_root={:.2f} v=({:.2f},{:.2f},{:.2f})",
+                            hips, handle.world, handle.index, handle.generation,
+                            resolve_skater_physics_api(state.trial.base) ? 1 : 0, applied ? 1 : 0,
+                            best, desired[0], desired[1], desired[2]);
                     }
+                    if (applied) player_skitch::note_physics_step();
                 } else {
                     const auto current = reader.value<std::array<float,3>>(bodies.parts[0], 0x70);
                     const auto delta = skateskitch::tow_velocity_delta(bodies.root, current, skitch->plan, bodies.seconds);
