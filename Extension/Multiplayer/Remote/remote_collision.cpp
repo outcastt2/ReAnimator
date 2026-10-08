@@ -380,6 +380,68 @@ void update_skitch_collision_pusher(std::uintptr_t base, std::uintptr_t context,
     } catch (...) {}
 }
 
+void probe_local_ragdoll_handles(std::uintptr_t base, std::uintptr_t entity) noexcept {
+    static std::atomic<std::uintptr_t> scanned_entity{};
+    if (!entity || !resolve(base)) return;
+    const auto &n = natives();
+    const auto world = current_world(n);
+    if (!world) return;
+    auto previous = scanned_entity.load(std::memory_order_relaxed);
+    if (previous == entity || !scanned_entity.compare_exchange_strong(previous, entity)) return;
+    std::uintptr_t collection{};
+    std::uint8_t count{};
+    if (!memory::peek(entity + 0x70, collection) || collection < 0x10000 ||
+        !memory::peek(collection + 8, count) || count > 64) {
+        logging::log(logging::Level::info, logging::Channel::runtime,
+            "Skitch solver probe: local component collection unavailable.");
+        return;
+    }
+    unsigned ragdoll_objects{}, valid_handles{};
+    constexpr std::uintptr_t ragdoll_vtable = 0x6176088; // FBCorePhysicsRagdoll ctor vtable
+    for (std::uint32_t i = 0; i < count; ++i) {
+        std::uintptr_t component{}, vtable{};
+        if (!memory::peek(collection + 0x20 + std::uintptr_t{i} * 0x20, component) || component < 0x10000 ||
+            !memory::peek(component, vtable)) continue;
+        std::array<std::uintptr_t, 4> candidates{};
+        unsigned candidate_count{};
+        if (vtable == base + ragdoll_vtable) candidates[candidate_count++] = component;
+        std::uintptr_t child{};
+        if (memory::peek(component + 0x48, child) && child >= 0x10000) {
+            std::uintptr_t child_vtable{};
+            if (memory::peek(child, child_vtable) && child_vtable == base + ragdoll_vtable)
+                candidates[candidate_count++] = child;
+        }
+        if (!candidate_count) continue;
+        for (unsigned c = 0; c < candidate_count; ++c) {
+            const auto object = candidates[c];
+            ++ragdoll_objects;
+            logging::log(logging::Level::info, logging::Channel::runtime,
+                "Skitch solver probe: FBCorePhysicsRagdoll object=0x{:x} component[{}]=0x{:x} table={} ",
+                object, i, component, c ? "component+0x48" : "component");
+            // The native constructor initializes its embedded PhysicsBodyHandle
+            // slots at +0x00..+0x110 and joint handles later in the object. Scan
+            // aligned slots read-only and only report handles validated by the
+            // current FBPhysicsWorld.
+            for (std::uintptr_t offset = 0; offset + sizeof(Handle) <= 0x370; offset += 0x10) {
+                Handle handle{};
+                if (!memory::peek(object + offset, handle) || handle.world != world ||
+                    handle.index == 0xffffffffu) continue;
+                bool valid{};
+                __try { valid = n.body_valid(&handle); }
+                __except (EXCEPTION_EXECUTE_HANDLER) { valid = false; }
+                if (!valid) continue;
+                ++valid_handles;
+                logging::log(logging::Level::info, logging::Channel::runtime,
+                    "Skitch solver probe: body handle +0x{:03x} world=0x{:x} index={} generation={}",
+                    offset, handle.world, handle.index, handle.generation);
+            }
+        }
+    }
+    logging::log(logging::Level::info, logging::Channel::runtime,
+        "Skitch solver probe: scanned {} component(s), found {} FBCorePhysicsRagdoll object(s), {} valid body/joint handles.",
+        count, ragdoll_objects, valid_handles);
+}
+
 void clear_remote_collision(std::uintptr_t base) noexcept {
     auto &s = slots().current();
     if ((!s.skater.solid && !s.board.solid) || !resolve(base)) return;

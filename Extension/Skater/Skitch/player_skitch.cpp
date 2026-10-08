@@ -280,6 +280,8 @@ void tick(std::uintptr_t base,std::uintptr_t client,const multiplayer::NativeFra
         }
         const bool player_collision=multiplayer::local_allows_player_collision(base,local.entity);
         const bool pusher_active=plan && plan->ragdoll && player_collision;
+        if(plan && plan->ragdoll && drag_state_probing())
+            multiplayer::probe_local_ragdoll_handles(base,local.entity);
         if(plan && plan->ragdoll && !player_collision && drag_state_probing()) {
             static std::atomic<std::uint64_t> last_collision_warning{};
             const auto warning_now=GetTickCount64();

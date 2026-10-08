@@ -25,6 +25,9 @@ void update_remote_collision(std::uintptr_t base, std::uintptr_t context, const 
 void update_skitch_collision_pusher(std::uintptr_t base, std::uintptr_t context,
     const std::array<float, 3> &root, const std::array<float, 3> &goal, bool active,
     int hand_side, bool diagnostic, std::uint64_t now_us) noexcept;
+// Read-only one-shot probe: find the simulated-ragdoll component and report
+// any valid FBPhysics body handles it owns (including the handle slot offsets).
+void probe_local_ragdoll_handles(std::uintptr_t base, std::uintptr_t entity) noexcept;
 // Client thread, for the current PeerScope slot: the player's skater is gone. Its capsules stop
 // colliding and wait, still allocated, for the slot's next player.
 void clear_remote_collision(std::uintptr_t base) noexcept;
