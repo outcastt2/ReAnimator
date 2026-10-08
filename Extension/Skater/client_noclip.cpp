@@ -176,19 +176,20 @@ void noclip_apply_velocity(std::uintptr_t core) noexcept {
                 reader.verify();
             } else if (bodies.seconds > 0) {
                 if (drag) {
-                    // The three rig bodies the riding parts list omits (24..26):
-                    // the bus proves they are simulated, and one of them anchors
-                    // the ragdoll root, so push them toward the follow slot and
-                    // let the simulation carry the context -- and the camera --
-                    // with them. The limbs are left alone: writing the root
-                    // alongside them cancels the whole push.
+                    // Muscle-driven ragdoll: a gentle velocity push is absorbed
+                    // by the pose muscles, which is why every soft attempt was
+                    // re-anchored. A bus overwhelms them with a hard impulse and
+                    // the whole ragdoll -- root included -- goes with it, because
+                    // the evaluation reads the bodies. So push every rig body at
+                    // bus strength and let the simulation carry the ragdoll.
                     const float dx = skitch->plan.root_goal[0] - bodies.root[0];
                     const float dz = skitch->plan.root_goal[2] - bodies.root[2];
                     const float distance = std::hypot(dx, dz);
-                    constexpr float max_drag_speed = 2.5f;
+                    constexpr float drag_gain = 6.0f;      // 1/s
+                    constexpr float max_drag_speed = 9.0f; // m/s, bus strength
                     float wanted_x = 0, wanted_z = 0;
-                    if (distance > 0.1f) {
-                        const float speed = std::min(max_drag_speed, distance * 3.0f);
+                    if (distance > 0.05f) {
+                        const float speed = std::min(max_drag_speed, distance * drag_gain);
                         wanted_x = dx / distance * speed;
                         wanted_z = dz / distance * speed;
                     }
@@ -196,7 +197,7 @@ void noclip_apply_velocity(std::uintptr_t core) noexcept {
                         "Skitch skeleton bodies are unavailable.");
                     std::array<float, 3> mean{};
                     std::size_t count = 0;
-                    for (std::size_t j = 24; j <= 26; ++j) {
+                    for (std::size_t j = 1; j <= 26; ++j) {
                         const auto body = bodies.rig_parts + j * 0x130;
                         std::uintptr_t owner{};
                         std::array<float, 3> velocity{};
@@ -209,8 +210,8 @@ void noclip_apply_velocity(std::uintptr_t core) noexcept {
                     for (auto &value : mean) value /= static_cast<float>(count);
                     const float delta_x = wanted_x - mean[0];
                     const float delta_z = wanted_z - mean[2];
-                    if (std::hypot(delta_x, delta_z) >= 0.02f) {
-                        for (std::size_t j = 24; j <= 26; ++j) {
+                    if (std::hypot(delta_x, delta_z) >= 0.05f) {
+                        for (std::size_t j = 1; j <= 26; ++j) {
                             const auto body = bodies.rig_parts + j * 0x130;
                             std::uintptr_t owner{};
                             std::array<float, 3> velocity{};
@@ -226,6 +227,15 @@ void noclip_apply_velocity(std::uintptr_t core) noexcept {
                             (void)copy_to(body + 0x60, &flags, sizeof(flags));
                         }
                         player_skitch::note_physics_step();
+                        if (player_skitch::drag_state_probing()) {
+                            static std::atomic<std::uint64_t> last{};
+                            const auto now = GetTickCount64();
+                            auto previous = last.load(std::memory_order_relaxed);
+                            if (now - previous >= 250 && last.compare_exchange_strong(previous, now))
+                                logging::log(logging::Level::info, logging::Channel::runtime,
+                                    "Skitch drag: ragdoll push ({:.1f},{:.1f}) delta ({:.1f},{:.1f}) bodies {}",
+                                    wanted_x, wanted_z, delta_x, delta_z, count);
+                        }
                     }
                 } else {
                     const auto current = reader.value<std::array<float,3>>(bodies.parts[0], 0x70);
