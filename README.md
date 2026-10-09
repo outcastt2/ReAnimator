@@ -1,4 +1,4 @@
-﻿# ReAnimator - Animation
+# ReAnimator - Animation
 
 Custom animation playback for your skater. No skitching, ragdoll drag, or unlocks.
 
