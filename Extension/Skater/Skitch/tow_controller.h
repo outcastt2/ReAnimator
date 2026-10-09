@@ -24,6 +24,21 @@ struct TowCandidate {
     RemoteSample sample;
     std::array<float,4> heading{0,0,0,1};
 };
+// Why the last acquisition attempt saw what it saw: one count per eligibility
+// predicate across every candidate offered on the press, plus the nearest hip,
+// so a press that finds nobody explains itself in the log.
+struct TowDiag {
+    std::uint32_t n{};            // candidates offered on the press
+    std::uint32_t fresh{};        // sample arrived inside the 250 ms window
+    std::uint32_t future{};       // arrival timestamp ahead of the local clock
+    std::uint32_t world{};        // same world/session as the local rider
+    std::uint32_t identity{};     // epoch and generation both present
+    std::uint32_t hip{};          // hip position finite
+    std::uint32_t yaw{};          // heading resolves to a yaw
+    float nearest{-1.f};          // metres to the closest offered hip; -1 = none
+    std::uint64_t age_min_us{};   // sample age window across the offered set
+    std::uint64_t age_max_us{};
+};
 struct TowPlan {
     PlayerKey player;
     Vec3 root_goal{}, target_velocity{}, hand_goal{};
@@ -43,8 +58,13 @@ public:
     void release(std::string_view reason) noexcept;
     bool attached() const noexcept { return attached_; }
     std::string_view status() const noexcept { return status_; }
+    // Diagnostics of the last acquisition press (see TowDiag) and whether it
+    // ended on the no-candidate release.
+    const TowDiag& diag() const noexcept { return diag_; }
+    bool no_candidate() const noexcept { return no_candidate_; }
 private:
-    bool attached_{}, previous_held_{}, needs_release_{};
+    bool attached_{}, previous_held_{}, needs_release_{}, no_candidate_{};
+    TowDiag diag_{};
     WorldKey world_{};
     PlayerKey target_{};
     float steering_offset_{};

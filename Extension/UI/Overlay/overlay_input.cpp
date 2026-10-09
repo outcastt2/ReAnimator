@@ -412,6 +412,20 @@ extern "C" void DingoSDKOverlayReadSkitchInput(bool* active, bool* held, float* 
         (sample.device && (sample.pad.wButtons & (XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER)) ==
             (XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER));
 }
+// Which gate bit suppressed the skitch input (1 window, 2 stop, 4 failed,
+// 8 interactive menu, 16 foreground). Read by the runtime's skitch input
+// diagnostics so a press that reads nothing can say which gate closed.
+extern "C" unsigned DingoSDKOverlaySkitchInputFlags() {
+    const auto& s = state();
+    const HWND window = s.window.load();
+    unsigned flags = 0;
+    if (window) flags |= 1u;
+    if (s.stop.load()) flags |= 2u;
+    if (s.failed.load()) flags |= 4u;
+    if (interactive_visible(s)) flags |= 8u;
+    if (window && game_window_foreground(window)) flags |= 16u;
+    return flags;
+}
 extern "C" void DingoSDKOverlayReadControllerInput(dingosdk::ControllerInput* output, bool allow_menu) {
     if (!output) return;
     struct PreserveError { DWORD value = GetLastError(); ~PreserveError() { SetLastError(value); } } preserve_error;

@@ -523,6 +523,12 @@ void render(Session &s, std::uintptr_t client, const NativeFrame &local, std::ui
                              nearest_distance(p, local, view) <= s.player_distance * (p.visible ? 1.15f : 1.f);
         }
     }
+    // Skitch candidate funnel: counted per frame, printed once per hotkey press
+    // (player_skitch::press_serial) so one held press explains at which stage
+    // nearby players were dropped before reaching the tow controller.
+    unsigned sk_shown{}, sk_visible{}, sk_anchor_fail{}, sk_spot_fail{}, sk_ready_fail{}, sk_echo_fail{};
+    unsigned sk_hidden{}, sk_show_fail{}, sk_spawn_wait{}, sk_wait{}, sk_not_shown{};
+    static std::uint64_t skitch_press_logged{};
     each_active_peer(s, [&](Peer &p) {
         // A dedicated server has no skater to show.
         if (!p.member.id || (dedicated_host(s) && p.member.id == s.host_id))
@@ -554,10 +560,13 @@ void render(Session &s, std::uintptr_t client, const NativeFrame &local, std::ui
             if (sampled) p.placed = true;
             const bool spawning = sampled && p.shown_wanted && p.appearance.value() && !was_visible && !remote_skater_entity();
             if (spawning && now < p.next_spawn) {
+                ++sk_spawn_wait;
                 p.native_status = "Waiting to show the player again.";
             } else if (spawning && native_pass) {
+                ++sk_spawn_wait;
                 p.native_status = "Waiting for another player's skater to finish spawning.";
             } else if ((sampled || held) && p.shown_wanted && p.appearance.value()) {
+                ++sk_shown;
                 if (spawning) {
                     native_pass = true;
                     p.applied_cosmetics = 0; // the new actor wears no recipe yet
@@ -584,6 +593,7 @@ void render(Session &s, std::uintptr_t client, const NativeFrame &local, std::ui
                                         now);
                 if (p.visible && hidden) {
                     // Keeps the actor and its cosmetics; no sound, nametag or spectate position.
+                    ++sk_hidden;
                     stop_remote_audio();
                     p.presented_audio.reset();
                     if (p.ui_visible) {
@@ -593,10 +603,18 @@ void render(Session &s, std::uintptr_t client, const NativeFrame &local, std::ui
                     }
                     apply_cosmetics(p, spawning);
                 } else if (p.visible) {
-                    if (const auto target = skateskitch::remote_sample(p.render_pose,
+                    ++sk_visible;
+                    const bool sk_ready = p.handshaken && p.world_ready;
+                    const bool sk_relocated = hidden || spot.has_value();
+                    const bool sk_echo = s.mode == Mode::echo;
+                    if (!sk_ready) ++sk_ready_fail;
+                    else if (sk_relocated) ++sk_spot_fail;
+                    else if (sk_echo) ++sk_echo_fail;
+                    else if (const auto target = skateskitch::remote_sample(p.render_pose,
                         {p.member.id,p.member.epoch,remote_skater_generation()}, skitch_world,
-                        p.pose_arrival,p.visible,p.handshaken && p.world_ready,hidden || spot.has_value(),s.mode==Mode::echo))
+                        p.pose_arrival,p.visible,sk_ready,sk_relocated,sk_echo))
                         skitch_candidates.push_back({*target,p.render_pose.root.rotation});
+                    else ++sk_anchor_fail;
                     present_audio(p);
                     apply_cosmetics(p, spawning);
                     // The spectate camera follows this every frame; the map and
@@ -611,8 +629,10 @@ void render(Session &s, std::uintptr_t client, const NativeFrame &local, std::ui
                 } else {
                     p.render_failed = true;
                     remove_remote(s.base);
+                    ++sk_show_fail;
                 }
             } else {
+                if (p.shown_wanted) ++sk_wait; else ++sk_not_shown;
                 if (was_visible) {
                     remove_remote(s.base);
                     p.next_spawn = now + 3000000;
@@ -639,6 +659,18 @@ void render(Session &s, std::uintptr_t client, const NativeFrame &local, std::ui
             }
         }
     });
+    // One funnel line per skitch press: which stage dropped the nearby players.
+    {
+        const auto skitch_press = player_skitch::press_serial();
+        if (skitch_press != skitch_press_logged) {
+            skitch_press_logged = skitch_press;
+            if (skitch_press)
+                logging::log(logging::Level::info, logging::Channel::runtime,
+                    "Skitch candidates: shown={} visible={} offered={} anchor_fail={} spot_fail={} ready_fail={} echo_fail={} hidden={} show_fail={} spawn_wait={} waiting={} not_shown={}",
+                    sk_shown, sk_visible, skitch_candidates.size(), sk_anchor_fail, sk_spot_fail, sk_ready_fail,
+                    sk_echo_fail, sk_hidden, sk_show_fail, sk_spawn_wait, sk_wait, sk_not_shown);
+        }
+    }
     player_skitch::tick(s.base,client,local,skitch_world,s.transport.status().local_id,now,skitch_candidates);
     // The local player's own lines, above their own skater, when asked for.
     if (labels && bubbles && s.chat_bubbles_own && local.ready) {
