@@ -1,10 +1,9 @@
 # ReAnimator - Animation
 
-Custom animation playback for your skater. No skitching, ragdoll drag, or unlocks.
+Custom animation playback for your skater. No skitching.
 
 ## Features
 - poseanim commands for playing, recording, and loading .rska animations
-- Pose layer masking (auto/full/legs) and tracing
 
 ## Installation
 1. Install ReSkate
