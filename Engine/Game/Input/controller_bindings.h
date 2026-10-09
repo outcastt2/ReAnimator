@@ -10,6 +10,9 @@ inline constexpr std::uint32_t controller_button_mask = 0x3f3ff;
 inline constexpr bool valid_controller_combo(std::uint32_t value) noexcept {
     return (value & ~controller_button_mask) == 0;
 }
+// Skitch's controller default is R1 (RB on Xbox pads): the value a profile
+// that never saved a binding reports. An explicit 0 in the profile clears it.
+inline constexpr std::uint32_t default_skitch_combo = 0x200;
 // Button names shown to the player. Bindings are always stored as XInput bits.
 enum class ControllerStyle : std::uint8_t { xbox, dualshock4, dualsense };
 struct ControllerInput {
@@ -25,6 +28,7 @@ struct ControllerBindingsModel {
     std::uint32_t noclip_combo{};
     std::uint32_t forward_velocity_combo{};
     std::uint32_t up_velocity_combo{};
+    std::uint32_t skitch_combo{default_skitch_combo}; // held while towing; zero disables controller Skitch
     std::uint32_t skitch_key{'V'}; // virtual-key code; zero disables keyboard Skitch
     std::string status;
 };

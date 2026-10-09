@@ -71,6 +71,7 @@ void Store::Update::encode(Json& patch) {
         (void)profile::forward_velocity_binding(value);
         (void)profile::up_velocity_binding(value);
         (void)profile::skitch_key_binding(value);
+        (void)profile::skitch_combo_binding(value);
         remove("player_settings", [](const Json& row) { return row[0] != "options"; });
         auto residual = value.settings;
         const auto flatten = [&](auto&& self, Json& node, const std::string& scope) -> void {

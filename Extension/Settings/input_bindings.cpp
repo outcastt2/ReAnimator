@@ -60,4 +60,19 @@ std::uint32_t skitch_key_binding(const Snapshot& s) {
     return static_cast<std::uint32_t>(key);
 }
 
+std::uint32_t skitch_combo_binding(const Snapshot& s) {
+    // R1 until a profile says otherwise; an explicit 0 clears the binding.
+    const auto bindings = s.settings.find("bindings");
+    if (bindings == s.settings.end()) return default_skitch_combo;
+    require(bindings->is_object(), "Bindings must be an object");
+    const auto value = bindings->find("skitch_combo");
+    if (value == bindings->end()) return default_skitch_combo;
+    require(value->is_number_unsigned() || (value->is_number_integer() && value->get<std::int64_t>() >= 0),
+        "Skitch binding must be a nonnegative integer");
+    const auto mask = value->get<std::uint64_t>();
+    require(mask <= controller_button_mask && valid_controller_combo(static_cast<std::uint32_t>(mask)),
+        "Unsupported controller buttons in Skitch binding");
+    return static_cast<std::uint32_t>(mask);
+}
+
 }

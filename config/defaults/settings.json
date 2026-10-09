@@ -1,6 +1,7 @@
 {
   "bindings": {
-    "noclip": 0
+    "noclip": 0,
+    "skitch_combo": 512
   },
   "graphics": {
     "film_grain": null,

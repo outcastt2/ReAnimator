@@ -73,7 +73,8 @@ void binds_page(SkateMenu& menu, const Model& model, const CallbacksV3& callback
     const auto save = [&](int action, std::uint32_t combo) {
         std::array<char, 512> result{};
         const auto command = std::string("bind ") +
-            (action == 1 ? "noclip " : action == 2 ? "forwardvelocity " : "upvelocity ") + std::to_string(combo);
+            (action == 1 ? "noclip " : action == 2 ? "forwardvelocity " : action == 3 ? "upvelocity " : "skitch ") +
+            std::to_string(combo);
         const bool queued = callbacks.queue_console_command(callbacks.user, command.c_str(), result.data(), result.size());
         result.back() = '\0';
         feedback(menu, result[0] ? result.data() : queued ? "Saving binding..." : "Could not queue binding.");
@@ -124,11 +125,12 @@ void binds_page(SkateMenu& menu, const Model& model, const CallbacksV3& callback
         row(1, "Noclip", model.bindings.noclip_combo);
         row(2, "Forward Boost", model.bindings.forward_velocity_combo);
         row(3, "Up Boost", model.bindings.up_velocity_combo);
+        row(4, "Skitch", model.bindings.skitch_combo);
         ImGui::EndTable();
     }
-    // The keyboard Skitch key sits immediately below the controller boost
-    // bindings. LB+RB remains as a controller alternative; this changes only
-    // the keyboard key (default V).
+    // The keyboard Skitch key sits immediately below the controller binds
+    // (its own controller combo is the Skitch row above). Either input works;
+    // this changes only the keyboard key (default V).
     field(menu, "Skitch keyboard key");
     const auto skitch_key_label = menu.recording_skitch_key ? std::string("Press a key...") :
         model.bindings.skitch_key ? dingosdk::launcher::key_name(model.bindings.skitch_key) : std::string("Not bound");
@@ -181,7 +183,7 @@ void binds_page(SkateMenu& menu, const Model& model, const CallbacksV3& callback
              "Hold the buttons you want together, then release them to save.");
     } else {
         note(("Record a button or combo, such as " + controller_combo_label(0x300, controller.style) +
-              ". Noclip toggles; Forward Boost and Up Boost add their velocity once per press. Use a different combo for each.").c_str());
+              ". Noclip toggles; Forward Boost and Up Boost add their velocity once per press; Skitch is held while towing. Use a different combo for each.").c_str());
         note("Saved to your profile.");
         if (!model.bindings.status.empty()) note(model.bindings.status.c_str());
         if (!model.bindings.available) warn("Waiting for the local profile.");

@@ -148,6 +148,7 @@ static Json profile_json(const Snapshot& s) {
     (void)forward_velocity_binding(s);
     (void)up_velocity_binding(s);
     (void)skitch_key_binding(s);
+    (void)skitch_combo_binding(s);
     (void)news_feed(s);
     (void)rip_score(s);
     (void)location_travel_enabled(s.extensions);

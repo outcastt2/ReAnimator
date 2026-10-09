@@ -17,6 +17,8 @@ extern "C" void DingoSDKOverlayReadSkitchInput(bool*, bool*, float*);
 // Overlay gate bits for the skitch input (window, stop, failed, interactive
 // menu, foreground), so a press that reads nothing can still say why.
 extern "C" unsigned DingoSDKOverlaySkitchInputFlags();
+// Last input observation: bit0 pad connected, bit1 bound combo held.
+extern "C" unsigned DingoSDKOverlaySkitchComboState();
 namespace dingosdk::player_skitch {
 using namespace client_source::detail;
 namespace {
@@ -45,12 +47,12 @@ struct State {
     std::uintptr_t owner{};
     std::uint64_t next_report{};
     bool ragdoll_active{};
-    std::string detail = "Hold V or LB+RB near a player";
+    std::string detail = "Hold V or R1 near a player";
     // Press diagnostics: one line per input-state change while a key is down,
     // one per attempt reason, and press_serial (a rising edge of the physical
     // input) so the session can print its candidate funnel once per press.
     std::string last_attempt;
-    std::uint32_t press_pack{}, bound_key{~0u};
+    std::uint32_t press_pack{}, bound_key{~0u}, bound_combo{~0u};
     bool press_edge_last{};
     std::atomic<std::uint64_t> press_serial{};
 };
@@ -231,31 +233,34 @@ void tick(std::uintptr_t base,std::uintptr_t client,const multiplayer::NativeFra
     auto& native=source_state();
     auto& s=state();
     std::lock_guard lock(s.mutex);
-    // Input diagnostics: the bound key is logged when it changes, every press
-    // edge bumps press_serial (the session prints its candidate funnel once per
-    // press), and every input-state change while the input is down gets a line,
-    // so a press that does nothing still explains itself in the log.
+    // Input diagnostics: the bound key and controller combo are logged when
+    // they change, every press edge bumps press_serial (the session prints
+    // its candidate funnel once per press), and every input-state change
+    // while the input is down gets a line, so a press that does nothing
+    // still explains itself in the log.
     const auto bound_key=local_profile_skitch_key_binding();
+    const auto bound_combo=local_profile_skitch_combo_binding();
     const bool key_down=bound_key && (GetAsyncKeyState(static_cast<int>(bound_key))&0x8000)!=0;
     const bool press_edge=key_down||held;
     if(press_edge && !s.press_edge_last) s.press_serial.fetch_add(1,std::memory_order_relaxed);
     s.press_edge_last=press_edge;
-    if(bound_key!=s.bound_key) {
-        s.bound_key=bound_key;
+    if(bound_key!=s.bound_key || bound_combo!=s.bound_combo) {
+        s.bound_key=bound_key; s.bound_combo=bound_combo;
         logging::log(logging::Level::info,logging::Channel::runtime,
-            "Player skitch input: keyboard key={} ('{}') enabled={} overlay_active={}",
+            "Player skitch input: keyboard key={} ('{}') controller_combo=0x{:x} enabled={} overlay_active={}",
             bound_key, bound_key>=32&&bound_key<127?static_cast<char>(bound_key):'?',
-            s.on.load(), input_active);
+            bound_combo, s.on.load(), input_active);
     }
     const unsigned overlay_flags=DingoSDKOverlaySkitchInputFlags();
+    const unsigned pad_combo=DingoSDKOverlaySkitchComboState();
     const std::uint32_t press_pack=(key_down?1u:0u)|(held?2u:0u)|(input_active?4u:0u)|(in_menu?8u:0u)|
-        ((overlay_flags&0xffu)<<4);
+        ((overlay_flags&0xffu)<<4)|((pad_combo&3u)<<12);
     if(press_edge) {
         if(press_pack!=s.press_pack) {
             s.press_pack=press_pack;
             logging::log(logging::Level::info,logging::Channel::runtime,
-                "Player skitch press: down={} held={} active={} in_menu={} overlay=0x{:02x} [bit0 window, bit1 stop, bit2 failed, bit3 interactive, bit4 foreground]",
-                key_down, held, input_active, in_menu, overlay_flags);
+                "Player skitch press: down={} held={} pad={} combo_held={} active={} in_menu={} overlay=0x{:02x} [bit0 window, bit1 stop, bit2 failed, bit3 interactive, bit4 foreground]",
+                key_down, held, (pad_combo&1u)!=0, (pad_combo&2u)!=0, input_active, in_menu, overlay_flags);
         }
     } else s.press_pack=0;
     if(s.pending && GetTickCount64()>=s.pending->expires) s.tow.release("Input expired; release grab to rearm");

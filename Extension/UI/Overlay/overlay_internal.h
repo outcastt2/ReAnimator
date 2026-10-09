@@ -129,6 +129,10 @@ struct State {
     std::atomic<bool> input_attached{false};
     std::atomic<bool> stop{false};
     std::atomic<HWND> window{nullptr};
+    // Last DingoSDKOverlayReadSkitchInput observation (bit0 pad connected,
+    // bit1 bound combo held): written by the reader, read by the runtime's
+    // one-line-per-press skitch diagnostic.
+    std::atomic<unsigned> skitch_input_state{0};
     struct WindowHook { WNDPROC previous{}; bool installed{}; };
     std::recursive_mutex window_hook_mutex;
     std::map<HWND, WindowHook> window_hooks;

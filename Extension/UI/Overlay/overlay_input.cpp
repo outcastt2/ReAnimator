@@ -401,16 +401,28 @@ extern "C" void DingoSDKOverlayReadSkitchInput(bool* active, bool* held, float* 
     if (!active || !held || !steering) return;
     struct PreserveError { DWORD value = GetLastError(); ~PreserveError() { SetLastError(value); } } preserve;
     *active = false; *held = false; *steering=0;
-    const auto& s = state(); const HWND window = s.window.load();
+    auto& s = state(); const HWND window = s.window.load();
+    s.skitch_input_state.store(0, std::memory_order_relaxed);
     if (!window || s.stop.load() || s.failed.load() || interactive_visible(s) || !game_window_foreground(window)) return;
     OverlayInputAccess access;
     const auto sample = read_controller_sample();
     *active = true;
     if(sample.device) *steering=skateskitch::skitch_steering_axis(static_cast<float>(sample.pad.sThumbLX)/32768.f);
     const auto skitch_key = dingosdk::local_profile_skitch_key_binding();
-    *held = (skitch_key && (GetAsyncKeyState(static_cast<int>(skitch_key)) & 0x8000) != 0) ||
-        (sample.device && (sample.pad.wButtons & (XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER)) ==
-            (XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER));
+    // The bound controller combo (R1 by default, any button or chord once
+    // rebindable) matched the same way the boost bindings see buttons: raw
+    // XInput bits plus the synthetic trigger bits above the dead zone.
+    const auto skitch_combo = dingosdk::local_profile_skitch_combo_binding();
+    const auto& pad = sample.pad;
+    std::uint32_t buttons = pad.wButtons & dingosdk::controller_button_mask;
+    if (pad.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) buttons |= 0x10000;
+    if (pad.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) buttons |= 0x20000;
+    const bool connected = sample.device != 0;
+    const bool combo_down = connected && skitch_combo && (buttons & skitch_combo) == skitch_combo;
+    *held = (skitch_key && (GetAsyncKeyState(static_cast<int>(skitch_key)) & 0x8000) != 0) || combo_down;
+    // Observed for the runtime's press diagnostic: bit0 pad connected,
+    // bit1 the bound combo is fully held right now.
+    s.skitch_input_state.store((connected ? 1u : 0u) | (combo_down ? 2u : 0u), std::memory_order_relaxed);
 }
 // Which gate bit suppressed the skitch input (1 window, 2 stop, 4 failed,
 // 8 interactive menu, 16 foreground). Read by the runtime's skitch input
@@ -425,6 +437,11 @@ extern "C" unsigned DingoSDKOverlaySkitchInputFlags() {
     if (interactive_visible(s)) flags |= 8u;
     if (window && game_window_foreground(window)) flags |= 16u;
     return flags;
+}
+// The last DingoSDKOverlayReadSkitchInput observation, for the press
+// diagnostic: bit0 pad connected, bit1 the bound combo fully held.
+extern "C" unsigned DingoSDKOverlaySkitchComboState() {
+    return state().skitch_input_state.load(std::memory_order_relaxed);
 }
 extern "C" void DingoSDKOverlayReadControllerInput(dingosdk::ControllerInput* output, bool allow_menu) {
     if (!output) return;

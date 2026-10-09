@@ -11,7 +11,7 @@
 #include <string>
 namespace dingosdk::console {
 void register_movement_commands(Commands &registry) {
-    auto skitch = variable("skitch", "Player hip towing: hold V or LB+RB nearby", Group::movement, argument("0|1", Type::boolean));
+    auto skitch = variable("skitch", "Player hip towing: hold V or R1 (both rebindable) nearby", Group::movement, argument("0|1", Type::boolean));
     skitch.inspect = [](const Model&) { return boolean_state(true,player_skitch::enabled(),{},player_skitch::status()); };
     skitch.run = [](const Model&,const Values& args,const Output&) { player_skitch::set_enabled(std::get<bool>(args[0])); };
     skitch.reset = [](const Model&,const Output&) { player_skitch::set_enabled(false); };
@@ -213,11 +213,21 @@ void register_movement_commands(Commands &registry) {
         out(saved ? local_profile_controller_bindings().status : "error: Invalid binding or save failed.");
     };
     registry.add(std::move(up_bind));
+    auto skitch_bind =
+        action("bind skitch", "Bind controller buttons to Skitch; 0 clears the binding (default R1)", Group::movement, {mask});
+    skitch_bind.inspect = [](const Model &m) {
+        return State{m.bindings.available, {}, "Controller bindings are unavailable.", {}, false};
+    };
+    skitch_bind.run = [](const Model &, const Values &args, const Output &out) {
+        const bool saved = set_local_skitch_combo_binding(static_cast<std::uint32_t>(std::get<std::uint64_t>(args[0])));
+        out(saved ? local_profile_controller_bindings().status : "error: Invalid binding or save failed.");
+    };
+    registry.add(std::move(skitch_bind));
     auto skitch_key_argument = argument("virtual_key", Type::unsigned_integer);
     skitch_key_argument.minimum = 0;
     skitch_key_argument.maximum = 255;
     auto skitch_key_bind = action("bind skitchkey",
-        "Bind the keyboard key for player skitching; 0 disables the keyboard key (controller LB+RB remains)",
+        "Bind the keyboard key for player skitching; 0 disables the keyboard key (the controller binding remains)",
         Group::movement, {skitch_key_argument});
     skitch_key_bind.inspect = [](const Model &m) {
         return State{m.bindings.available, {}, "Controller bindings are unavailable.", {}, false};

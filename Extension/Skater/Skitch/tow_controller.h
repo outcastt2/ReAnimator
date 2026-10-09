@@ -75,7 +75,7 @@ private:
     Vec3 last_hip_{};
     std::uint64_t last_seen_us_{};
     bool have_last_{};
-    std::string_view status_ = "Ready: hold V or LB+RB near a player";
+    std::string_view status_ = "Ready: hold V or R1 near a player";
 };
 // Deadzone and normalize left-stick X; does not consume native game input.
 float skitch_steering_axis(float normalized);
