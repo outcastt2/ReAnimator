@@ -243,7 +243,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             }
         }
         const bool capture = owns_pointer();
-        if (capture && is_input(message)) {
+        const bool freecam_capture = s.freecam_controller_active.load(std::memory_order_relaxed);
+        if (freecam_capture) release_game_buttons(window, previous);
+        if ((capture || freecam_capture) && is_input(message)) {
             // Foreground raw-input packets still need DefWindowProc cleanup.
             return message == WM_INPUT ? DefWindowProcW(window, message, wp, lp) : 0;
         }
@@ -392,8 +394,17 @@ dingosdk::overlay::FlightInput read_player_flight_controller() {
     const auto sample = read_controller_sample();
     if (!sample.device) return {};
     const auto& pad = sample.pad;
-    return dingosdk::controller_flight_input(pad.sThumbLX, pad.sThumbLY, pad.bLeftTrigger, pad.bRightTrigger,
+    auto input = dingosdk::controller_flight_input(pad.sThumbLX, pad.sThumbLY, pad.bLeftTrigger, pad.bRightTrigger,
         (pad.wButtons & XINPUT_GAMEPAD_LEFT_THUMB) != 0);
+    const float rx = static_cast<float>(pad.sThumbRX), ry = static_cast<float>(pad.sThumbRY);
+    const float magnitude = std::sqrt(rx * rx + ry * ry);
+    constexpr float deadzone = 8689.0f;
+    if (magnitude > deadzone) {
+        const float scale = std::clamp((magnitude - deadzone) / (32767.0f - deadzone), 0.0f, 1.0f) / magnitude;
+        input.look_x = rx * scale * 25.0f;
+        input.look_y = ry * scale * -25.0f;
+    }
+    return input;
 }
 }
 
@@ -409,19 +420,34 @@ extern "C" void DingoSDKOverlayReadSkitchInput(bool* active, bool* held, float* 
     *active = true;
     if(sample.device) *steering=skateskitch::skitch_steering_axis(static_cast<float>(sample.pad.sThumbLX)/32768.f);
     const auto skitch_key = dingosdk::local_profile_skitch_key_binding();
-    // The bound controller combo (R1 by default, any button or chord once
-    // rebindable) matched the same way the boost bindings see buttons: raw
-    // XInput bits plus the synthetic trigger bits above the dead zone.
+    // The bound combo (R1 by default) matches the same way the other action
+    // binds do: a keyboard binding — single key or chord — is read from the
+    // OS key state, a controller combo from raw XInput bits plus the
+    // synthetic trigger bits above the dead zone.
     const auto skitch_combo = dingosdk::local_profile_skitch_combo_binding();
     const auto& pad = sample.pad;
     std::uint32_t buttons = pad.wButtons & dingosdk::controller_button_mask;
     if (pad.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) buttons |= 0x10000;
     if (pad.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) buttons |= 0x20000;
     const bool connected = sample.device != 0;
-    const bool combo_down = connected && skitch_combo && (buttons & skitch_combo) == skitch_combo;
+    const bool combo_down = [&] {
+        if (!skitch_combo) return false;
+        if (dingosdk::keyboard_binding(skitch_combo)) {
+            if ((skitch_combo & 0xc0000000u) == dingosdk::keyboard_binding_tag)
+                return (GetAsyncKeyState(static_cast<int>(skitch_combo & 0xffu)) & 0x8000) != 0;
+            for (unsigned slot = 0; slot < 5; ++slot) {
+                const auto id = (skitch_combo >> (slot * 6)) & 0x3fu;
+                if (!id) break;
+                const auto key = dingosdk::keyboard_key_from_id(id);
+                if (!key || !(GetAsyncKeyState(static_cast<int>(key)) & 0x8000)) return false;
+            }
+            return true;
+        }
+        return connected && (buttons & skitch_combo) == skitch_combo;
+    }();
     *held = (skitch_key && (GetAsyncKeyState(static_cast<int>(skitch_key)) & 0x8000) != 0) || combo_down;
     // Observed for the runtime's press diagnostic: bit0 pad connected,
-    // bit1 the bound combo is fully held right now.
+    // bit1 the bound combo is fully held right now (keyboard or controller).
     s.skitch_input_state.store((connected ? 1u : 0u) | (combo_down ? 2u : 0u), std::memory_order_relaxed);
 }
 // Which gate bit suppressed the skitch input (1 window, 2 stop, 4 failed,
@@ -443,6 +469,13 @@ extern "C" unsigned DingoSDKOverlaySkitchInputFlags() {
 extern "C" unsigned DingoSDKOverlaySkitchComboState() {
     return state().skitch_input_state.load(std::memory_order_relaxed);
 }
+extern "C" void DingoSDKOverlaySetFreecamInputCapture(bool active) {
+    const bool previous = state().freecam_controller_active.exchange(active, std::memory_order_relaxed);
+    if (previous != active)
+        dingosdk::logging::printf(dingosdk::logging::Level::info, dingosdk::logging::Channel::input,
+            "Freecam controller input capture %s.", active ? "enabled" : "disabled");
+}
+
 extern "C" void DingoSDKOverlayReadControllerInput(dingosdk::ControllerInput* output, bool allow_menu) {
     if (!output) return;
     struct PreserveError { DWORD value = GetLastError(); ~PreserveError() { SetLastError(value); } } preserve_error;
@@ -451,6 +484,15 @@ extern "C" void DingoSDKOverlayReadControllerInput(dingosdk::ControllerInput* ou
     const HWND window = s.window.load();
     if (!window || s.stop.load() || s.failed.load() || (!allow_menu && interactive_visible(s)) ||
         !game_window_foreground(window)) return;
+    // Read through the overlay's bypass: freecam capture hides keys from the game.
+    {
+        OverlayInputAccess access;
+        for (unsigned key = 0; key < 256; ++key) {
+            if (dingosdk::bindable_keyboard_key(key) && (GetAsyncKeyState(key) & 0x8000)) {
+                output->keys[key / 64] |= std::uint64_t{1} << (key % 64);
+            }
+        }
+    }
     const auto sample = read_controller_sample();
     output->style = sample.style;
     if (!sample.device) return;
@@ -503,6 +545,8 @@ extern "C" void DingoSDKOverlayReadFlightInput(dingosdk::overlay::FlightInput* o
         output->forward = std::clamp(output->forward + controller.forward, -1.0f, 1.0f);
         output->up = std::clamp(output->up + controller.up, -1.0f, 1.0f);
         output->boost = output->boost || controller.boost;
+        output->look_x = controller.look_x;
+        output->look_y = controller.look_y;
         looking = false;
         return; // Native camera owns look input; do not sample or recenter the cursor.
     }

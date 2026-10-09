@@ -13,16 +13,25 @@ std::atomic<std::uint32_t>& skitch_combo_cache() {
     static std::atomic<std::uint32_t> value{default_skitch_combo};
     return value;
 }
-// One combo cannot stand for two actions: Skitch is held while the other
-// three fire once per press, so a shared combo would toggle noclip or fire a
+// One combo cannot stand for two actions: Skitch is held while the others
+// fire once per press, so a shared combo would toggle noclip or fire a
 // boost the moment a tow begins. Refuse the save, naming the action on it.
-// The four setters pass their own side; skitch checks the other three.
+// Skitch checks every other binding (keyboard ones included); noclip and
+// the boosts pass their own side and check Skitch back.
 const char* combo_conflict(const profile::Store& store, std::uint32_t combo, bool saving_skitch) {
     if (!combo) return nullptr;
     if (saving_skitch) {
         if (combo == store.noclip_binding()) return "Noclip";
         if (combo == store.forward_velocity_binding()) return "Forward Boost";
         if (combo == store.up_velocity_binding()) return "Up Boost";
+        if (combo == store.offboard_up_velocity_binding()) return "Off-board Up Boost";
+        if (combo == store.freecam_controller_binding()) return "Freecam Controller";
+        if (combo == store.freecam_binding()) return "Freecam";
+        if (combo == store.tp_to_freecam_binding()) return "TP to Freecam";
+        if (combo == store.vote_binding(true)) return "Vote yes";
+        if (combo == store.vote_binding(false)) return "Vote no";
+        for (std::size_t i = 0; i < action_binds.size(); ++i)
+            if (combo == store.action_binding(action_binds[i].key)) return action_binds[i].label.data();
         return nullptr;
     }
     return combo == store.skitch_combo_binding() ? "Skitch" : nullptr;
@@ -33,6 +42,10 @@ ControllerBindingsModel local_profile_controller_bindings() {
     ControllerBindingsModel result;
     result.status = binding_feedback;
     if (!s.active || !s.store) return result;
+    result.freecam_controller = s.store->freecam_controller();
+    result.freecam_controller_combo = s.store->freecam_controller_binding();
+    result.freecam_combo = s.store->freecam_binding();
+    result.tp_to_freecam_combo = s.store->tp_to_freecam_binding();
     result.noclip_combo = s.store->noclip_binding();
     result.forward_velocity_combo = s.store->forward_velocity_binding();
     result.up_velocity_combo = s.store->up_velocity_binding();
@@ -40,12 +53,16 @@ ControllerBindingsModel local_profile_controller_bindings() {
     result.skitch_combo = s.store->skitch_combo_binding();
     skitch_key_cache().store(result.skitch_key, std::memory_order_release);
     skitch_combo_cache().store(result.skitch_combo, std::memory_order_release);
+    result.offboard_up_velocity_combo = s.store->offboard_up_velocity_binding();
+    result.vote_yes_combo = s.store->vote_binding(true);
+    result.vote_no_combo = s.store->vote_binding(false);
+    for (std::size_t i = 0; i < action_binds.size(); ++i) result.action_combos[i] = s.store->action_binding(action_binds[i].key);
     result.available = true;
     return result;
 }
 bool set_local_noclip_binding(std::uint32_t combo) {
     auto& s = local_runtime(); std::lock_guard lock(s.native_mutex);
-    if (!s.active || !s.store || !valid_controller_combo(combo)) return false;
+    if (!s.active || !s.store || !valid_action_binding(combo)) return false;
     try {
         if (const auto* taken = combo_conflict(*s.store, combo, false)) {
             binding_feedback = std::string("Noclip not saved: those buttons are bound to ") + taken + ".";
@@ -58,9 +75,78 @@ bool set_local_noclip_binding(std::uint32_t combo) {
     } catch (...) { binding_feedback = "Could not save the binding. See the console log."; return false; }
 }
 
+bool local_freecam_controller() {
+    auto& s = local_runtime(); std::lock_guard lock(s.native_mutex);
+    return s.active && s.store && s.store->freecam_controller();
+}
+bool set_local_freecam_controller(bool value) {
+    auto& s = local_runtime(); std::lock_guard lock(s.native_mutex);
+    if (!s.active || !s.store) return false;
+    try {
+        s.store->save_freecam_controller(value);
+        return true;
+    } catch (...) { return false; }
+}
+
+bool set_local_freecam_controller_binding(std::uint32_t combo) {
+    auto& s = local_runtime(); std::lock_guard lock(s.native_mutex);
+    if (!s.active || !s.store || !valid_action_binding(combo)) return false;
+    try {
+        s.store->save_freecam_controller_binding(combo);
+        binding_feedback = combo ? "Freecam Controller binding saved." : "Freecam Controller binding cleared.";
+        dingosdk::logging::event(dingosdk::logging::Channel::profile, dingosdk::Json{{"event","controller_binding_saved"},{"action","freecam_controller"},{"combo",combo}}.dump().c_str());
+        return true;
+    } catch (...) { binding_feedback = "Could not save the binding. See the console log."; return false; }
+}
+
+bool set_local_freecam_binding(std::uint32_t combo) {
+    auto& s = local_runtime(); std::lock_guard lock(s.native_mutex);
+    if (!s.active || !s.store || !valid_action_binding(combo)) return false;
+    try {
+        s.store->save_freecam_binding(combo);
+        binding_feedback = combo ? "Freecam binding saved." : "Freecam binding cleared.";
+        dingosdk::logging::event(dingosdk::logging::Channel::profile, dingosdk::Json{{"event","controller_binding_saved"},{"action","freecam"},{"combo",combo}}.dump().c_str());
+        return true;
+    } catch (...) { binding_feedback = "Could not save the binding. See the console log."; return false; }
+}
+
+bool set_local_action_binding(std::size_t index, std::uint32_t combo) {
+    auto& s = local_runtime(); std::lock_guard lock(s.native_mutex);
+    if (!s.active || !s.store || index >= action_binds.size() || !valid_action_binding(combo)) return false;
+    try {
+        const auto& slot = action_binds[index];
+        s.store->save_action_binding(slot.key, combo);
+        binding_feedback = std::string(slot.label) + (combo ? " binding saved." : " binding cleared.");
+        dingosdk::logging::event(dingosdk::logging::Channel::profile, dingosdk::Json{{"event","controller_binding_saved"},{"action",std::string(slot.key)},{"combo",combo}}.dump().c_str());
+        return true;
+    } catch (...) { binding_feedback = "Could not save the binding. See the console log."; return false; }
+}
+
+bool set_local_vote_binding(bool yes, std::uint32_t combo) {
+    auto& s = local_runtime(); std::lock_guard lock(s.native_mutex);
+    if (!s.active || !s.store || !valid_action_binding(combo)) return false;
+    try {
+        s.store->save_vote_binding(yes, combo);
+        binding_feedback = std::string(yes ? "Vote yes" : "Vote no") + (combo ? " binding saved." : " binding cleared.");
+        dingosdk::logging::event(dingosdk::logging::Channel::profile, dingosdk::Json{{"event","controller_binding_saved"},{"action",yes ? "vote_yes" : "vote_no"},{"combo",combo}}.dump().c_str());
+        return true;
+    } catch (...) { binding_feedback = "Could not save the binding. See the console log."; return false; }
+}
+
+bool set_local_tp_to_freecam_binding(std::uint32_t combo) {
+    auto& s = local_runtime(); std::lock_guard lock(s.native_mutex);
+    if (!s.active || !s.store || !valid_action_binding(combo)) return false;
+    try {
+        s.store->save_tp_to_freecam_binding(combo);
+        binding_feedback = combo ? "TP to Freecam binding saved." : "TP to Freecam binding cleared.";
+        dingosdk::logging::event(dingosdk::logging::Channel::profile, dingosdk::Json{{"event","controller_binding_saved"},{"action","tp_to_freecam"},{"combo",combo}}.dump().c_str());
+        return true;
+    } catch (...) { binding_feedback = "Could not save the binding. See the console log."; return false; }
+}
+
 bool set_local_forward_velocity_binding(std::uint32_t combo) {
     auto& s = local_runtime(); std::lock_guard lock(s.native_mutex);
-    if (!s.active || !s.store || !valid_controller_combo(combo)) return false;
+    if (!s.active || !s.store || !valid_action_binding(combo)) return false;
     try {
         if (const auto* taken = combo_conflict(*s.store, combo, false)) {
             binding_feedback = std::string("Forward Boost not saved: those buttons are bound to ") + taken + ".";
@@ -73,9 +159,20 @@ bool set_local_forward_velocity_binding(std::uint32_t combo) {
     } catch (...) { binding_feedback = "Could not save the binding. See the console log."; return false; }
 }
 
+bool set_local_offboard_up_velocity_binding(std::uint32_t combo) {
+    auto& s = local_runtime(); std::lock_guard lock(s.native_mutex);
+    if (!s.active || !s.store || !valid_action_binding(combo)) return false;
+    try {
+        s.store->save_offboard_up_velocity_binding(combo);
+        binding_feedback = combo ? "Off-board Up Boost binding saved." : "Off-board Up Boost binding cleared.";
+        dingosdk::logging::event(dingosdk::logging::Channel::profile, dingosdk::Json{{"event","controller_binding_saved"},{"action","offboard_up_velocity"},{"combo",combo}}.dump().c_str());
+        return true;
+    } catch (...) { binding_feedback = "Could not save the binding. See the console log."; return false; }
+}
+
 bool set_local_up_velocity_binding(std::uint32_t combo) {
     auto& s = local_runtime(); std::lock_guard lock(s.native_mutex);
-    if (!s.active || !s.store || !valid_controller_combo(combo)) return false;
+    if (!s.active || !s.store || !valid_action_binding(combo)) return false;
     try {
         if (const auto* taken = combo_conflict(*s.store, combo, false)) {
             binding_feedback = std::string("Up Boost not saved: those buttons are bound to ") + taken + ".";
@@ -110,7 +207,7 @@ std::uint32_t local_profile_skitch_combo_binding() noexcept {
 
 bool set_local_skitch_combo_binding(std::uint32_t combo) {
     auto& s = local_runtime(); std::lock_guard lock(s.native_mutex);
-    if (!s.active || !s.store || !valid_controller_combo(combo)) return false;
+    if (!s.active || !s.store || !valid_action_binding(combo)) return false;
     try {
         if (const auto* taken = combo_conflict(*s.store, combo, true)) {
             binding_feedback = std::string("Skitch not saved: those buttons are bound to ") + taken + ".";

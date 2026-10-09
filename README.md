@@ -1,4 +1,4 @@
-﻿# ReAnimator - Main Testing
+# ReAnimator - Main Testing
 
 Custom Animations and Skitching in one pack. This is for testing and will have unfinished features. Please use the Merged Branch if you want AIO mod.
 
