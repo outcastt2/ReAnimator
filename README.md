@@ -1,12 +1,11 @@
 ﻿# ReAnimator - Main Testing
 
-Complete mod pack with custom animations, skitching, ragdoll drag, and all unlocks enabled.
+Custom Animations and Skitching in one pack. This is for testing and will have unfinished features. Please use the Merged Branch if you want AIO mod.
 
 ## Features
 - Custom Animations (poseanim) - Play custom .rska animations
 - Player Skitching - Hold V (rebindable) or LB+RB near another player
-- Ragdoll Drag (dragstate on/off) - Physics-driven drag when bailing while skitching
-- Unlocks - All cosmetics, objects, neighborhoods, preset slots, bus stops unlocked
+- Ragdoll Drag (dragstate on/off) - Physics-driven drag when bailing while skitching (Broken WIP)
 
 ## Installation
 1. Install ReSkate
