@@ -643,6 +643,7 @@ bool queue_command(std::string_view action, std::string_view argument, std::stri
     return true;
 }
 bool server_vote_open() noexcept { return session_detail::server_vote_open_flag.load(std::memory_order_relaxed); }
+unsigned server_poll_answers() noexcept { return session_detail::server_poll_answers_flag.load(std::memory_order_relaxed); }
 std::string command(std::string_view action, std::string_view argument, std::string_view password) {
     if (launcher::offline_mode() && !own_mark_command(action))
         return "Multiplayer is unavailable in offline mode. Start Steam and relaunch ReSkate.";
@@ -666,8 +667,11 @@ std::string command(std::string_view action, std::string_view argument, std::str
             return result;
         }
         if (action == "vote") {
-            if (argument != "yes" && argument != "no") return "vote yes|no";
-            const auto result = cast_server_vote(s, argument == "yes");
+            // yes or no, or the number of a poll's answer
+            const bool answer = argument.size() == 1 && argument[0] >= '1' && argument[0] <= '0' + static_cast<char>(max_vote_answers);
+            if (argument != "yes" && argument != "no" && !answer) return "vote yes|no|<answer number>";
+            const auto result = answer ? answer_server_poll(s, static_cast<std::size_t>(argument[0] - '1'))
+                                       : cast_server_vote(s, argument == "yes");
             if (!result.empty()) add_chat(s, 0, "ReSkate", result);
             return result;
         }
@@ -932,6 +936,7 @@ std::string command(std::string_view action, std::string_view argument, std::str
         };
         // Joining is for the host or the server to refuse (a server may opt out of the bans).
         if (action == "host" && reskate_banned(s.transport.status().local_id)) return refuse(std::string(banned_notice));
+        if (action == "host" && banned_host(s.transport.status().local_id)) return refuse(std::string(banned_host_notice));
         if (action == "host") {
             const auto space = argument.find(' ');
             if (space != std::string_view::npos) {
@@ -971,6 +976,7 @@ std::string command(std::string_view action, std::string_view argument, std::str
             if (!invitation)
                 return refuse("Invalid join code. Paste the complete SteamID-session code from the host.");
             if (blocked_server(invitation->steam_id)) return refuse(std::string(blocked_server_notice));
+            if (banned_host(invitation->steam_id)) return refuse(std::string(banned_host_lobby_notice));
         }
         stop(s, "Starting multiplayer...");
         s.chat.clear(); // A new session starts with an empty chat.

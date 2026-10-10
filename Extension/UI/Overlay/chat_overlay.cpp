@@ -305,7 +305,7 @@ bool chat_pending() {
     }
     if (s.chat_visible.load()) return true;
     if (!c.feed.available) return false;
-    if (c.feed.vote.id) return true; // the vote card
+    if (c.feed.vote.id || c.feed.announcement.id) return true; // the vote and announcement cards
     for (const auto& [line, at] : c.arrivals)
         if (now - at < chat_hold + chat_fade) return true;
     return false;
@@ -449,77 +449,216 @@ void draw_command_list(ChatState& c, ImFont* heading, ImFont* body, ImVec2 botto
                        "; Tab for the next, Shift+Tab back").c_str());
 }
 
-// The vote a dedicated server is running, or has just finished: a card above the chat with what
-// is voted on, the tally, the time left, and Yes and No. The player answers with their binds
-// (shown on the buttons; F1 and F2 unless changed), or by clicking while the cursor is free.
-// `bottom_right` is the corner the card sits on. Returns the room it took, 0 when there is none.
-float draw_vote(const MultiplayerVote& vote, ImFont* heading, ImFont* body, ImVec2 bottom_right, float width, float scale,
-                bool clickable) {
-    if (!vote.id) return 0.0f;
-    constexpr ImU32 green = IM_COL32(88, 214, 141, 255), red = IM_COL32(236, 96, 96, 255);
+// Card text with its :emote: images (chat_rich.h), measured and drawn as the chat panel's
+// lines are; text without any known emote is drawn plainly, as before.
+struct CardText {
+    bool emotes{};
+    RichText rich;
+    ImVec2 extent;
+};
+CardText card_text(ImFont* font, float size, const std::string& text, float wrap, std::size_t max_lines = 0,
+                   float emote_scale = 1.3f) {
+    CardText out;
+    out.emotes = has_emotes(text);
+    if (out.emotes) {
+        out.rich = lay_out(font, size, text, wrap, 0.0f, max_lines, emote_scale);
+        out.extent = ImVec2(out.rich.width, out.rich.height);
+    } else {
+        out.extent = font->CalcTextSizeA(size, FLT_MAX, wrap, text.c_str());
+    }
+    return out;
+}
+void draw_card_text(ImDrawList* draw, ImFont* font, float size, ImVec2 at, const std::string& text, const CardText& laid,
+                    ImU32 colour, float wrap) {
+    if (laid.emotes) draw_rich(draw, font, size, at, text, laid.rich, colour, 1.0f);
+    else draw->AddText(font, size, at, colour, text.c_str(), nullptr, wrap);
+}
+
+// The vote a dedicated server is running, or has just finished: a card on the middle of the
+// screen's right edge, in the look of the overlay's notices (a dark tile with a strip of colour
+// down its left). It says what is voted on, the tally and the time left, and has Yes and No. The
+// player answers with their binds (the keycaps on the buttons; F1 and F2 unless changed), or by
+// clicking while the cursor is free.
+// A poll on the same card: its question, then a row for each answer with its count and a bar of
+// its share. The player answers with the number key on the row's keycap, by clicking a row while
+// the cursor is free, or with /1, /2... in chat; their answer is the blue row.
+void draw_poll(const MultiplayerVote& poll, ImFont* heading, ImFont* body, ImVec2 display, float scale, bool clickable) {
+    const bool running = poll.outcome == 0;
+    const ImU32 accent = running ? theme::blue : poll.outcome == 3 ? theme::muted : skate_theme::good;
+    const char* title = running ? "POLL" : poll.outcome == 3 ? "POLL CANCELLED" : "POLL ENDED";
+    const float width = 360.0f * scale, margin = 24.0f * scale, strip = 5.0f * scale;
+    const float pad = 14.0f * scale, gap = 8.0f * scale, title_size = 13.0f * scale, size = 18.0f * scale, fine = 13.0f * scale;
+    const float row = 30.0f * scale, between = 4.0f * scale, inner = width - strip - pad * 2.0f;
+    const auto question = card_text(heading, size, poll.label, inner);
+    const auto question_extent = question.extent;
+    const bool answers = running && poll.may_vote;
+    const auto rows = static_cast<float>(poll.answers.size());
+    const float height = pad + title_size + gap + question_extent.y + gap + rows * row + std::max(0.0f, rows - 1.0f) * between +
+                         (answers ? gap + fine : 0.0f) + pad;
+    const ImVec2 min(display.x - margin - width, std::floor((display.y - height) * 0.5f)), max(min.x + width, min.y + height);
+    auto* draw = ImGui::GetForegroundDrawList();
+    draw->AddRectFilled(min, max, with_alpha(theme::ink, 0.92f));
+    draw->AddRectFilled(min, ImVec2(min.x + strip, max.y), accent);
+    const float left = min.x + strip + pad, right = max.x - pad;
+    float y = min.y + pad;
+    draw->AddText(heading, title_size, ImVec2(left, y), accent, title);
+    if (running) {
+        const auto time = std::to_string(poll.seconds) + " s";
+        const auto extent = heading->CalcTextSizeA(title_size, FLT_MAX, 0.0f, time.c_str());
+        draw->AddText(heading, title_size, ImVec2(right - extent.x, y), theme::paper, time.c_str());
+    }
+    y += title_size + gap;
+    draw_card_text(draw, heading, size, ImVec2(left, y), poll.label, question, theme::paper, inner);
+    y += question_extent.y + gap;
+    unsigned total{}, most{};
+    for (const auto count : poll.counts) total += count, most = std::max(most, count);
+    for (std::size_t i = 0; i < poll.answers.size(); ++i) {
+        const auto count = i < poll.counts.size() ? poll.counts[i] : 0U;
+        const ImVec2 a(left, y), b(right, y + row);
+        const bool chosen = poll.mine == i + 1;
+        const bool hovered = answers && clickable && ImGui::IsMouseHoveringRect(a, b, false);
+        draw->AddRectFilled(a, b, hovered ? skate_theme::tile_light : skate_theme::tile_grey);
+        // Its share of the answers as a bar along the bottom; once ended, the winner's is green.
+        const float share = total ? static_cast<float>(count) / static_cast<float>(total) : 0.0f;
+        const ImU32 fill = chosen ? theme::blue : !running && count && count == most ? skate_theme::good : theme::muted;
+        if (share > 0.0f) draw->AddRectFilled(ImVec2(a.x, b.y - 3.0f * scale), ImVec2(a.x + (b.x - a.x) * share, b.y), fill);
+        if (chosen) draw->AddRectFilled(a, ImVec2(a.x + 3.0f * scale, b.y), theme::blue);
+        const auto number = std::to_string(i + 1);
+        const float text_y = y + (row - fine) * 0.5f - 1.0f * scale;
+        // The key that gives this answer, as the game shows its own keys.
+        {
+            const float cap = 18.0f * scale;
+            const ImVec2 at(a.x + 6.0f * scale, y + (row - cap) * 0.5f);
+            const auto extent = heading->CalcTextSizeA(12.0f * scale, FLT_MAX, 0.0f, number.c_str());
+            draw->AddRectFilled(at, ImVec2(at.x + cap, at.y + cap), chosen ? theme::blue : theme::paper, 3.0f * scale);
+            draw->AddText(heading, 12.0f * scale, ImVec2(at.x + (cap - extent.x) * 0.5f, at.y + (cap - extent.y) * 0.5f),
+                          chosen ? theme::paper : skate_theme::black, number.c_str());
+        }
+        const auto counted = std::to_string(count);
+        const float count_width = heading->CalcTextSizeA(fine, FLT_MAX, 0.0f, counted.c_str()).x;
+        draw->PushClipRect(ImVec2(a.x + 32.0f * scale, a.y), ImVec2(b.x - count_width - 18.0f * scale, b.y), true);
+        // One line, cut with "..." where the count starts; an emote is a little smaller here, so it fits the row.
+        const float answer_size = fine + 1.0f * scale;
+        const float answer_wrap = (b.x - count_width - 18.0f * scale) - (a.x + 32.0f * scale);
+        const auto answer = card_text(body, answer_size, poll.answers[i], answer_wrap, 1, 1.15f);
+        const float answer_y = answer.emotes ? y + (row - answer.extent.y) * 0.5f : text_y;
+        draw_card_text(draw, body, answer_size, ImVec2(a.x + 32.0f * scale, answer_y), poll.answers[i], answer, theme::paper, 0.0f);
+        draw->PopClipRect();
+        draw->AddText(heading, fine, ImVec2(b.x - 10.0f * scale - count_width, text_y), theme::paper, counted.c_str());
+        if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) queue_multiplayer_action("vote", number);
+        y += row + between;
+    }
+    if (answers) {
+        const auto hint = "Press 1 to " + std::to_string(poll.answers.size()) + " on the keyboard, or click an answer.";
+        draw->AddText(body, fine, ImVec2(left, y - between + gap), theme::muted, hint.c_str());
+    }
+}
+
+// A dedicated server's announcement: a card at the top middle of the screen in the same look,
+// blue down its left, for as long as the server shows it.
+void draw_announcement(const MultiplayerAnnouncement& announcement, ImFont* heading, ImFont* body, ImVec2 display, float scale) {
+    if (!announcement.id || announcement.text.empty()) return;
+    const float width = std::min(520.0f * scale, display.x - 48.0f * scale), strip = 5.0f * scale;
+    const float pad = 14.0f * scale, gap = 6.0f * scale, title_size = 13.0f * scale, size = 18.0f * scale;
+    const float inner = width - strip - pad * 2.0f;
+    const auto text = card_text(body, size, announcement.text, inner);
+    const auto text_extent = text.extent;
+    const float height = pad + title_size + gap + text_extent.y + pad;
+    const ImVec2 min(std::floor((display.x - width) * 0.5f), 24.0f * scale), max(min.x + width, min.y + height);
+    auto* draw = ImGui::GetForegroundDrawList();
+    draw->AddRectFilled(min, max, with_alpha(theme::ink, 0.92f));
+    draw->AddRectFilled(min, ImVec2(min.x + strip, max.y), theme::blue);
+    const float left = min.x + strip + pad;
+    draw->AddText(heading, title_size, ImVec2(left, min.y + pad), theme::blue, "ANNOUNCEMENT");
+    draw_card_text(draw, body, size, ImVec2(left, min.y + pad + title_size + gap), announcement.text, text, theme::paper, inner);
+}
+
+void draw_vote(const MultiplayerVote& vote, ImFont* heading, ImFont* body, ImVec2 display, float scale, bool clickable) {
+    if (!vote.id) return;
+    if (vote.poll) return draw_poll(vote, heading, body, display, scale, clickable);
+    constexpr ImU32 green = skate_theme::good, red = skate_theme::danger;
     const bool running = vote.outcome == 0;
     const ImU32 accent = running ? theme::blue : vote.outcome == 1 ? green : vote.outcome == 2 ? red : theme::muted;
     const char* title = running ? "VOTE" : vote.outcome == 1 ? "VOTE PASSED" : vote.outcome == 2 ? "VOTE FAILED" : "VOTE CANCELLED";
     std::string question = vote.label;
     if (!question.empty() && question.front() >= 'a' && question.front() <= 'z') question.front() = static_cast<char>(question.front() - 32);
     if (running) question += '?';
-    const float pad = 12.0f * scale, gap = 6.0f * scale, title_size = 14.0f * scale, size = 16.0f * scale, fine = 14.0f * scale;
-    const float button_height = 30.0f * scale, bar = 3.0f * scale, inner = width - pad * 2.0f;
-    const auto question_extent = body->CalcTextSizeA(size, FLT_MAX, inner, question.c_str());
+    const float width = 360.0f * scale, margin = 24.0f * scale, strip = 5.0f * scale;
+    const float pad = 14.0f * scale, gap = 8.0f * scale, title_size = 13.0f * scale, size = 18.0f * scale, fine = 13.0f * scale;
+    const float button_height = 34.0f * scale, bar = 4.0f * scale, inner = width - strip - pad * 2.0f;
+    const auto question_extent = heading->CalcTextSizeA(size, FLT_MAX, inner, question.c_str());
     const bool answers = running && vote.may_vote;
-    const float height = pad + title_size + gap + question_extent.y + gap + fine + gap + bar +
+    const float height = pad + title_size + gap + question_extent.y + gap + bar + gap + fine +
                          (running ? gap + (answers ? button_height : fine) : 0.0f) + pad;
-    const ImVec2 min(bottom_right.x - width, bottom_right.y - height), max(bottom_right);
+    const ImVec2 min(display.x - margin - width, std::floor((display.y - height) * 0.5f)), max(min.x + width, min.y + height);
     auto* draw = ImGui::GetForegroundDrawList();
-    draw->AddRectFilled(min, max, with_alpha(theme::ink, 0.92f), 4.0f * scale);
-    draw->AddRect(min, max, with_alpha(accent, 0.9f), 4.0f * scale);
+    draw->AddRectFilled(min, max, with_alpha(theme::ink, 0.92f));
+    draw->AddRectFilled(min, ImVec2(min.x + strip, max.y), accent);
+    const float left = min.x + strip + pad, right = max.x - pad;
     float y = min.y + pad;
-    draw->AddText(heading, title_size, ImVec2(min.x + pad, y), accent, title);
+    draw->AddText(heading, title_size, ImVec2(left, y), accent, title);
     if (running) {
-        const auto left = std::to_string(vote.seconds) + " s";
-        const auto extent = heading->CalcTextSizeA(title_size, FLT_MAX, 0.0f, left.c_str());
-        draw->AddText(heading, title_size, ImVec2(max.x - pad - extent.x, y), theme::muted, left.c_str());
+        const auto time = std::to_string(vote.seconds) + " s";
+        const auto extent = heading->CalcTextSizeA(title_size, FLT_MAX, 0.0f, time.c_str());
+        draw->AddText(heading, title_size, ImVec2(right - extent.x, y), theme::paper, time.c_str());
     }
     y += title_size + gap;
-    draw->AddText(body, size, ImVec2(min.x + pad, y), theme::paper, question.c_str(), nullptr, inner);
+    draw->AddText(heading, size, ImVec2(left, y), theme::paper, question.c_str(), nullptr, inner);
     y += question_extent.y + gap;
-    // The tally, and a bar of how far Yes is towards what it needs.
-    float x = min.x + pad;
+    // How far Yes is towards what it needs, then the tally under it.
+    const float share = vote.needed ? std::clamp(static_cast<float>(vote.yes) / static_cast<float>(vote.needed), 0.0f, 1.0f) : 0.0f;
+    draw->AddRectFilled(ImVec2(left, y), ImVec2(right, y + bar), skate_theme::tile_light);
+    if (share > 0.0f) draw->AddRectFilled(ImVec2(left, y), ImVec2(left + inner * share, y + bar), green);
+    y += bar + gap;
+    float x = left;
     const auto word = [&](const std::string& text, ImU32 colour) {
-        draw->AddText(heading, fine, ImVec2(x, y), colour, text.c_str());
-        x += heading->CalcTextSizeA(fine, FLT_MAX, 0.0f, text.c_str()).x + 14.0f * scale;
+        draw->AddText(body, fine, ImVec2(x, y), colour, text.c_str());
+        x += body->CalcTextSizeA(fine, FLT_MAX, 0.0f, text.c_str()).x + 14.0f * scale;
     };
     word("Yes " + std::to_string(vote.yes), green);
     word("No " + std::to_string(vote.no), red);
-    word(std::to_string(vote.needed) + " needed", theme::muted);
-    y += fine + gap;
-    const float share = vote.needed ? std::clamp(static_cast<float>(vote.yes) / static_cast<float>(vote.needed), 0.0f, 1.0f) : 0.0f;
-    draw->AddRectFilled(ImVec2(min.x + pad, y), ImVec2(max.x - pad, y + bar), with_alpha(theme::muted, 0.35f), bar * 0.5f);
-    if (share > 0.0f) draw->AddRectFilled(ImVec2(min.x + pad, y), ImVec2(min.x + pad + inner * share, y + bar), green, bar * 0.5f);
-    y += bar;
-    if (!running) return height + gap;
+    {
+        const auto needed = std::to_string(vote.needed) + " needed";
+        const auto extent = body->CalcTextSizeA(fine, FLT_MAX, 0.0f, needed.c_str());
+        draw->AddText(body, fine, ImVec2(right - extent.x, y), theme::muted, needed.c_str());
+    }
+    y += fine;
+    if (!running) return;
     y += gap;
     if (!answers) {
-        draw->AddText(body, fine, ImVec2(min.x + pad, y), theme::muted, "This vote is about you, so you have no vote in it.");
-        return height + gap;
+        draw->AddText(body, fine, ImVec2(left, y), theme::muted, "This vote is about you, so you have no vote in it.");
+        return;
     }
+    // Two tiles as the menu's: grey, the answer's colour once it is this player's, each with its
+    // bind on a white keycap.
     const float button_width = (inner - gap) * 0.5f;
-    const auto button = [&](float left, bool yes, std::uint32_t bind) {
-        const ImVec2 a(left, y), b(left + button_width, y + button_height);
+    const auto button = [&](float at, bool yes, std::uint32_t bind) {
+        const ImVec2 a(at, y), b(at + button_width, y + button_height);
         const ImU32 colour = yes ? green : red;
         const bool chosen = vote.mine == (yes ? 1 : 2);
         const bool hovered = clickable && ImGui::IsMouseHoveringRect(a, b, false);
-        draw->AddRectFilled(a, b, with_alpha(colour, chosen ? 0.85f : hovered ? 0.35f : 0.14f), 4.0f * scale);
-        draw->AddRect(a, b, with_alpha(colour, 0.9f), 4.0f * scale);
-        const std::string label = (bind ? dingosdk::controller_combo_label(bind) + "   " : std::string{}) + (yes ? "Yes" : "No");
-        const auto extent = heading->CalcTextSizeA(size, FLT_MAX, 0.0f, label.c_str());
-        draw->AddText(heading, size, ImVec2(a.x + (button_width - extent.x) * 0.5f, a.y + (button_height - extent.y) * 0.5f),
-                      chosen ? theme::ink : theme::paper, label.c_str());
+        draw->AddRectFilled(a, b, chosen ? colour : hovered ? skate_theme::tile_light : skate_theme::tile_grey);
+        if (!chosen) draw->AddRectFilled(ImVec2(a.x, b.y - 3.0f * scale), b, colour);
+        const std::string key = bind ? dingosdk::controller_combo_label(bind) : std::string{};
+        const char* label = yes ? "YES" : "NO";
+        const float label_size = 15.0f * scale, key_size = 12.0f * scale, cap_height = 20.0f * scale;
+        const auto label_extent = heading->CalcTextSizeA(label_size, FLT_MAX, 0.0f, label);
+        const auto key_extent = key.empty() ? ImVec2{} : heading->CalcTextSizeA(key_size, FLT_MAX, 0.0f, key.c_str());
+        const float cap_width = key.empty() ? 0.0f : key_extent.x + 12.0f * scale, between = key.empty() ? 0.0f : 8.0f * scale;
+        float cursor = a.x + (button_width - cap_width - between - label_extent.x) * 0.5f;
+        if (!key.empty()) {
+            const ImVec2 cap(cursor, a.y + (button_height - cap_height) * 0.5f);
+            draw->AddRectFilled(cap, ImVec2(cap.x + cap_width, cap.y + cap_height), theme::paper, 3.0f * scale);
+            draw->AddText(heading, key_size, ImVec2(cap.x + 6.0f * scale, cap.y + (cap_height - key_extent.y) * 0.5f), skate_theme::black,
+                          key.c_str());
+            cursor += cap_width + between;
+        }
+        draw->AddText(heading, label_size, ImVec2(cursor, a.y + (button_height - label_extent.y) * 0.5f),
+                      chosen ? skate_theme::black : theme::paper, label);
         if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) queue_multiplayer_action("vote", yes ? "yes" : "no");
     };
-    button(min.x + pad, true, vote.yes_bind);
-    button(min.x + pad + button_width + gap, false, vote.no_bind);
-    return height + gap;
+    button(left, true, vote.yes_bind);
+    button(left + button_width + gap, false, vote.no_bind);
 }
 
 void draw_chat() {
@@ -637,11 +776,11 @@ void draw_chat() {
         ImGui::End();
         ImGui::PopStyleVar(2);
         ImGui::PopStyleColor(4);
-        // The vote card sits on the panel; the command list and the emote picker go above it.
-        const float above = panel_top - 6.0f * scale -
-                            draw_vote(c.feed.vote, heading, body, ImVec2(display.x - margin, panel_top - 6.0f * scale), width, scale, true);
+        const float above = panel_top - 6.0f * scale;
         draw_command_list(c, heading, body, ImVec2(display.x - margin - width, above), width, scale);
         emote_picker(c, heading, ImVec2(display.x - margin - width, above), width, scale);
+        draw_announcement(c.feed.announcement, heading, body, display, scale);
+        draw_vote(c.feed.vote, heading, body, display, scale, true); // the cursor is free while typing
         return;
     }
 
@@ -692,9 +831,8 @@ void draw_chat() {
         else draw->AddText(body, size, text_at, text, drawn.text.c_str(), nullptr, wrap);
         bottom = top_left.y - gap;
     }
-    // Above the newest lines, or in the corner when there are none. Clickable while the menu or
-    // the console has freed the cursor.
-    draw_vote(c.feed.vote, heading, body, ImVec2(display.x - margin, bottom), width, scale,
-              s.visible.load() || s.console_visible.load());
+    // Clickable while the menu or the console has freed the cursor.
+    draw_announcement(c.feed.announcement, heading, body, display, scale);
+    draw_vote(c.feed.vote, heading, body, display, scale, s.visible.load() || s.console_visible.load());
 }
 } // namespace dingosdk::overlay::detail

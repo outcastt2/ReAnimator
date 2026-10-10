@@ -279,6 +279,9 @@ void apply_roster(Session &s, const Packet &p, std::uint64_t now) {
     apply_guest_tools(s, p.guest_noclip, p.guest_no_bail, p.guest_boosts);
     s.enforce_tuning = p.enforce_tuning;
     s.server_votes = dedicated_host(s) ? p.server_votes : 0;
+    s.server_polls = dedicated_host(s) ? p.server_polls : 0;
+    if (dedicated_host(s)) s.server_custom_votes = p.server_custom_votes;
+    else s.server_custom_votes.clear();
     publish_chat(s); // the "/" list follows the server's votes, its players and its maps
     if (s.object_clears && *s.object_clears != p.object_clears) s.clear_pending = true;
     s.object_clears = p.object_clears;
@@ -312,13 +315,24 @@ void apply_roster(Session &s, const Packet &p, std::uint64_t now) {
     s.roster_voice_range = p.voice_range;
     s.server_chat_badge = p.chat_badge;
     s.server_chat_text = p.chat_text;
-    // The server's vote. A new one starts with no answer from this player, unless they started it.
+    // The server's vote. A new one starts with no answer from this player, unless they started
+    // it and the server counts that as a yes. A poll they started they still answer.
     if (dedicated_host(s)) {
         const auto local = s.transport.status().local_id;
-        if (p.vote.id != s.vote.id) s.vote_mine = p.vote.id && p.vote.starter == local ? 1 : 0;
+        const bool poll = p.vote.kind == server_vote_poll;
+        if (p.vote.id != s.vote.id) s.vote_mine = p.vote.id && !poll && p.vote.starter == local && p.vote.yes ? 1 : 0;
         s.vote = p.vote;
         s.vote_ends = now_us() + std::uint64_t{p.vote.seconds} * 1000000;
-        server_vote_open_flag.store(p.vote.id && p.vote.outcome == vote_running && p.vote.target != local, std::memory_order_relaxed);
+        // The Yes and No binds answer a yes/no vote; a poll is answered with the number keys, on
+        // its card or with /1, /2...
+        server_vote_open_flag.store(p.vote.id && !poll && p.vote.outcome == vote_running && p.vote.target != local,
+                                    std::memory_order_relaxed);
+        server_poll_answers_flag.store(p.vote.id && poll && p.vote.outcome == vote_running
+                                           ? static_cast<unsigned>(std::min(p.vote.answers.size(), max_vote_answers)) : 0U,
+                                       std::memory_order_relaxed);
+        if (p.announcement.id != s.announcement.id)
+            s.announcement_ends = now_us() + std::uint64_t{p.announcement.seconds} * 1000000;
+        s.announcement = p.announcement;
     }
     ++s.party_revision; // anyone's party may have changed
     // A dedicated server knows players only by the name each sent in their hello.
@@ -438,6 +452,15 @@ void networking(Session &s, const NativeFrame &local, std::uint64_t now) {
     }
     if (s.mode == Mode::join && reskate_banned(s.host_id)) {
         stop(s, "This host is banned from ReSkate multiplayer.");
+        return;
+    }
+    // The same for a player who may not host (banned_host): theirs stops, and nobody stays in it.
+    if (s.mode == Mode::host && banned_host(s.transport.status().local_id)) {
+        stop(s, std::string(banned_host_notice));
+        return;
+    }
+    if (s.mode == Mode::join && banned_host(s.host_id)) {
+        stop(s, std::string(banned_host_lobby_notice));
         return;
     }
     for (const auto &link : links) {
@@ -935,6 +958,20 @@ void networking(Session &s, const NativeFrame &local, std::uint64_t now) {
             // Everyone holds everyone to the same pace, so a modified client cannot flood.
             if (!server && sender->chat_rate.accept(now, p.text, 1) != ChatRate::Verdict::accepted) continue;
             sender->last_packet = now;
+            // A word that is not allowed at all: a lobby's host does not show or pass the line on,
+            // warns the guest, and after the last warning removes them (a dedicated server
+            // does the same with its own count).
+            if (s.mode == Mode::host && text::contains_forbidden_words(p.text)) {
+                const auto count = ++s.word_warnings[sender->member.id];
+                if (count > word_warnings_default) {
+                    s.transport.disconnect(sender->member.id, word_kick_notice.data());
+                } else {
+                    auto notice = packet(s, PacketKind::admin, now);
+                    notice.text = clean_chat_text(word_warning(count, word_warnings_default));
+                    send_packet(s, sender->member.id, notice, true, false);
+                }
+                continue;
+            }
             // "/p": party chat, which a lobby's host relays to the sender's party and nobody else.
             if (s.mode == Mode::host && p.text.starts_with("/p ")) {
                 host_party_chat(s, sender->member.id, std::string_view(p.text).substr(3), now);
