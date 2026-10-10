@@ -46,6 +46,11 @@ constexpr ULONGLONG mask_ramp_ms = 200;
 // Above this the automatic mask decides the skater is walking or riding.
 constexpr float walking_speed = 0.6f;
 
+// How far below the game's own foot height a clip's foot may sit before the
+// floor correction lifts it. A hair above zero: the game plants its feet on
+// the surface, so anything under that is the clip sinking through it.
+constexpr float floor_margin = 0.01f;
+
 // The skater is on foot exactly when their motion state (core+0x3b0) is the
 // offboard flight state, which owns walking, sliding and falling. While riding,
 // that slot holds a different object with a different vtable -- the same check
@@ -113,6 +118,9 @@ struct Playback {
     // it, and the handler cost is always measured: this tool runs inside the
     // engine's frame, so it should be able to say what it costs.
     std::atomic<bool> trace{};
+    // Floor correction strength, 0..1. The game plants its own feet before the
+    // clip write; this is how hard a clip that sinks below them is lifted back.
+    std::atomic<float> ik{1.0f};
     std::atomic<std::uint64_t> handler_ticks{};
     std::atomic<std::uint64_t> handler_peak{};
     std::atomic<std::uint32_t> handler_frames{};
@@ -461,6 +469,14 @@ void write_current(Playback &p, std::uintptr_t buffer, std::uint32_t available_j
     // engine's own pose for them stays, so the feet keep the board and the walk
     // keeps walking.
     const auto keep = mask_weight(p, GetTickCount64());
+    // The game's feet are the floor: sample them before the clip overwrites
+    // the legs. The engine's gesture IK has already planted them on the board
+    // or the ground, so their lowest point is the surface the clip must not
+    // sink through -- the answer to "where is the floor", read rather than
+    // re-solved.
+    float floor_y = 0.0f;
+    const auto ik = p.ik.load(std::memory_order_relaxed);
+    const bool have_floor = ik > 0.0f && layers::sample_floor(buffer, floor_y);
     const auto *frames = p.clip.data.data();
     layers::write_pose_interpolated(buffer + 2 * layers::pose_stride,
                                     frames + static_cast<std::size_t>(frame) * p.clip.joints * floats_per_joint +
@@ -468,6 +484,9 @@ void write_current(Playback &p, std::uintptr_t buffer, std::uint32_t available_j
                                     frames + static_cast<std::size_t>(next) * p.clip.joints * floats_per_joint +
                                         2 * floats_per_joint,
                                     alpha, 2, clip_joints - 2, keep);
+    // Then lift whatever the clip sank back above that floor, with a two-bone
+    // solve per limb so the legs and arms bend instead of stretching.
+    if (have_floor) layers::apply_floor(buffer, floor_y, floor_margin, ik, keep);
     note_write();
 }
 } // namespace
@@ -626,6 +645,11 @@ std::string pose_playback_cost() {
 
 void set_pose_trace(bool enabled) noexcept { playback().trace.store(enabled, std::memory_order_relaxed); }
 bool pose_trace() { return playback().trace.load(std::memory_order_relaxed); }
+void set_pose_ik(float strength) noexcept {
+    const float clamped = strength < 0.0f ? 0.0f : (strength > 1.0f ? 1.0f : strength);
+    playback().ik.store(clamped, std::memory_order_relaxed);
+}
+float pose_ik() noexcept { return playback().ik.load(std::memory_order_relaxed); }
 
 void set_pose_mask(PoseMask mask) noexcept {
     auto &p = playback();

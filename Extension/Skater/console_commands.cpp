@@ -7,6 +7,7 @@
 #include "effect_attach.h"
 #include "custom_animation.h"
 #include "prop_attach.h"
+#include <cstdlib>
 #include <format>
 #include <string>
 namespace dingosdk::console {
@@ -620,23 +621,42 @@ void register_movement_commands(Commands &registry) {
 
     // Route B: overwrite the local skater's pose with a baked custom animation.
     auto poseanim = action("poseanim",
-        "Custom animation: poseanim test | record | off | play | save <path> | mask auto|full|legs | trace 0|1 | <file>.rska",
+        "Custom animation: poseanim test | record | off | play | save <path> | mask auto|full|legs | ik <0..1> | trace 0|1 | <file>.rska",
         Group::movement, {argument("clip", Type::text, true), argument("path", Type::text, true)});
     poseanim.execution = Execution::local;
     poseanim.inspect = [](const Model &) {
         return State{true, {}, {},
-                     skater::pose_playback_status() + "  [mask: " + skater::pose_mask_name() + "]", false};
+                     skater::pose_playback_status() + "  [mask: " + skater::pose_mask_name() +
+                         ", ik: " + std::to_string(skater::pose_ik()).substr(0, 4) + "]", false};
     };
     poseanim.run = [](const Model &, const Values &args, const Output &out) {
         if (args.empty()) {
             out(skater::pose_playback_status());
             out("Masking: " + skater::pose_mask_name() + ".");
+            out("Floor correction: " + std::to_string(skater::pose_ik()).substr(0, 4) + " (poseanim ik <0..1>).");
             out(skater::pose_playback_cost());
             out(std::string("Layer trace: ") + (skater::pose_trace() ? "on" : "off") + " (poseanim trace 0|1).");
             return;
         }
         const auto clip = std::get<std::string>(args[0]);
         if (lower(clip) == "off") { skater::request_pose_playback_stop(); out("Stopping custom animation..."); return; }
+        if (lower(clip) == "ik") {
+            // How hard a clip that sinks below the game's planted feet is
+            // lifted back. 0 leaves the clip exactly as authored.
+            const auto mode = args.size() > 1 ? lower(std::get<std::string>(args[1])) : std::string{};
+            char *end = nullptr;
+            const float strength = mode.empty() ? -1.0f : std::strtof(mode.c_str(), &end);
+            if (end == mode.c_str() || strength < 0.0f || strength > 1.0f) {
+                out("usage: poseanim ik <0..1>  (currently " + std::to_string(skater::pose_ik()).substr(0, 4) + ")");
+                return;
+            }
+            skater::set_pose_ik(strength);
+            out(strength > 0.0f
+                    ? "Floor correction: " + std::to_string(strength).substr(0, 4) +
+                          " (the clip's feet and hands are lifted above the game's floor)."
+                    : "Floor correction off: the clip's limbs are written as authored.");
+            return;
+        }
         if (lower(clip) == "trace") {
             const auto mode = args.size() > 1 ? std::get<std::string>(args[1]) : std::string{};
             const bool enabled = mode == "1" || lower(mode) == "on";

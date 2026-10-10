@@ -58,4 +58,26 @@ void write_pose(std::uintptr_t buffer, const float *frame, std::uint32_t first, 
 void write_pose_interpolated(std::uintptr_t buffer, const float *frame_a, const float *frame_b, float alpha,
                              std::uint32_t first, std::uint32_t count, float keep) noexcept;
 
+// Floor correction. A clip baked in Blender has no idea where the game's
+// floor is, so its feet sink into the board or the ground. The game's own
+// gesture IK already answered that question in the very pose this unit
+// replaces: the engine's feet are planted on whatever the skater stands on.
+// The lowest of the four game foot points (both ankles, both toes), sampled
+// just before the clip is written, IS the local floor -- the answer of the
+// game's IK, borrowed without calling any of it and without touching the
+// gesture system.
+bool sample_floor(std::uintptr_t buffer, float &out_y) noexcept;
+
+// After the clip write: lift what the clip drove back above `floor_y` by an
+// analytic two-bone solve per limb, so the legs and arms bend instead of
+// stretching. `margin` is the tolerated sink (authored near-floor poses and
+// joint noise are left alone); `strength` scales the lift, 0 disables.
+//   legs  the part the clip owns, scaled by (1 - keep): a leg the mask kept
+//         is the game's own planted foot and is never touched
+//   arms  always clip-driven, corrected at full strength
+// Only the two rotations per limb that the solve needs are written; every
+// position, scale and spare float in the buffer stays exactly as the clip
+// (or the game) left it.
+void apply_floor(std::uintptr_t buffer, float floor_y, float margin, float strength, float keep) noexcept;
+
 } // namespace dingosdk::skater::layers

@@ -39,6 +39,11 @@ std::string pose_playback_cost();
 // The two-second geometry summary in the log. Off by default.
 void set_pose_trace(bool enabled) noexcept;
 bool pose_trace();
+// Floor correction strength for the clip's feet and hands, 0..1 (0 off, the
+// default 1). The game plants its own feet before this tool's write; a clip
+// that sinks below them is lifted back with a two-bone solve.
+void set_pose_ik(float strength) noexcept;
+float pose_ik() noexcept;
 // Per-frame housekeeping on the client thread (start/stop, local component).
 void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept;
 // The animation-evaluation listener: overwrites the pose before it is rendered.
