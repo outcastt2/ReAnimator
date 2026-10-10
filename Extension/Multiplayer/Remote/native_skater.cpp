@@ -1,4 +1,5 @@
 #include "native_skater_internal.h"
+#include "Extension/Skater/Skitch/player_skitch.h"
 #include "native_pose_layout.h"
 #include "puppet_cost.h"
 #include "Extension/Multiplayer/Session/monotonic_clock.h"
@@ -333,6 +334,9 @@ void observe_destruction(std::uintptr_t entity) {
     }
 }
 bool render_pose_hook(std::uintptr_t animation_interface, std::uintptr_t render_data) {
+    // Local physics can replace the evaluated arm pose. Reach immediately before
+    // native publication constructs the skinning matrices from the final bones.
+    player_skitch::render_pose(animation_interface);
     const bool result = shared().original_render_pose(animation_interface, render_data);
     if (const auto listener = shared().render_listener.load(std::memory_order_acquire); result && listener)
         listener(animation_interface);
@@ -376,8 +380,11 @@ void animation_hook(std::uintptr_t component, std::uintptr_t update) {
         return;
     }
     shared().original_animation(component, update);
+    player_skitch::animation_evaluated(component);
     if (const auto listener = shared().evaluated_listener.load(std::memory_order_acquire))
         listener(component);
+    if (const auto playback = shared().pose_listener.load(std::memory_order_acquire))
+        playback(component);
 }
 void destroy_hook(std::uintptr_t entity, std::uintptr_t owner) {
     // Other SDK-created actors share this hook; they must forget the entity
@@ -597,5 +604,8 @@ void set_render_pose_listener(RenderPosePublished listener) noexcept {
 }
 void set_animation_evaluated_listener(AnimationEvaluated listener) noexcept {
     shared().evaluated_listener.store(listener, std::memory_order_release);
+}
+void set_pose_playback_listener(PoseOverride listener) noexcept {
+    shared().pose_listener.store(listener, std::memory_order_release);
 }
 } // namespace dingosdk::multiplayer

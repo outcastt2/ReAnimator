@@ -1,12 +1,19 @@
 #include "Engine/Core/Log/logging.h"
 #include "local_customization_runtime.h"
+#include "local_player_card_runtime.h"
 #include "Extension/Profile/runtime_internal.h"
+#include "Extension/Profile/local_profile.h"
 #include "Engine/Vfs/content_catalogs.h"
 #include "Engine/Game/Build/addresses.h"
 #include "Engine/Game/Build/20260929/engine.h"
 #include "Engine/Game/Build/20260929/local_customization.h"
+#include <algorithm>
+#include <fstream>
 #include <mutex>
 #include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace dingosdk::profile_runtime {
 CosmeticRuntime& cosmetic_runtime() { static auto* r = new CosmeticRuntime; return *r; }
@@ -130,17 +137,35 @@ bool refresh_cosmetic_catalog() {
         !read(manager + 0x3c, current_count) || current_count != count) return false;
     const auto& catalogs = content_cache::catalogs();
     c.ownership_unavailable = !catalogs.available;
-    std::vector<std::string> keys, objects, reserved_keys, reserved_objects;
+    // Gestures and build items are unlocked in full; every other cosmetic keeps
+    // the upstream open-catalogue rule, and only reserved items are revoked.
+    std::vector<std::string> seed_cosmetics, seed_objects, locked_cosmetics, locked_objects;
     for (const auto& [key, info] : items) {
         std::string folded = key;
         for (auto& letter : folded) if (letter >= 'A' && letter <= 'Z') letter = static_cast<char>(letter + ('a' - 'A'));
-        const bool held = catalogs.reserved(folded);
-        (info.build_kit ? (held ? reserved_objects : objects) : (held ? reserved_keys : keys)).push_back(key);
+        // Entitlement-granted collab collections ("Own_Own_...") are absent from
+        // the open content cache entirely -- it ships only content ReSkate can
+        // distribute -- so reserved() cannot see them. Treat them as reserved:
+        // they are the paid brand packs, and an owned paid item whose backing
+        // data the cache does not describe has crashed the client's item
+        // previews (a shared-pointer copy of an object that is not there).
+        const bool held = catalogs.reserved(folded) || folded.starts_with("own_own_");
+        if (info.build_kit) {
+            (profile::unlock_build_items ? seed_objects : locked_objects).push_back(key);
+        } else if (key.starts_with("own_rctn_gesture") || info.category.starts_with("gestures")) {
+            (profile::unlock_gesture_items ? seed_cosmetics : locked_cosmetics).push_back(key);
+        } else if (!held || profile::unlock_reserved_cosmetics) {
+            // Upstream ReSkate: the open catalogue is unlocked, which is the
+            // base game clothing and everything a mod installed.
+            seed_cosmetics.push_back(key);
+        } else {
+            locked_cosmetics.push_back(key);
+        }
     }
     if (!c.ownership_unavailable) {
-        s.store->seed_cosmetic_inventory(keys);
-        s.store->seed_object_inventory(objects);
-        s.store->reconcile_inventory(reserved_keys, reserved_objects);
+        s.store->seed_cosmetic_inventory(seed_cosmetics);
+        s.store->seed_object_inventory(seed_objects);
+        s.store->reconcile_inventory(locked_cosmetics, locked_objects);
     }
     {
         std::set<std::uint32_t> hashes;
@@ -152,8 +177,9 @@ bool refresh_cosmetic_catalog() {
     c.items = std::move(items); c.item_count = count; c.item_manager = manager;
     ++c.items_generation;
     std::ostringstream event;
-    event << "{\"event\":\"local_cosmetic_catalog\",\"installed\":" << keys.size()
-          << ",\"objects\":" << objects.size() << '}';
+    event << "{\"event\":\"local_cosmetic_catalog\",\"installed\":"
+          << seed_cosmetics.size() + locked_cosmetics.size() << ",\"objects\":"
+          << seed_objects.size() + locked_objects.size() << '}';
     dingosdk::logging::event(dingosdk::logging::Channel::customization, event.str().c_str());
     return true;
 }
@@ -191,27 +217,156 @@ bool read_cosmetic_recipes(const void* vector, profile::CosmeticLoadout& result,
     return true;
 }
 
-bool cosmetic_slot_categories(std::uintptr_t resource, std::map<std::uint32_t, std::uint32_t>& result) {
+namespace {
+// A slot names two different things: the slot itself, and the category it accepts items from.
+// Tattoos, gestures, stickers and several color/right-side slots share categories, so the slot name
+// is the only way to tell a shirt from a pair of pants. Only the diagnostic below wants the text,
+// so this is kept apart from cosmetic_slot_categories(), which wants only the hashes.
+struct SlotDefinition {
+    std::uint32_t hash{}, category_hash{};
+    std::string name, category;
+};
+
+bool read_slot_definitions(std::uintptr_t resource, std::vector<SlotDefinition>& out) {
     // RecipeTemplate.Slots is a 24-byte array (port name, slot asset, save flag).
-    // RecipeSlotAsset identifies its slot separately from its accepted Category.
-    // Tattoos, gestures, stickers and several color/right-side slots share categories.
     std::uintptr_t slots{}; std::uint32_t count{};
     if (!read(resource + 0x28, slots) || !cosmetic_array(slots, 24, 256, count)) return false;
     for (std::uint32_t i = 0; i < count; ++i) {
-        std::uintptr_t slot{}, type{}, name{}, category{}, category_name{};
-        std::uint32_t hash{}, category_hash{}; std::string text, category_text;
+        std::uintptr_t slot{}, type{}, name{}, category{};
+        SlotDefinition def;
         if (!read(slots + i * 24ULL + 8, slot)) return false;
         slot &= ~std::uintptr_t{4};
         if (!read(slot + 8, type) || type != local_runtime().base + addr::engine::cosmetic_slot_type ||
-            !read(slot + 0x20, name) || !cosmetic_text(name, text) || text.empty() ||
-            !read(slot + 0x4c, hash) || hash != cosmetic_hash(text) ||
+            !read(slot + 0x20, name) || !cosmetic_text(name, def.name) || def.name.empty() ||
+            !read(slot + 0x4c, def.hash) || def.hash != cosmetic_hash(def.name) ||
             !read(slot + 0x30, category)) return false;
         category &= ~std::uintptr_t{4};
-        if (!read(category + 0x28, category_name) || !cosmetic_text(category_name, category_text) || category_text.empty() ||
-            !read(category + 0x38, category_hash) || category_hash != cosmetic_hash(category_text) ||
-            !result.emplace(hash, category_hash).second) return false;
+        if (!read(category + 0x28, name) || !cosmetic_text(name, def.category) || def.category.empty() ||
+            !read(category + 0x38, def.category_hash) || def.category_hash != cosmetic_hash(def.category)) return false;
+        out.push_back(std::move(def));
     }
     return true;
+}
+}
+
+bool cosmetic_slot_categories(std::uintptr_t resource, std::map<std::uint32_t, std::uint32_t>& result) {
+    std::vector<SlotDefinition> definitions;
+    if (!read_slot_definitions(resource, definitions)) return false;
+    for (const auto& def : definitions)
+        if (!result.emplace(def.hash, def.category_hash).second) return false;
+    return true;
+}
+
+// Diagnostic: which cosmetic slots exist, what each is called, and what asset it currently holds.
+// Whether a slot can be emptied is the whole question behind a barefoot or shirtless character, and
+// the only record of it is the live recipe: neither the profile nor the catalogue records a slot's
+// default separately. Written once per session beside the log, because the log pipeline summarises
+// and would drop it. Read only; it never writes game state.
+namespace {
+bool cosmetic_slots_dumped{};
+void note_cosmetic_slots(const std::vector<CosmeticNativeRecipe>& native,
+    const profile::CosmeticLoadout& value) noexcept {
+    try {
+        // The player card rides the same load path but says nothing about clothing, and it is
+        // loaded first, so a card-only load must not touch the slot names.
+        const auto clothing = std::ranges::find_if(value.recipes, [](const profile::CosmeticRecipe& r) {
+            return r.template_key != player_card_template; });
+        if (clothing == value.recipes.end()) return; // Card only; wait for the character.
+        // Name every slot the character's template defines, once, while the recipe is still
+        // live: the recipes themselves carry hashes only, and a command asked for a name
+        // long after this load needs one. Cached on the first load because the template
+        // pointer is only valid here.
+        auto& names = cosmetic_runtime().slot_names;
+        if (names.empty()) {
+            std::vector<SlotDefinition> definitions;
+            if (read_slot_definitions(native[static_cast<std::size_t>(clothing - value.recipes.begin())].resource,
+                    definitions))
+                for (const auto& def : definitions) names.emplace(def.hash, def.name);
+        }
+        if (cosmetic_slots_dumped) return; // Once per session.
+        const auto path = logging::status().directory / L".." / L"cosmetic_slots.txt";
+        std::ofstream out(path, std::ios::trunc);
+        if (!out) return;
+        out << "# Cosmetic slots, read from the live recipe vector.\n";
+        out << "# slot    the slot's own name; accepts  the category it takes items from.\n";
+        out << "# asset   what the character is wearing there now. <EMPTY> means the slot\n";
+        out << "#         holds nothing, which is the state a barefoot look needs.\n";
+        out << "# UNREAD  the recipe has this slot but its definition could not be named.\n";
+        for (std::size_t r = 0; r < value.recipes.size(); ++r) {
+            const auto& recipe = value.recipes[r];
+            out << "\n# recipe " << r << " template " << recipe.template_key
+                << " version " << recipe.template_version
+                << " slots " << recipe.items.size();
+            if (r >= native.size()) { out << " native_unread\n"; continue; }
+            std::vector<SlotDefinition> definitions;
+            out << (read_slot_definitions(native[r].resource, definitions) ? "\n" : " definitions_unread\n");
+            for (const auto& item : recipe.items) {
+                const auto found = std::ranges::find_if(definitions,
+                    [&](const SlotDefinition& d) { return d.hash == item.slot; });
+                out << "  slot " << item.slot << ' ';
+                if (found == definitions.end()) out << "UNREAD";
+                else out << found->name << "  accepts " << found->category;
+                out << "  hash " << cosmetic_hash(item.asset)
+                    << "  asset " << (item.asset.empty() ? "<EMPTY>" : item.asset) << '\n';
+            }
+        }
+        out.close();
+        cosmetic_slots_dumped = true;
+        logging::log(logging::Level::info, logging::Channel::customization,
+            "Cosmetic slot diagnostic written ({} recipes).", value.recipes.size());
+    } catch (...) {}
+}
+}
+
+namespace {
+// A slot's own name is authoritative. The short form is accepted only when it is
+// unambiguous, because the slots are named by prefix (cust_, board_, tattoo_) and a
+// bare word like "color" could name several.
+std::optional<std::uint32_t> resolve_slot_name(std::string_view name) {
+    const auto& names = cosmetic_runtime().slot_names;
+    std::uint32_t suffix{};
+    std::size_t matches{};
+    for (const auto& [slot, slot_name] : names) {
+        if (slot_name == name) return slot;
+        if (slot_name.ends_with(name)) { suffix = slot; ++matches; }
+    }
+    return matches == 1 ? std::optional{suffix} : std::nullopt;
+}
+
+// The hidden slots as hashes, resolved once per outfit load rather than per slot.
+std::set<std::uint32_t> hidden_slot_hashes() {
+    std::set<std::uint32_t> result;
+    const auto snapshot = local_runtime().store->shared_snapshot();
+    if (!snapshot) return result;
+    for (const auto& [key, enabled] : snapshot->bool_options) {
+        if (!enabled || !key.starts_with(profile::hide_slot_prefix)) continue;
+        if (const auto slot = resolve_slot_name(key.substr(profile::hide_slot_prefix.size()))) result.insert(*slot);
+    }
+    return result;
+}
+}
+
+std::vector<std::string> cosmetic_slot_names() {
+    std::vector<std::string> result;
+    for (const auto& [slot, name] : cosmetic_runtime().slot_names) result.push_back(name);
+    return result;
+}
+
+std::vector<std::string> hidden_cosmetic_slots() {
+    std::vector<std::string> result;
+    for (auto slot : hidden_slot_hashes())
+        if (const auto& name = cosmetic_runtime().slot_names[slot]; !name.empty()) result.push_back(name);
+    return result;
+}
+
+bool set_cosmetic_slot_hidden(std::string_view slot, bool hidden) {
+    try {
+        const auto resolved = resolve_slot_name(slot);
+        if (!resolved) return false;
+        local_runtime().store->set_bool_option(std::string(profile::hide_slot_prefix) +
+            cosmetic_runtime().slot_names[*resolved], hidden);
+        return true;
+    } catch (...) { return false; }
 }
 
 bool complete_starter_recipes(const profile::CosmeticLoadout& value) {
@@ -309,6 +464,7 @@ bool load_cosmetic_hook(const void* wrapper, void* destination) {
         if (!saved) {
             profile::CosmeticLoadout starter; std::vector<CosmeticNativeRecipe> native;
             const bool valid = read_cosmetic_recipes(destination, starter, native);
+            if (valid) note_cosmetic_slots(native, starter);
             if (cosmetic_runtime().diagnostics.insert("starter_recipe:" + id).second) {
                 dingosdk::Json counts = dingosdk::Json::array();
                 if (valid) for (const auto& recipe : starter.recipes)
@@ -323,6 +479,7 @@ bool load_cosmetic_hook(const void* wrapper, void* destination) {
         c.blocked_loadouts.insert(id);
         profile::CosmeticLoadout defaults; std::vector<CosmeticNativeRecipe> native;
         if (!read_cosmetic_recipes(destination, defaults, native)) return cosmetic_diagnostic("load", "invalid_native_recipe", id);
+        note_cosmetic_slots(native, defaults);
         if (recover_card_only_preset(id, *saved, defaults)) return false;
         // The cosmetics manager cannot be read for the first seconds of a level
         // load, which is when the game asks for every slot up to the selected
@@ -339,6 +496,7 @@ bool load_cosmetic_hook(const void* wrapper, void* destination) {
         std::vector<CosmeticBorrowedArray<CosmeticNativeItem>> item_arrays;
         words.reserve(16 * 257); item_arrays.reserve(16);
         std::vector<CosmeticRuntime::HeldSlot> held;
+        const auto hidden = hidden_slot_hashes();
         for (std::size_t i = 0; i < saved->recipes.size(); ++i) {
             const auto& recipe = saved->recipes[i]; const auto& expected = defaults.recipes[i];
             if (recipe.template_key != expected.template_key || recipe.template_version != expected.template_version ||
@@ -364,9 +522,24 @@ bool load_cosmetic_hook(const void* wrapper, void* destination) {
             for (std::size_t j = 0; j < expected.items.size(); ++j) {
                 const auto match = saved_slots.find(expected.items[j].slot);
                 const auto* slot = match == saved_slots.end() ? &expected.items[j] : match->second;
-                if (match == saved_slots.end()) ++added;
+                const bool from_saved = match != saved_slots.end();
+                if (!from_saved) ++added;
                 else saved_slots.erase(match);
-                if (slot != &expected.items[j] && !slot->asset.empty()) {
+                if (hidden.contains(expected.items[j].slot)) {
+                    // A hidden slot is written empty whatever the preset holds. That is the same
+                    // shape the game already uses for its own unworn slots, so it renders as
+                    // nothing rather than as a missing item. The held entry keeps the saved item
+                    // out of harm's way: with an empty fallback the save path sees the slot still
+                    // showing the substitute and restores what the player actually picked.
+                    if (from_saved) held.push_back({i, *slot, {}});
+                    words.emplace_back(0); // An item with no parameters to vary.
+                    item_arrays.back().data()[j] = {"", words.back().data(), 0, expected.items[j].slot};
+                    dingosdk::logging::log(dingosdk::logging::Level::info, dingosdk::logging::Channel::customization,
+                        "Hiding slot {} (hash {}) for preset {}.", expected.items[j].slot,
+                        cosmetic_hash(slot->asset), id);
+                    continue;
+                }
+                if (from_saved && !slot->asset.empty()) {
                     // An item that is no longer installed (a removed mod, a catalog
                     // change) or no longer fits its slot falls back to the slot's
                     // default. Rejecting the whole outfit would also block every
