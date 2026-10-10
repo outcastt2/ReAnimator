@@ -15,6 +15,7 @@
 #include "Extension/Objects/network_object_runtime.h"
 #include "Extension/Objects/ParkEditor/park_editor_runtime.h"
 #include "Extension/Multiplayer/Remote/native_audio.h"
+#include "Extension/Multiplayer/Remote/native_vfx.h"
 #include "Extension/Skater/client_source_spawn.h"
 #include "Extension/Skater/no_bail.h"
 #include "Extension/Skater/physics_tuning.h"
@@ -74,6 +75,8 @@ void stop(Session &s, std::string reason) {
     s.tps = multiplayer_default_tps;
     s.object_placement = ObjectPlacement::everyone;
     s.object_limit = 0;
+    s.object_scaling = true;
+    s.sync_effects = true;
     set_lobby_object_limit(0);
     s.server_admin = false;
     s.server_bans.clear();
@@ -99,6 +102,8 @@ void stop(Session &s, std::string reason) {
     set_session_tuning_enforced(false);
     set_host_physics_extras({});
     s.server_votes = 0;
+    s.server_polls = 0;
+    s.server_custom_votes.clear();
     set_session_tools_allowed(true, true, true);
     s.object_clears.reset();
     s.clear_pending = false;
@@ -129,6 +134,7 @@ void stop(Session &s, std::string reason) {
     s.used_slots = 0;
     s.object_owners_valid = false;
     reset_audio();
+    reset_effects();
     s.public_host = s.started_map = s.roster_dirty = false;
     s.awaiting_map = s.join_map_authorized = s.map_load_submitted = false;
     s.join_started = s.last_map_request = s.last_map_load_check = 0;
@@ -155,6 +161,22 @@ void stop(Session &s, std::string reason) {
     s.next_send = s.last_hello = s.last_roster = s.last_cosmetic_capture = s.last_routes =
         s.last_network_log = 0;
     s.sequence = s.roster_sequence = 0;
+    s.server_chat_badge = default_server_chat_badge;
+    s.server_chat_text = default_server_chat_text;
+    s.vote = {};
+    s.vote_ends = 0;
+    s.vote_mine = 0;
+    s.announcement = {};
+    s.announcement_ends = 0;
+    server_vote_open_flag.store(false, std::memory_order_relaxed);
+    server_poll_answers_flag.store(0, std::memory_order_relaxed);
+    s.pose_streams.clear();
+    s.pose_ack = {};
+    s.pose_ack_due = false;
+    s.pose_upload = {};
+    s.own_poses.clear();
+    s.sound_streams.clear();
+    s.sound_upload = {};
     s.local_pose_count = s.logged_local_pose_count = 0;
     s.status = std::move(reason);
 }
@@ -162,6 +184,14 @@ void stop(Session &s, std::string reason) {
 // admission, password challenges and stable member slots intact.
 void clear_world(Session &s, std::uint64_t now) {
     s.voice.reset();
+    // The server starts its pose streams and message numbers over with the world.
+    s.pose_streams.clear();
+    s.pose_ack = {};
+    s.pose_ack_due = false;
+    s.pose_upload.restart();
+    s.own_poses.clear();
+    s.sound_streams.clear();
+    s.sound_upload.restart();
     clear_remote_network_objects();
     s.object_owners_valid = false;
     s.local_objects = {}; s.next_object_update = 0;
@@ -181,6 +211,7 @@ void clear_world(Session &s, std::uint64_t now) {
         peer.last_packet = now;
     }
     reset_audio();
+    reset_effects();
     s.started_map = false;
     s.context = s.parent = 0;
     s.sent_appearance.reset();
@@ -264,6 +295,7 @@ void publish_party(Session &s) {
         if (const auto saved = profile_runtime::local_value("NametagDistance"); saved && saved->is_number())
             s.nametag_distance = std::clamp(saved->get<float>(), 10.f, 500.f);
         s.nametag_dots = profile_runtime::local_preference("NametagDots").value_or(true);
+        s.prefer_direct = profile_runtime::local_preference("DirectConnections").value_or(true);
         if (const auto saved = profile_runtime::local_value("PlayerDistance"); saved && saved->is_number())
             s.player_distance = std::clamp(saved->get<float>(), player_distance_least, player_distance_unlimited);
         s.nametags_friends = profile_runtime::local_preference("NametagsFriendsOnly").value_or(false);
@@ -464,11 +496,27 @@ void render(Session &s, std::uintptr_t client, const NativeFrame &local, std::ui
             native_pass = true;
         }
         update_remote_cosmetics(s.base, local, *p.appearance.value(), p.cosmetic_status);
+        // The effects their costume and board items come with follow the outfit.
+        if (p.applied_cosmetics != p.cosmetic_revision && s.sync_effects) note_remote_outfit(now);
         p.last_cosmetic_apply = now;
         p.applied_cosmetics = p.cosmetic_revision;
     };
-    // The player's sound for this frame, every frame they are shown.
+    // The player's sound for this frame, every frame they are shown, and the effects of their
+    // skater's contacts that are due.
     const auto present_audio = [&](Peer &p) {
+        tick_remote_effects(now);
+        if (!s.sync_effects) p.impacts.clear();
+        while (!p.impacts.empty() && p.impacts.front().first <= now) {
+            const auto &impact = p.impacts.front().second;
+            float distance{};
+            for (unsigned i = 0; i < 3; ++i) {
+                const auto d = impact.position[i] - p.render_pose.root.position[i];
+                distance += d * d;
+            }
+            // Only where their skater is: a contact far from it is not theirs to place.
+            if (distance <= 30.f * 30.f) play_impact(impact);
+            p.impacts.pop_front();
+        }
         if (const auto audio = p.audio.sample(now)) {
             // Preserve discrete audio changes immediately, but let
             // unchanged continuous inputs and spatial transforms
@@ -849,6 +897,7 @@ void tick(std::uintptr_t base, std::uintptr_t client, bool ready, std::string_vi
             if (!install_entity_hooks(base, entity_detail) && !entity_detail.empty())
                 logging::log(logging::Level::warning, logging::Channel::runtime, "Multiplayer: {}", entity_detail);
             prepare_remote_audio(base);
+            prepare_effects(base);
             logging::log(logging::Level::info, logging::Channel::runtime,
                          "Multiplayer: remote-player hooks installed in {} ms (once, before anyone joins).",
                          (now_us() - started) / 1000);
@@ -889,6 +938,8 @@ void tick(std::uintptr_t base, std::uintptr_t client, bool ready, std::string_vi
         s.client_timing.record(ClientTiming::capture, now, receive_at);
         if (s.mode != Mode::echo)
             networking(s, local, receive_at);
+        for (const auto &note : s.transport.take_direct_notes())
+            logging::log(logging::Level::info, logging::Channel::runtime, "Multiplayer: {}", note);
         relay_throwdowns(s, world_playing(s, local));
         // A S.K.A.T.E. player waiting for their turn stays off the board.
         update_board_lock(client, local.entity, local.ready && throwdown_relay_waits_offboard());

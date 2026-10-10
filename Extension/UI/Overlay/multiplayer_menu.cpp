@@ -1,5 +1,6 @@
 #include "multiplayer_menu_internal.h"
 #include "role_badge.h"
+#include "Extension/Boot/discord_presence.h"
 #include "Engine/Game/World/world_names.h"
 #include <algorithm>
 #include <atomic>
@@ -21,6 +22,11 @@ bool queue_multiplayer_action(const char* action, const std::string& argument) {
     const auto callback = private_queue.load();
     std::array<char, 256> result{};
     return callback && callback(action, argument.c_str(), "", result.data(), result.size());
+}
+bool queue_multiplayer_action(const char* action, const std::string& argument, const std::string& password) {
+    const auto callback = private_queue.load();
+    std::array<char, 256> result{};
+    return callback && callback(action, argument.c_str(), password.c_str(), result.data(), result.size());
 }
 } // namespace dingosdk::overlay::detail
 
@@ -256,6 +262,15 @@ void multiplayer_display_settings(SkateMenu &menu, const Model &model) {
             (*menu.player_distance_pending == mp.player_distance || ImGui::GetTime() >= menu.player_distance_until))
             menu.player_distance_pending.reset();
     }
+    bool direct = mp.prefer_direct;
+    if (toggle_row(menu, "Direct connections",
+                   "Connect straight to dedicated servers that offer it: the shortest route, so the lowest ping. The server can then "
+                   "see your IP address, as with any game's dedicated servers; other players never can. Off: always through Steam's "
+                   "relays. Applies from the next server you join.",
+                   direct)) {
+        std::array<char, 65> unused{};
+        send_private(menu, "direct-connections", direct ? "on" : "off", unused, false);
+    }
     bool nametags = mp.nametags;
     if (toggle_row(menu, "Player nametags",
                    "The name above each skater, with their distance: purple for ReSkate developers, red for content creators, "
@@ -300,6 +315,13 @@ void multiplayer_display_settings(SkateMenu &menu, const Model &model) {
     if (toggle_row(menu, "Chat filter", "Show bad words in chat messages and names as ****.", filter, mp.chat_visible, "OFF")) {
         std::array<char, 65> unused{};
         send_private(menu, "chat-filter", filter ? "on" : "off", unused, false);
+    }
+    if (dingosdk::discord_presence::available()) {
+        bool discord = dingosdk::discord_presence::enabled();
+        if (toggle_row(menu, "Discord status",
+                "Show on your Discord profile where you are skating: the map, the server or lobby and how many are in it. A session with a password shows no name.",
+                discord))
+            dingosdk::discord_presence::set_enabled(discord);
     }
     bool bubbles = mp.chat_bubbles;
     if (toggle_row(menu, "Chat bubbles", "Show each player's newest chat line in a bubble above their skater.", bubbles)) {

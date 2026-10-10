@@ -123,12 +123,16 @@ void settings_window(Launcher& launcher, const Fonts& fonts, ImVec2 size, Ui& ui
     // ------------------------------------------------ rail
     const float rail_top = top + title_size + S(20);
     ImGui::SetCursorPos(ImVec2(rail_x, rail_top));
-    ImGui::BeginChild("##settings_rail", ImVec2(rail_width, bottom - rail_top));
+    // Flattened, so a controller's D-pad crosses from the rail into the page and back.
+    ImGui::BeginChild("##settings_rail", ImVec2(rail_width, bottom - rail_top), ImGuiChildFlags_NavFlattened);
     static constexpr std::array<const char*, 4> names{"GAME", "DISPLAY", "KEYS", "ADVANCED"};
     ImGui::BeginDisabled(binding);
-    for (int i = 0; i < static_cast<int>(names.size()); ++i)
+    for (int i = 0; i < static_cast<int>(names.size()); ++i) {
         if (nav_tile(fonts, rail_width, names[static_cast<std::size_t>(i)], ui.settings_tab == i))
             ui.settings_tab = i;
+        // A controller starts on the open tab's tile.
+        if (ui.settings_tab == i) default_focus();
+    }
     ImGui::SetCursorPosY(ImGui::GetWindowHeight() - S(38));
     push_primary_button();
     if (ImGui::Button("\xe2\x86\x90  BACK", ImVec2(-1, S(34)))) open = false;
@@ -140,9 +144,9 @@ void settings_window(Launcher& launcher, const Fonts& fonts, ImVec2 size, Ui& ui
     // Kept to a readable column: settings are sentences, not a table.
     ImGui::SetCursorPos(ImVec2(content_x, top));
     ImGui::BeginChild("##settings_content",
-        ImVec2(std::min(S(760), frame.x - content_x - S(28)), bottom - top));
+        ImVec2(std::min(S(760), frame.x - content_x - S(28)), bottom - top), ImGuiChildFlags_NavFlattened);
     const float footer = ImGui::GetTextLineHeight() + S(16);
-    ImGui::BeginChild("##settings_page", ImVec2(0, ImGui::GetWindowHeight() - footer));
+    ImGui::BeginChild("##settings_page", ImVec2(0, ImGui::GetWindowHeight() - footer), ImGuiChildFlags_NavFlattened);
     switch (ui.settings_tab) {
     case 0: {
         section_caption(fonts, "GAME FOLDER");
@@ -161,6 +165,8 @@ void settings_window(Launcher& launcher, const Fonts& fonts, ImVec2 size, Ui& ui
                       "Used automatically whenever Steam isn't running.", settings.offline);
         setting_check("Loose files", "Export the game's scripts/ and config/ beside Skate.exe so you can edit them.",
                       settings.loose_files);
+        setting_check("Discord status", "Show on your Discord profile where you are skating: the map, the server or lobby "
+                      "and how many are in it. Off, the game does not talk to Discord at all.", settings.discord_status);
         ImGui::Spacing();
         section_caption(fonts, "EXTRA GAME ARGUMENTS");
         std::array<char, 1024> arguments{};
