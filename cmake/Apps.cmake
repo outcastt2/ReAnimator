@@ -24,6 +24,9 @@ if(DINGOSDK_BUILD_LAUNCHER_TESTS AND WIN32)
     target_link_libraries(dingosdk_gamepad_input_tests PRIVATE dingosdk_imgui)
     target_include_directories(dingosdk_gamepad_input_tests PRIVATE "${PROJECT_SOURCE_DIR}")
     add_test(NAME launcher_gamepad_input COMMAND dingosdk_gamepad_input_tests)
+    add_executable(dingosdk_depot_output_tests Launcher/Test/depot_output_tests.cpp)
+    target_include_directories(dingosdk_depot_output_tests PRIVATE "${PROJECT_SOURCE_DIR}")
+    add_test(NAME launcher_depot_output COMMAND dingosdk_depot_output_tests)
     add_executable(dingosdk_content_catalogs_tests Engine/Vfs/Test/content_catalogs_tests.cpp)
     target_link_libraries(dingosdk_content_catalogs_tests PRIVATE dingosdk_content_cache)
     add_test(NAME content_catalogs COMMAND dingosdk_content_catalogs_tests)
@@ -170,7 +173,7 @@ endif()
 add_executable(dingosdk_server Server/main.cpp Server/server_host.cpp Server/server_party.cpp
     Extension/Multiplayer/Session/party_book.cpp Server/server_config.cpp Server/steam_server.cpp
     Server/server_update.cpp Server/server_release.cpp $<$<BOOL:${WIN32}>:Launcher/updater.cpp>
-    Server/global_bans.cpp Extension/Multiplayer/developer_identity.cpp
+    Server/global_bans.cpp Extension/Multiplayer/developer_identity.cpp Extension/Multiplayer/word_lists.cpp
     Extension/Multiplayer/Steam/steam_transport.cpp Extension/Multiplayer/Net/protocol.cpp
     Extension/Multiplayer/Net/delta_codec.cpp Extension/Multiplayer/Net/wire_codec.cpp
     Extension/Multiplayer/Remote/playback_buffers.cpp Extension/Multiplayer/Session/password.cpp

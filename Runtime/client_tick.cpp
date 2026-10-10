@@ -11,6 +11,8 @@
 #include "Extension/UI/NativeMenu/native_menu.h"
 #include "Extension/Multiplayer/Hud/native_party.h"
 #include "Extension/Multiplayer/Session/session.h"
+#include "Extension/Boot/discord_presence.h"
+#include "Engine/Game/World/world_names.h"
 #include "Extension/Multiplayer/Hud/custom_nametags.h"
 #include "Extension/Multiplayer/developer_identity.h"
 #include "Extension/Multiplayer/Hud/follow_camera.h"
@@ -395,6 +397,7 @@ void update_model(std::uintptr_t client, TickState& frame) {
     // The switches on buttons (action_binds): each runs its console command.
     std::array<std::uint32_t, dingosdk::action_binds.size()> action_combos{};
     const bool vote_open = dingosdk::multiplayer::server_vote_open();
+    const unsigned poll_answers = dingosdk::multiplayer::server_poll_answers();
     bool freecam_controller = dingosdk::local_freecam_controller();
     {
         std::lock_guard lock(r.mutex);
@@ -419,7 +422,7 @@ void update_model(std::uintptr_t client, TickState& frame) {
     DingoSDKOverlaySetFreecamInputCapture(dingosdk::client_free_camera_active() && freecam_controller);
     dingosdk::ControllerInput controller;
     if (freecam_controller_combo || freecam_combo || tp_to_freecam_combo || noclip_combo || forward_velocity_combo || up_velocity_combo || offboard_up_velocity_combo ||
-        vote_yes_combo || vote_no_combo || std::ranges::any_of(action_combos, [](auto combo) { return combo != 0; }))
+        vote_yes_combo || vote_no_combo || poll_answers || std::ranges::any_of(action_combos, [](auto combo) { return combo != 0; }))
         DingoSDKOverlayReadControllerInput(&controller);
     for (std::size_t i = 0; i < action_combos.size(); ++i)
         if (r.action_bind_latches[i].update(action_combos[i], controller, r.observer_failed)) {
@@ -434,6 +437,14 @@ void update_model(std::uintptr_t client, TickState& frame) {
         record("{\"event\":\"controller_binding_triggered\",\"action\":\"vote_yes\"}");
     if (r.vote_no_bind_latch.update(vote_no_combo, controller, !vote_open) && dingosdk::multiplayer::queue_command("vote", "no", ""))
         record("{\"event\":\"controller_binding_triggered\",\"action\":\"vote_no\"}");
+    // A poll's answers are on the number keys, 1 for the first: only while one is running, so
+    // the keys are the game's own the rest of the time.
+    for (unsigned answer = 0; answer < r.poll_answer_latches.size(); ++answer) {
+        const std::uint32_t key = answer < poll_answers ? dingosdk::keyboard_binding_tag | ('1' + answer) : 0U;
+        const char number[2]{static_cast<char>('1' + answer), 0};
+        if (r.poll_answer_latches[answer].update(key, controller, !poll_answers) && dingosdk::multiplayer::queue_command("vote", number, ""))
+            record("{\"event\":\"controller_binding_triggered\",\"action\":\"poll_answer\"}");
+    }
     
     if (r.freecam_controller_bind_latch.update(freecam_controller_combo, controller, r.observer_failed || controller_busy || !r.debug_model.free_camera)) {
         if (dingosdk::set_local_freecam_controller(!freecam_controller))
@@ -1111,6 +1122,41 @@ void tick(std::uintptr_t client, std::uintptr_t update) {
                 dingosdk::overlay::notify(dingosdk::overlay::NoticeLevel::warning, "Map not installed", std::move(notice));
         }
         dingosdk::multiplayer::refresh_identity_lists();
+        // The player's Discord status (discord_presence.h): where they skate and with whom,
+        // looked at every couple of seconds.
+        if (static std::uint64_t next_presence{}; dingosdk::discord_presence::available() && GetTickCount64() >= next_presence) {
+            next_presence = GetTickCount64() + 2000;
+            const auto mp = dingosdk::multiplayer::model();
+            const bool session = mp.active && !mp.echo && (mp.hosting || mp.connected);
+            // A destination is "root|level": the level names the map. Maps ReSkate adds are "reskate <name>".
+            const std::string_view destination = session && !mp.map.empty() ? std::string_view(mp.map) : std::string_view(r.multiplayer_map);
+            auto map = dingosdk::world_level_name(destination.substr(destination.find_last_of('|') + 1));
+            if (map.size() > 8 && (map.starts_with("reskate ") || map.starts_with("ReSkate "))) map.erase(0, 8);
+            dingosdk::discord_presence::Presence presence;
+            presence.details = map.empty() ? std::string("Skating") : "On " + map;
+            if (!session) {
+                presence.state = "Solo skating";
+            } else {
+                // A session behind a password keeps its name to itself.
+                presence.state = mp.password_required ? std::string(mp.dedicated ? "Private server" : "Private lobby")
+                                 : mp.lobby_name.empty() ? std::string(mp.dedicated ? "On a server" : "In a lobby")
+                                 : (mp.dedicated ? "Server: " : "Lobby: ") + mp.lobby_name;
+                presence.party_size = mp.players;
+                presence.party_most = std::max(mp.capacity, mp.players);
+                presence.party = std::to_string(mp.host_id);
+                // Anyone may walk in: no password, and a server or a lobby that is publicly listed
+                // (one shared by code stays with those who were given the code).
+                if (!mp.password_required && (mp.dedicated || (mp.public_host && mp.lobby_listed) || mp.public_lobby))
+                    presence.join = mp.join_code;
+            }
+            dingosdk::discord_presence::update(std::move(presence));
+        }
+        // A session the player chose to join from Discord, once the game can join one.
+        if (static std::string discord_join; dingosdk::discord_presence::available()) {
+            if (auto asked = dingosdk::discord_presence::take_join(); !asked.empty()) discord_join = std::move(asked);
+            if (!discord_join.empty() && multiplayer_ready && dingosdk::multiplayer::queue_command("join", discord_join, ""))
+                discord_join.clear();
+        }
         dingosdk::tick_local_developer_hoodie(r.base, client, multiplayer_ready);
         dingosdk::tick_local_developer_board(r.base, client, multiplayer_ready);
         // The session spawns and places skaters and can teleport: check the camera again.

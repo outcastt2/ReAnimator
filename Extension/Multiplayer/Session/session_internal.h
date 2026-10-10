@@ -2,6 +2,8 @@
 #include "Engine/Game/Multiplayer/chat_rate.h"
 #include "session.h"
 #include "Extension/Multiplayer/developer_identity.h"
+#include "Extension/Multiplayer/word_lists.h"
+#include "Engine/Core/Text/word_filter.h"
 #include "Extension/Customization/developer_hoodie.h"
 #include "Extension/Customization/developer_board.h"
 #include "Extension/Multiplayer/Remote/native_skater.h"
@@ -190,6 +192,8 @@ struct Session {
     std::vector<std::uint8_t> extras_packet;
     std::uint64_t next_extras_check{};
     std::uint8_t server_votes{}; // guest of a dedicated server: the votes it runs
+    std::uint8_t server_polls{}; // ... who may start a poll there (ServerPolls)
+    std::vector<ServerCustomVote> server_custom_votes; // ... and its owner's own votes
     // Host: bumped per "delete all guest objects". Guest: the last value seen
     // (unset until the first roster) and whether a local wipe is outstanding.
     std::optional<std::uint32_t> object_clears;
@@ -197,6 +201,8 @@ struct Session {
     bool force_world_layers{};
     // Players the host kicked. They cannot reconnect until the session ends.
     std::set<std::uint64_t> banned;
+    // Warnings each guest of this lobby has had for words that are not allowed at all (word_lists.h).
+    std::map<std::uint64_t, unsigned> word_warnings;
     // Host: Steam IDs whose attempts to join keep failing wait longer each time (room.h).
     JoinBackoff join_backoff;
     // Players banned for good (every session this PC hosts), from the local profile.
@@ -213,7 +219,7 @@ struct Session {
     std::mutex request_mutex;
     std::deque<std::unique_ptr<PrivateRequest>> requests;
     SteamTransport transport;
-    SteamLobbies lobbies{make_steam_lobby_api()};
+    SteamLobbies lobbies{make_steam_lobby_api(), [](std::uint64_t host) { return banned_host(host) || reskate_banned(host); }};
     SteamServerBrowser servers;
     // Guest of a dedicated server: whether the roster lists us as an admin,
     // and the server's voice range from it.
@@ -222,10 +228,13 @@ struct Session {
     // The colours of the dedicated server's own chat lines, as its roster gives them.
     std::uint32_t server_chat_badge = default_server_chat_badge, server_chat_text = default_server_chat_text;
     // The dedicated server's vote as its roster last gave it, when it ends by this game's clock,
-    // and what this player answered in it (0 nothing yet, 1 yes, 2 no).
+    // and what this player answered in it (0 nothing yet, 1 yes, 2 no; in a poll 1 + the answer).
     ServerVote vote;
     std::uint64_t vote_ends{};
     std::uint8_t vote_mine{};
+    // The dedicated server's announcement as its roster last gave it, and when it goes by this game's clock.
+    ServerAnnouncement announcement;
+    std::uint64_t announcement_ends{};
     // The server's ban list, as sent to us while we are one of its admins.
     std::vector<MultiplayerBan> server_bans;
     std::uint32_t server_ban_total{};
@@ -427,8 +436,11 @@ std::string send_chat(Session &s, std::string_view typed);
 std::string send_chat_command(Session &s, std::string_view typed);
 // Answers the dedicated server's running vote, as /yes or /no in chat does.
 std::string cast_server_vote(Session &s, bool yes);
+// Answers the dedicated server's running poll (0: its first answer), as /1, /2... in chat does.
+std::string answer_server_poll(Session &s, std::size_t answer);
 // Whether a vote the local player may answer is running: read by the game thread for the binds.
 inline std::atomic<bool> server_vote_open_flag{};
+inline std::atomic<unsigned> server_poll_answers_flag{};
 // "/p <message>" in a lobby: one line for the local player's party only, relayed by the host.
 std::string send_party_chat(Session &s, std::string_view typed);
 // The "/" commands this session offers (the chat overlay lists them as the player types "/").
