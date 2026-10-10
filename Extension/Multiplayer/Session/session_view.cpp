@@ -168,6 +168,7 @@ void publish(Session &s, const NativeFrame *local) {
     view.direct_upload_limit = s.direct_upload.limit;
     view.active = s.mode != Mode::off;
     view.hosting = s.mode == Mode::host;
+    view.map_fetching = s.fetching_since != 0;
     view.echo = s.mode == Mode::echo;
     view.local_id = t.local_id;
     view.local_name = s.mode != Mode::off ? s.transport.name(t.local_id) : steam_social_snapshot()->local.name;
@@ -178,6 +179,10 @@ void publish(Session &s, const NativeFrame *local) {
     view.saved_host = {true, s.host_preferences.public_lobby, s.host_preferences.password_required,
                        static_cast<int>(s.host_preferences.capacity), s.host_preferences.tps, s.host_preferences.lobby_name};
     view.nametags = s.nametags;
+    if (const auto social = steam_social_snapshot())
+        view.steam_ids_shown = identity_listed(social->local.id, IdentityList::developer) ||
+                               identity_listed(social->local.id, IdentityList::staff) ||
+                               identity_listed(social->local.id, IdentityList::homie);
     if (const auto social = steam_social_snapshot())
         if (const auto mark = identity_mark(social->local.id)) {
             std::tie(view.identity_tag_colour, view.identity_tag) = mark_role(*mark);
