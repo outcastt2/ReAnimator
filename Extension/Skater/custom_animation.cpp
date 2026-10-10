@@ -16,6 +16,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <format>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -109,9 +110,44 @@ struct Playback {
     std::uint32_t physics_state{UINT32_MAX};
     bool offboard_motion{};
     ULONGLONG summary_at{};
+    // Diagnostics. The geometry summary is off unless `poseanim trace 1` asks for
+    // it, and the handler cost is always measured: this tool runs inside the
+    // engine's frame, so it should be able to say what it costs.
+    std::atomic<bool> trace{};
+    std::atomic<std::uint64_t> handler_ticks{};
+    std::atomic<std::uint64_t> handler_peak{};
+    std::atomic<std::uint32_t> handler_frames{};
 };
 Playback &playback() { static Playback p; return p; }
 std::mutex &status_mutex() { static std::mutex m; return m; }
+// The performance counter's frequency, read once. Every frame this tool spends
+// inside the engine is measured against it.
+std::uint64_t performance_frequency() noexcept {
+    static const std::uint64_t value = [] {
+        LARGE_INTEGER frequency{};
+        return static_cast<std::uint64_t>(QueryPerformanceFrequency(&frequency) && frequency.QuadPart > 0
+                                              ? frequency.QuadPart
+                                              : 1);
+    }();
+    return value;
+}
+// Times the per-frame handler and folds the result into the playback record.
+struct HandlerTimer {
+    Playback &owner;
+    LARGE_INTEGER begin{};
+    explicit HandlerTimer(Playback &value) noexcept : owner(value) { QueryPerformanceCounter(&begin); }
+    ~HandlerTimer() noexcept {
+        LARGE_INTEGER end{};
+        QueryPerformanceCounter(&end);
+        const auto elapsed = static_cast<std::uint64_t>(end.QuadPart - begin.QuadPart);
+        owner.handler_ticks.fetch_add(elapsed, std::memory_order_relaxed);
+        owner.handler_frames.fetch_add(1, std::memory_order_relaxed);
+        auto peak = owner.handler_peak.load(std::memory_order_relaxed);
+        while (elapsed > peak &&
+               !owner.handler_peak.compare_exchange_weak(peak, elapsed, std::memory_order_relaxed)) {
+        }
+    }
+};
 void set_status(const std::string &text) {
     std::lock_guard lock(status_mutex());
     playback().status = text;
@@ -308,9 +344,10 @@ void sample_motion(Playback &p, const PoseLocation &pose, std::uintptr_t compone
     p.on_board = state == UINT32_MAX
         ? !p.offboard_motion
         : !(state == addr::no_bail::offboard_physics_state || state == addr::no_bail::wipeout_physics_state);
-    // A summary every couple of seconds, so one session in a log is enough to
-    // see what the layer decided and where the legs it kept actually are.
-    if (now >= p.summary_at + 2000 && pose.buffer) {
+    // A geometry summary, only when tracing: one line says what the layer
+    // decided and where the legs it kept actually are. Off by default, because
+    // a clip that plays for minutes does not need to narrate itself.
+    if (p.trace.load(std::memory_order_relaxed) && now >= p.summary_at + 2000 && pose.buffer) {
         p.summary_at = now;
         const std::uint32_t pelvis_chain[] = {1, 7};
         const std::uint32_t left_chain[] = {1, 7, 8, 9, 10};
@@ -409,6 +446,7 @@ void on_pose_evaluated(std::uintptr_t component) noexcept {
 // Runs after the engine's own post-physics constraints, on the same update
 // order. This is the write that survives to the renderer.
 void on_skeleton_responded(std::uintptr_t rig) noexcept {
+    HandlerTimer measured(playback());
     try {
         auto &p = playback();
         if (!rig) return;
@@ -525,6 +563,24 @@ std::string pose_playback_status() {
     return playback().status;
 }
 
+std::string pose_playback_cost() {
+    auto &p = playback();
+    const auto frames = p.handler_frames.load(std::memory_order_relaxed);
+    if (!frames) return "Animation handler: not measured yet.";
+    const auto frequency = static_cast<double>(performance_frequency());
+    const auto average_us = 1e6 * static_cast<double>(p.handler_ticks.load(std::memory_order_relaxed)) / frequency /
+                            static_cast<double>(frames);
+    const auto peak_us = 1e6 * static_cast<double>(p.handler_peak.load(std::memory_order_relaxed)) / frequency;
+    // A 60 Hz frame is 16.67 ms; the share of one is the number that matters.
+    const auto share = average_us / 16666.7 * 100.0;
+    return std::format(
+        "Animation handler: {:.1f} us average, {:.1f} us worst, over {} frames ({:.3f}% of a 60 Hz frame).",
+        average_us, peak_us, frames, share);
+}
+
+void set_pose_trace(bool enabled) noexcept { playback().trace.store(enabled, std::memory_order_relaxed); }
+bool pose_trace() { return playback().trace.load(std::memory_order_relaxed); }
+
 void set_pose_mask(PoseMask mask) noexcept {
     auto &p = playback();
     p.mask.store(static_cast<int>(mask), std::memory_order_relaxed);
@@ -631,6 +687,9 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
         p.physics_state = UINT32_MAX;
         p.mask_updated = GetTickCount64();
         p.summary_at = p.mask_updated;
+        p.handler_ticks.store(0, std::memory_order_relaxed);
+        p.handler_peak.store(0, std::memory_order_relaxed);
+        p.handler_frames.store(0, std::memory_order_relaxed);
         // The write that survives is the one after the engine's post-physics
         // response. That hook belongs to No Bail, which installs it at startup;
         // if it is missing, say so rather than playing invisibly.

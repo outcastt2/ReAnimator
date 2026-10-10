@@ -33,6 +33,12 @@ std::string save_recorded_clip(std::string_view path);
 // Queue a dump of the live skeleton resource beside the log (read-only).
 void request_skeleton_dump();
 std::string pose_playback_status();
+// What this tool's per-frame work actually costs, averaged since playback began.
+// It runs inside the engine's frame; this is how it answers for itself.
+std::string pose_playback_cost();
+// The two-second geometry summary in the log. Off by default.
+void set_pose_trace(bool enabled) noexcept;
+bool pose_trace();
 // Per-frame housekeeping on the client thread (start/stop, local component).
 void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept;
 // The animation-evaluation listener: overwrites the pose before it is rendered.
