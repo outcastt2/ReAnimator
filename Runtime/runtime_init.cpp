@@ -10,11 +10,13 @@
 #include "Engine/Game/Build/supported_build.h"
 #include "Engine/Vfs/mod_catalog.h"
 #include "Extension/Boot/offline_boot.h"
+#include "Extension/HallOfMeat/hall_of_meat.h"
 #include "Extension/Skater/camera_observer.h"
 
 #include "Extension/Progression/entitlement_request_hook.h"
 #include "Extension/Skater/skater_observer.h"
 #include "Extension/UI/NativeMenu/native_menu.h"
+#include "Extension/UI/NativeMenu/ui_sound.h"
 #include "Extension/Throwdowns/throwdown_lab.h"
 #include "Extension/Multiplayer/Session/session.h"
 #include "Extension/Throwdowns/throwdown_debug_text.h"
@@ -188,6 +190,9 @@ extern "C" __declspec(dllexport) BOOL WINAPI DingoSDKDebugInitialize() {
         dingosdk::multiplayer::set_native_menu_callbacks(native_callbacks);
         dingosdk::overlay::set_multiplayer_queue(queue_multiplayer_command);
         dingosdk::overlay::set_chat_feed(dingosdk::multiplayer::chat);
+        dingosdk::overlay::set_hub_page_feed(dingosdk::multiplayer::native_menu_page);
+        dingosdk::overlay::set_hub_callbacks(native_callbacks);
+        dingosdk::overlay::set_ui_sound(dingosdk::multiplayer::queue_ui_sound);
         dingosdk::overlay::set_game_text_feed(dingosdk::multiplayer::skate_debug_text);
         dingosdk::overlay::set_skate_hud_feed(dingosdk::multiplayer::skate_hud);
         dingosdk::overlay::set_nametag_feed(dingosdk::multiplayer::custom_nametags);
@@ -369,6 +374,8 @@ extern "C" __declspec(dllexport) BOOL WINAPI DingoSDKDebugInitialize() {
         const bool camera_hook = dingosdk::start_camera_observer(r.base);
         record("{\"event\":\"camera_observer_initialized\",\"active\":" + std::string(camera_hook ? "true" : "false") + "}");
         (void)dingosdk::start_no_bail(r.base);
+        const bool meat = dingosdk::hall_of_meat::start(r.base);
+        record("{\"event\":\"hall_of_meat_initialized\",\"active\":" + std::string(meat ? "true" : "false") + "}");
         const bool noclip_velocity = dingosdk::start_client_noclip_velocity(r.base);
         record("{\"event\":\"noclip_velocity_initialized\",\"active\":" + std::string(noclip_velocity ? "true" : "false") + "}");
         const bool loading_screens = dingosdk::loading_screen::start(r.base);
