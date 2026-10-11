@@ -15,12 +15,12 @@ namespace dingosdk::skater {
 // else is a path to a .rska clip file.
 void request_pose_playback(std::string clip);
 void request_pose_playback_stop();
-// Floor correction off for one clip: the clip is written exactly as authored,
-// the old system before per-leg floors. The override is remembered per clip
-// name, so re-running `poseanim <file>` after a quickswap re-export keeps it;
-// `set_pose_clip_noik(name, false)` (or `poseanim <file> ik`) clears it.
-void set_pose_clip_noik(std::string_view clip, bool noik) noexcept;
-bool pose_clip_noik(std::string_view clip) noexcept;
+// Floor correction is opt-in per clip: off unless `poseanim <file> ik` was
+// given, remembered per clip name, so re-running `poseanim <file>` after a
+// quickswap re-export keeps the flag; `set_pose_clip_ik(name, false)` (or
+// `poseanim <file> noik`) clears it.
+void set_pose_clip_ik(std::string_view clip, bool ik) noexcept;
+bool pose_clip_ik(std::string_view clip) noexcept;
 // Which joints a custom animation is allowed to drive. The game can keep the
 // pelvis and both legs, so a clip layers on top of walking or a board stance
 // the way the game's own moving gestures do.

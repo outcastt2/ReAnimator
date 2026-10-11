@@ -622,7 +622,7 @@ void register_movement_commands(Commands &registry) {
     // Route B: overwrite the local skater's pose with a baked custom animation.
     auto poseanim = action("poseanim",
         "Custom animation: poseanim test | record | off | play | save <path> | mask auto|full|legs | ik <0..1> | "
-        "trace 0|1 | <file>.rska [noik|ik]",
+        "trace 0|1 | <file>.rska [ik|noik]",
         Group::movement, {argument("clip", Type::text, true), argument("path", Type::text, true),
                           argument("flag", Type::text, true)});
     poseanim.execution = Execution::local;
@@ -636,7 +636,7 @@ void register_movement_commands(Commands &registry) {
             out(skater::pose_playback_status());
             out("Masking: " + skater::pose_mask_name() + ".");
             out("Floor correction: " + std::to_string(skater::pose_ik()).substr(0, 4) +
-                " (poseanim ik <0..1>; per-clip opt-out: poseanim <file> noik).");
+                " (per clip: poseanim <file> ik opts a clip in; off by default).");
             out(skater::pose_playback_cost());
             out(std::string("Layer trace: ") + (skater::pose_trace() ? "on" : "off") + " (poseanim trace 0|1).");
             return;
@@ -690,19 +690,19 @@ void register_movement_commands(Commands &registry) {
             // the file, which is what a bare name does too.
             if (args.size() > 1) {
                 const auto name = std::get<std::string>(args[1]);
-                // An optional trailing noik/ik sets this clip's floor-correction
-                // override and is remembered for the next run of the same name.
+                // An optional trailing ik/noik opts this clip into floor
+                // correction and is remembered for the next run of the same name.
                 if (args.size() > 2) {
                     const auto flag = lower(std::get<std::string>(args[2]));
-                    if (flag != "noik" && flag != "ik") {
-                        out("usage: poseanim play <file>.rska [noik|ik]");
+                    if (flag != "ik" && flag != "noik") {
+                        out("usage: poseanim play <file>.rska [ik|noik]");
                         return;
                     }
-                    skater::set_pose_clip_noik(name, flag == "noik");
+                    skater::set_pose_clip_ik(name, flag == "ik");
                 }
                 skater::request_pose_playback(name);
                 out("Playing " + name +
-                    (skater::pose_clip_noik(name) ? " (floor correction off for this clip)..." : "..."));
+                    (skater::pose_clip_ik(name) ? " (floor correction on for this clip)..." : "..."));
             } else {
                 skater::request_pose_record_playback();
                 out("Playing the recorded pose...");
@@ -716,21 +716,22 @@ void register_movement_commands(Commands &registry) {
             out(error.empty() ? "Saved: " + path : "error: " + error);
             return;
         }
-        // A bare file name plays it; an optional trailing noik/ik sets this
-        // clip's floor-correction override -- "poseanim sit noik" plays a sit
-        // animation exactly as authored, with no leg, foot or torso
-        // correction, and remembers that for the next run of the same name.
+        // A bare file name plays it; an optional trailing ik/noik opts this
+        // clip into floor correction -- "poseanim dance ik" plays the clip with
+        // the leg, foot and torso correction on and remembers that for the
+        // next run of the same name. Without the flag a clip is written
+        // exactly as authored.
         if (args.size() > 1) {
             const auto flag = lower(std::get<std::string>(args[1]));
-            if (flag != "noik" && flag != "ik") {
-                out("usage: poseanim <file>.rska [noik|ik]");
+            if (flag != "ik" && flag != "noik") {
+                out("usage: poseanim <file>.rska [ik|noik]");
                 return;
             }
-            skater::set_pose_clip_noik(clip, flag == "noik");
+            skater::set_pose_clip_ik(clip, flag == "ik");
         }
         skater::request_pose_playback(clip);
         out("Starting custom animation " + clip +
-            (skater::pose_clip_noik(clip) ? " (floor correction off for this clip)..." : "..."));
+            (skater::pose_clip_ik(clip) ? " (floor correction on for this clip)..." : "..."));
     };
     registry.add(std::move(poseanim));
 

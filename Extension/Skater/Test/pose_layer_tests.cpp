@@ -419,7 +419,7 @@ void test_floor_lift() {
     check(std::abs(field(off_address, 8, 0x10) - before[0]) < 1e-6f &&
               std::abs(field(off_address, 8, 0x14) - before[1]) < 1e-6f &&
               std::abs(field(off_address, 8, 0x1c) - before[2]) < 1e-6f,
-          "strength 0 writes nothing (the noik system)");
+          "strength 0 writes nothing (correction off)");
     // A foot above the floor on flat ground is left exactly as authored: the
     // game's two feet agree, so the terrain is not uneven and a raised foot
     // is the clip's authorship.

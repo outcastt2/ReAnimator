@@ -123,11 +123,13 @@ struct Playback {
     // Floor correction strength, 0..1. The game plants its own feet before the
     // clip write; this is how hard a clip that sinks below them is lifted back.
     std::atomic<float> ik{1.0f};
-    // Per-clip floor-correction opt-out ("poseanim sit noik"), remembered by
-    // clip name so a quickswap re-export played again keeps it. Guarded by
-    // mutex; `active_noik` is the resolved value for the clip now playing.
-    std::unordered_map<std::string, bool> clip_noik;
-    std::atomic<bool> active_noik{};
+    // Per-clip floor-correction opt-in ("poseanim dance ik"), remembered by
+    // clip name so a quickswap re-export played again keeps it. Correction is
+    // off by default per clip -- the analytic leg solve was janky in game on
+    // clips it wasn't tuned for, so a clip gets it only when asked for. Guarded
+    // by mutex; `active_ik` is the resolved value for the clip now playing.
+    std::unordered_map<std::string, bool> clip_ik;
+    std::atomic<bool> active_ik{};
     std::atomic<std::uint64_t> handler_ticks{};
     std::atomic<std::uint64_t> handler_peak{};
     std::atomic<std::uint32_t> handler_frames{};
@@ -482,9 +484,11 @@ void write_current(Playback &p, std::uintptr_t buffer, std::uint32_t available_j
     // -- plus the way each knee bends and each sole pitches, which is what a
     // straight-legged or mirrored clip cannot answer for itself.
     layers::FloorSample floor{};
-    const auto ik = p.active_noik.load(std::memory_order_relaxed)
-                        ? 0.0f
-                        : p.ik.load(std::memory_order_relaxed);
+    // Per clip, correction is opt-in: only a clip flagged with "poseanim
+    // <file> ik" gets any. The global strength still scales it.
+    const auto ik = p.active_ik.load(std::memory_order_relaxed)
+                        ? p.ik.load(std::memory_order_relaxed)
+                        : 0.0f;
     const bool have_floor = ik > 0.0f && layers::sample_floors(buffer, floor);
     const auto *frames = p.clip.data.data();
     layers::write_pose_interpolated(buffer + 2 * layers::pose_stride,
@@ -663,7 +667,7 @@ float pose_ik() noexcept { return playback().ik.load(std::memory_order_relaxed);
 
 namespace {
 // The key a per-clip override is remembered by: the name as typed, folded to
-// one case, so "poseanim Sit noik" and "poseanim sit" agree.
+// one case, so "poseanim Sit ik" and "poseanim sit" agree.
 std::string clip_key(std::string_view clip) {
     std::string key(clip);
     for (char &c : key) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -671,16 +675,16 @@ std::string clip_key(std::string_view clip) {
 }
 } // namespace
 
-void set_pose_clip_noik(std::string_view clip, bool noik) noexcept {
+void set_pose_clip_ik(std::string_view clip, bool ik) noexcept {
     auto &p = playback();
     std::lock_guard lock(p.mutex);
-    p.clip_noik[clip_key(clip)] = noik;
+    p.clip_ik[clip_key(clip)] = ik;
 }
-bool pose_clip_noik(std::string_view clip) noexcept {
+bool pose_clip_ik(std::string_view clip) noexcept {
     auto &p = playback();
     std::lock_guard lock(p.mutex);
-    const auto found = p.clip_noik.find(clip_key(clip));
-    return found != p.clip_noik.end() && found->second;
+    const auto found = p.clip_ik.find(clip_key(clip));
+    return found != p.clip_ik.end() && found->second;
 }
 
 void set_pose_mask(PoseMask mask) noexcept {
@@ -710,18 +714,19 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
         if (!armed.exchange(true, std::memory_order_acq_rel))
             dingosdk::set_skeleton_responded_listener(&on_skeleton_responded);
         std::string pending_clip;
-        bool pending{}, stop{}, pending_test{}, pending_noik{};
+        bool pending{}, stop{}, pending_test{}, pending_ik{};
         {
             std::lock_guard lock(p.mutex);
             pending = p.pending;
             stop = p.stop;
             pending_test = p.pending_test;
             pending_clip = p.pending_clip;
-            // The per-clip floor-correction opt-out travels with the request:
+            // The per-clip floor-correction opt-in travels with the request:
             // looked up by the name as typed, so a quickswap re-export played
-            // again under the same name keeps its override.
-            const auto found = p.clip_noik.find(clip_key(pending_clip));
-            pending_noik = found != p.clip_noik.end() && found->second;
+            // again under the same name keeps its flag. A clip never flagged
+            // plays exactly as authored.
+            const auto found = p.clip_ik.find(clip_key(pending_clip));
+            pending_ik = found != p.clip_ik.end() && found->second;
             p.pending = p.stop = false;
         }
         if (pending)
@@ -879,7 +884,7 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
             }
             p.writes.store(0, std::memory_order_release);
             p.started = GetTickCount64();
-            p.active_noik.store(pending_noik, std::memory_order_relaxed);
+            p.active_ik.store(pending_ik, std::memory_order_relaxed);
             p.playing.store(true, std::memory_order_release);
             set_status("Playing the recorded pose (" + std::to_string(frames) + " frames).");
             logging::log(logging::Level::info, logging::Channel::skater,
@@ -926,14 +931,14 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
         p.component.store(component, std::memory_order_release);
         p.writes.store(0, std::memory_order_release);
         p.started = GetTickCount64();
-        p.active_noik.store(pending_noik, std::memory_order_relaxed);
+        p.active_ik.store(pending_ik, std::memory_order_relaxed);
         p.playing.store(true, std::memory_order_release);
         set_status("Custom animation playing: " + p.clip_name +
-                   (pending_noik ? " (floor correction off for this clip)." : "."));
+                   (pending_ik ? " (floor correction on for this clip)." : "."));
         logging::log(logging::Level::info, logging::Channel::skater,
                      "Custom animation: playing {} on component {:#x} (mask {}, floor correction {}).",
                      p.clip_name, component, pose_mask_name(),
-                     pending_noik ? "off for this clip" : "on");
+                     pending_ik ? "on for this clip" : "off");
     } catch (const std::exception &e) {
         logging::log(logging::Level::warning, logging::Channel::skater, "Custom animation: {}.", e.what());
         set_status(std::string("Custom animation: ") + e.what());
