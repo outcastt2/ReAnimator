@@ -297,14 +297,30 @@ const Limb &left_arm() noexcept {
     static const Limb limb{{1, 7, 42, 43, 44, 45, 275, 276, 277, 278}, 10, 7, 8, 9, false, 0};
     return limb;
 }
+// The torso as one limb: the spine from joint 42 up through the neck to the
+// head at 103. The pelvis below it is the game's, so hips cannot clip; a
+// clip bent over or lying down can put the head or chest through the floor,
+// and this is the chain that lifts them back. Root 42, mid 45 (upper chest),
+// end 103 (head).
+const Limb &torso() noexcept {
+    static const Limb limb{{1, 7, 42, 43, 44, 45, 101, 102, 103}, 9, 2, 5, 8, false, 0};
+    return limb;
+}
 
-// One analytic pass of the two-bone solve: lift `lift` meters, aiming the end
-// joint at the height it had plus the lift. Only the root's and mid's
-// rotations are written -- bone lengths are rotation invariants, so the solve
-// moves the end without stretching the limb, and every position, scale and
-// spare float in the buffer stays as it was. Returns false when the geometry
+// One analytic pass of the two-bone solve: lift `lift` meters (negative
+// reaches down), aiming the end joint at the height it had plus the lift.
+// Only the root's and mid's rotations are written -- bone lengths are
+// rotation invariants, so the solve moves the end without stretching the
+// limb, and every position, scale and spare float in the buffer stays as it
+// was. `knee_hint`, when given, is the way the game's own knee bends (a unit
+// world direction off the aim line, sampled before the clip wrote): a clip
+// whose leg is dead straight carries no bend plane of its own -- the perp is
+// float noise -- and a clip authored against a mirrored rig bends the knee
+// backwards. In both cases the game's direction wins; a clip that clearly
+// authored its own bend and agrees keeps it. Returns false when the geometry
 // cannot move any further.
-bool solve_limb_pass(std::uintptr_t buffer, const Limb &limb, float lift) noexcept {
+bool solve_limb_pass(std::uintptr_t buffer, const Limb &limb, float lift,
+                     const float *knee_hint) noexcept {
     Frame frames[max_chain];
     if (!compose_chain(buffer, limb.chain, limb.count, frames)) return false;
     const float *root = frames[limb.root].pos;
@@ -324,12 +340,39 @@ bool solve_limb_pass(std::uintptr_t buffer, const Limb &limb, float lift) noexce
     const float d = reach < d_min ? d_min : (reach > d_max ? d_max : reach);
     const float unit[3] = {aim[0] / reach, aim[1] / reach, aim[2] / reach};
     // The bend plane, taken from the current pose: how far the knee sits off
-    // the aim line. A dead-straight limb has no plane of its own, so a leg
-    // borrows the direction its toe points (a knee bends the way a foot
-    // points) and anything perpendicular will do for an arm.
+    // the aim line. A dead-straight limb has no plane of its own -- what
+    // perp it has is float noise, which is how a straight-legged clip ends up
+    // with the knee popping backwards. The game's own knee, sampled before
+    // the clip wrote, is the fallback: it bends the way this body's knee
+    // actually bends. A leg also borrows the direction its toe points (a knee
+    // bends the way a foot points) and anything perpendicular will do for an
+    // arm.
     const float along = bone1[0] * unit[0] + bone1[1] * unit[1] + bone1[2] * unit[2];
     float perp[3] = {bone1[0] - along * unit[0], bone1[1] - along * unit[1], bone1[2] - along * unit[2]};
     float perp_length = length3(perp);
+    float hint[3]{}, hint_length = 0.0f;
+    if (knee_hint) {
+        const float hint_along = knee_hint[0] * unit[0] + knee_hint[1] * unit[1] + knee_hint[2] * unit[2];
+        hint[0] = knee_hint[0] - hint_along * unit[0];
+        hint[1] = knee_hint[1] - hint_along * unit[1];
+        hint[2] = knee_hint[2] - hint_along * unit[2];
+        hint_length = length3(hint);
+    }
+    // The clip's plane counts as authored when the knee sits clearly off the
+    // aim line AND on the same side as the game's knee. Anything else -- a
+    // straight leg, or a knee bent against the way the body's own knees bend
+    // -- takes the game's direction instead. With no hint at all (arms, torso)
+    // only degeneracy decides, the way it did before the knee hint existed.
+    const bool has_hint = hint_length > 1e-3f;
+    const bool authored = has_hint ? perp_length > 0.05f * l1 &&
+                                          perp[0] * hint[0] + perp[1] * hint[1] + perp[2] * hint[2] > 0.0f
+                                   : perp_length > 1e-3f;
+    if (!authored && has_hint) {
+        perp[0] = hint[0];
+        perp[1] = hint[1];
+        perp[2] = hint[2];
+        perp_length = hint_length;
+    }
     if (perp_length < 1e-3f && limb.has_tip) {
         const float *tip = frames[limb.tip].pos;
         const float toe[3] = {tip[0] - end[0], tip[1] - end[1], tip[2] - end[2]};
@@ -390,88 +433,235 @@ bool solve_limb_pass(std::uintptr_t buffer, const Limb &limb, float lift) noexce
     multiply(delta_root, frames[limb.mid].quat, mid_turned);
     float mid_world[4];
     multiply(delta_mid, mid_turned, mid_world);
-    // Back to parent-local, which is what the buffer holds: the root's parent
-    // is the frame before it on the chain, the mid joint's parent is the root.
+    // Back to parent-local, which is what the buffer holds. The root's parent
+    // is the frame before it on the chain; the mid joint's parent is whatever
+    // sits between -- the root itself for a leg or arm, but for the torso
+    // chain (root 42, mid 45) the spine joints in between. Everything below
+    // the root turned with it, so the mid's parent's new world is the root's
+    // delta applied to its old one.
     float parent_inv[4];
     conjugate(frames[limb.root - 1].quat, parent_inv);
     float root_local[4];
     multiply(parent_inv, root_world, root_local);
     normalize_quat(root_local);
-    float root_inv[4];
-    conjugate(root_world, root_inv);
+    float mid_parent[4];
+    multiply(delta_root, frames[limb.mid - 1].quat, mid_parent);
+    float mid_parent_inv[4];
+    conjugate(mid_parent, mid_parent_inv);
     float mid_local[4];
-    multiply(root_inv, mid_world, mid_local);
+    multiply(mid_parent_inv, mid_world, mid_local);
     normalize_quat(mid_local);
     write_quat(buffer, limb.chain[limb.root], root_local);
     write_quat(buffer, limb.chain[limb.mid], mid_local);
     return true;
 }
 
-// Lift one limb until its lowest point clears the floor. One pass is exact
-// for an arm (nothing hangs past the wrist), but a foot's toe rides with the
-// shin: tilting the shin to lift the ankle rotates the toe along with it, so
-// a pass aimed at the ankle can leave the toe just short. Each pass lifts
-// what is still missing and stops when the gap closes or the geometry runs
-// out of reach.
-void correct_limb(std::uintptr_t buffer, const Limb &limb, float floor_y, float margin,
-                  float strength) noexcept {
-    if (strength <= 0.0f) return;
+// Drive a limb's lowest point to `goal` (a world Y), lifting or reaching
+// down. One pass is exact for an arm (nothing hangs past the wrist), but a
+// foot's toe rides with the shin: tilting the shin to move the ankle rotates
+// the toe along with it, so a pass aimed at the ankle can leave the toe just
+// short. Each pass moves what is still missing and stops when the gap
+// closes or the geometry runs out of reach. `knee_hint` is the game's own
+// knee direction or null; see solve_limb_pass.
+void drive_to(std::uintptr_t buffer, const Limb &limb, float goal, const float *knee_hint) noexcept {
     Frame frames[max_chain];
-    if (!compose_chain(buffer, limb.chain, limb.count, frames)) return;
-    float lowest = frames[limb.end].pos[1];
-    if (limb.has_tip) lowest = std::min(lowest, frames[limb.tip].pos[1]);
-    const float sink = floor_y - lowest;
-    if (sink <= margin) return; // within the tolerated sink: authored or noise
-    const float goal = lowest + sink * strength; // at full strength, the floor itself
     for (int pass = 0; pass < 3; ++pass) {
         if (!compose_chain(buffer, limb.chain, limb.count, frames)) return;
         float now = frames[limb.end].pos[1];
         if (limb.has_tip) now = std::min(now, frames[limb.tip].pos[1]);
         const float remaining = goal - now;
-        if (remaining <= 5e-4f) return; // close enough
-        if (!solve_limb_pass(buffer, limb, remaining)) return; // out of reach
+        if (std::fabs(remaining) <= 5e-4f) return; // close enough
+        if (!solve_limb_pass(buffer, limb, remaining, knee_hint)) return; // out of reach
         Frame after[max_chain];
         if (!compose_chain(buffer, limb.chain, limb.count, after)) return;
         float moved = after[limb.end].pos[1];
         if (limb.has_tip) moved = std::min(moved, after[limb.tip].pos[1]);
-        if (moved - now < 1e-3f) return; // the solve is not gaining any more height
+        if (std::fabs(moved - now) < 1e-3f) return; // the solve is not gaining any more
     }
+}
+
+// Pitch the sole flat onto the game's planted-foot direction: rotate the
+// ankle so the clip's ankle->toe vector takes the game's, blended by
+// `strength`. Only the ankle's rotation is written, which swings the toe
+// with it; the toe's height is then whatever it is, and the height passes in
+// correct_leg put the foot back on the floor with the sole flat -- which is
+// what holds the ankle at the height that keeps the toe on the ground.
+void flatten_sole(std::uintptr_t buffer, const Limb &limb, const LegFloor &leg, float strength) noexcept {
+    Frame frames[max_chain];
+    if (!leg.toe_valid || strength <= 0.0f) return;
+    if (!compose_chain(buffer, limb.chain, limb.count, frames)) return;
+    const float *ankle = frames[limb.end].pos;
+    const float *toe = frames[limb.tip].pos;
+    float current[3] = {toe[0] - ankle[0], toe[1] - ankle[1], toe[2] - ankle[2]};
+    if (length3(current) < 1e-4f) return;
+    normalize3(current);
+    // Blend the target direction by strength: full strength takes the game's
+    // pitch outright, half leaves part of the authored tilt.
+    float want[3];
+    for (int c = 0; c < 3; ++c) want[c] = current[c] + (leg.toe_dir[c] - current[c]) * strength;
+    if (length3(want) < 1e-4f) return;
+    normalize3(want);
+    float delta[4];
+    from_to(current, want, delta);
+    float ankle_world[4];
+    multiply(delta, frames[limb.end].quat, ankle_world);
+    float parent_inv[4];
+    conjugate(frames[limb.end - 1].quat, parent_inv); // the shin: the ankle's parent
+    float local[4];
+    multiply(parent_inv, ankle_world, local);
+    normalize_quat(local);
+    write_quat(buffer, limb.chain[limb.end], local);
+}
+
+// One leg against its own sampled foot. `uneven` says the game's two feet sit
+// at different heights -- the terrain itself is uneven (a ledge, a stair) --
+// and only then may a floating foot reach DOWN to its surface: on flat
+// ground a raised foot is the clip's authorship (a kick, a tuck) and is left
+// alone. While the foot is near its floor the sole is also pitched flat onto
+// the game's planted direction. Only rotations are written.
+void correct_leg(std::uintptr_t buffer, const Limb &limb, const LegFloor &leg, float margin,
+                 float strength, bool uneven) noexcept {
+    if (strength <= 0.0f || !leg.valid) return;
+    // How far above its floor a foot may still be followed down: past this it
+    // is not floating over the ground under it, it is an authored air pose.
+    constexpr float follow_band = 0.35f;
+    Frame frames[max_chain];
+    if (!compose_chain(buffer, limb.chain, limb.count, frames)) return;
+    float lowest = frames[limb.end].pos[1];
+    if (limb.has_tip) lowest = std::min(lowest, frames[limb.tip].pos[1]);
+    // Where the foot's lowest point ends: the scaled share of the way to its
+    // own floor (or down to it, on uneven ground). Decided once here, so
+    // strength is applied a single time however many phases run -- the phases
+    // only settle what the flatten moved around it.
+    const float sink = leg.foot_y - lowest;  // >0: under its own floor
+    const float above = lowest - leg.foot_y; // >0: floating above it
+    bool drive = false;
+    float target = 0.0f;
+    if (sink > margin) {
+        drive = true;
+        target = lowest + sink * strength;
+    } else if (uneven && above > margin && above < follow_band) {
+        drive = true;
+        target = lowest - above * strength;
+    }
+    for (int phase = 0; phase < 2; ++phase) {
+        // Flatten the sole first while the foot is near its floor, then bring
+        // the (new) lowest point to the height decided above: the ankle ends
+        // at whatever keeps the toe on the ground.
+        if (!compose_chain(buffer, limb.chain, limb.count, frames)) return;
+        lowest = frames[limb.end].pos[1];
+        if (limb.has_tip) lowest = std::min(lowest, frames[limb.tip].pos[1]);
+        if (std::fabs(lowest - leg.foot_y) <= margin + 0.05f) flatten_sole(buffer, limb, leg, strength);
+        if (!compose_chain(buffer, limb.chain, limb.count, frames)) return;
+        lowest = frames[limb.end].pos[1];
+        if (limb.has_tip) lowest = std::min(lowest, frames[limb.tip].pos[1]);
+        if (drive) {
+            drive_to(buffer, limb, target, leg.knee);
+        } else if (lowest < leg.foot_y - margin) {
+            // A planted foot whose flatten dipped the toe through the floor:
+            // put it back on the surface. Nothing within the margin is chased.
+            drive_to(buffer, limb, leg.foot_y, leg.knee);
+        } else if (phase > 0) {
+            return;
+        }
+    }
+}
+
+// Lift one limb until its lowest point clears the shared floor plane: the
+// torso (spine and head -- the pelvis below is the game's, so hips are
+// already safe) and the hands.
+void correct_limb(std::uintptr_t buffer, const Limb &limb, float floor_y, float margin,
+                  float strength) noexcept {
+    if (strength <= 0.0f) return;
+    Frame frames[max_chain];
+    if (!compose_chain(buffer, limb.chain, limb.count, frames)) return;
+    const float lowest = frames[limb.end].pos[1];
+    const float sink = floor_y - lowest;
+    if (sink <= margin) return; // within the tolerated sink: authored or noise
+    drive_to(buffer, limb, lowest + sink * strength, nullptr);
 }
 } // namespace
 
-bool sample_floor(std::uintptr_t buffer, float &out_y) noexcept {
-    // The game's own feet, sampled before the clip overwrites the legs: both
-    // ankles and both toes, and the lowest of them is what the skater is
-    // standing on -- the board's top when riding, the ground when walking or
-    // standing. The engine's IK already solved foot placement into this pose;
-    // this only reads its answer.
-    constexpr std::uint32_t right[] = {1, 7, 8, 9, 10, 11};
-    constexpr std::uint32_t left[] = {1, 7, 341, 342, 343, 344};
+bool sample_floors(std::uintptr_t buffer, FloorSample &out) noexcept {
+    out = {};
+    if (!buffer) return false;
+    // The game's own feet, sampled before the clip overwrites the legs: per
+    // foot, its lowest point (ankle or toe) is the surface that foot stands
+    // on -- the board's top when riding, the ground when walking or standing,
+    // the ledge under one foot and the drop under the other when the stance
+    // straddles an edge. The engine's gesture IK already solved foot
+    // placement into this pose; this only reads its answer, along with the
+    // way each knee bends (the fallback bend plane for a clip whose leg is
+    // straight or mirrored) and each sole's pitch.
+    constexpr std::uint32_t chains[2][6] = {{1, 7, 8, 9, 10, 11}, {1, 7, 341, 342, 343, 344}};
     Frame frames[max_chain];
-    if (!compose_chain(buffer, right, 6, frames)) return false;
-    float lowest = std::min(frames[4].pos[1], frames[5].pos[1]);
-    if (!compose_chain(buffer, left, 6, frames)) return false;
-    lowest = std::min(lowest, std::min(frames[4].pos[1], frames[5].pos[1]));
-    out_y = lowest;
-    return true;
+    bool floored = false;
+    for (int side = 0; side < 2; ++side) {
+        LegFloor &leg = out.legs[side];
+        if (!compose_chain(buffer, chains[side], 6, frames)) continue;
+        const float *hip = frames[2].pos;
+        const float *knee = frames[3].pos;
+        const float *ankle = frames[4].pos;
+        const float *toe = frames[5].pos;
+        leg.valid = true;
+        leg.foot_y = std::min(ankle[1], toe[1]);
+        leg.ankle_offset = ankle[1] - leg.foot_y;
+        // How far the knee sits off the hip->ankle line: the way this body's
+        // knee bends, in world space.
+        float bone1[3] = {knee[0] - hip[0], knee[1] - hip[1], knee[2] - hip[2]};
+        float aim[3] = {ankle[0] - hip[0], ankle[1] - hip[1], ankle[2] - hip[2]};
+        if (length3(aim) > 1e-4f && length3(bone1) > 1e-4f) {
+            normalize3(aim);
+            const float along = bone1[0] * aim[0] + bone1[1] * aim[1] + bone1[2] * aim[2];
+            float perp[3] = {bone1[0] - along * aim[0], bone1[1] - along * aim[1], bone1[2] - along * aim[2]};
+            if (length3(perp) > 1e-4f) {
+                normalize3(perp);
+                leg.knee[0] = perp[0];
+                leg.knee[1] = perp[1];
+                leg.knee[2] = perp[2];
+            }
+        }
+        float toe_dir[3] = {toe[0] - ankle[0], toe[1] - ankle[1], toe[2] - ankle[2]};
+        if (length3(toe_dir) > 1e-4f) {
+            normalize3(toe_dir);
+            leg.toe_valid = true;
+            leg.toe_dir[0] = toe_dir[0];
+            leg.toe_dir[1] = toe_dir[1];
+            leg.toe_dir[2] = toe_dir[2];
+        }
+        out.floor_y = floored ? std::min(out.floor_y, leg.foot_y) : leg.foot_y;
+        floored = true;
+    }
+    out.valid = out.legs[0].valid && out.legs[1].valid;
+    return out.valid;
 }
 
-void apply_floor(std::uintptr_t buffer, float floor_y, float margin, float strength, float keep) noexcept {
-    if (!buffer || strength <= 0.0f) return;
+void apply_floor(std::uintptr_t buffer, const FloorSample &floor, float margin, float strength,
+                 float keep) noexcept {
+    if (!buffer || !floor.valid || strength <= 0.0f) return;
     // Legs: only the part the clip owns. A leg the mask kept is the game's own
     // planted foot -- the very thing the floor was sampled from -- so the
     // correction fades out with the clip's share of the leg.
     const float leg_strength = keep >= 1.0f ? 0.0f : strength * (1.0f - keep);
     if (leg_strength > 0.0f) {
-        correct_limb(buffer, right_leg(), floor_y, margin, leg_strength);
-        correct_limb(buffer, left_leg(), floor_y, margin, leg_strength);
+        // The game's own two feet at different heights is the one signal that
+        // the terrain itself is uneven: only then may a floating foot reach
+        // down to the surface under it.
+        const bool uneven = floor.legs[0].valid && floor.legs[1].valid &&
+                            std::fabs(floor.legs[0].foot_y - floor.legs[1].foot_y) > margin;
+        correct_leg(buffer, right_leg(), floor.legs[0], margin, leg_strength, uneven);
+        correct_leg(buffer, left_leg(), floor.legs[1], margin, leg_strength, uneven);
     }
+    // Torso: a clip bent over or lying down can put the spine, chest or head
+    // through the floor. The pelvis is the game's, so the hips are already
+    // safe; this lifts the spine+head chain clear of the floor plane.
+    correct_limb(buffer, torso(), floor.floor_y, margin, strength);
     // Hands: always the clip's. A hand resting on the floor is a handplant and
     // stays where the clip put it; only one below the floor is a bug, so the
     // clearance here is a hair, not the legs' margin.
     constexpr float hand_clearance = 0.005f;
-    correct_limb(buffer, right_arm(), floor_y, hand_clearance, strength);
-    correct_limb(buffer, left_arm(), floor_y, hand_clearance, strength);
+    correct_limb(buffer, right_arm(), floor.floor_y, hand_clearance, strength);
+    correct_limb(buffer, left_arm(), floor.floor_y, hand_clearance, strength);
 }
 
 } // namespace dingosdk::skater::layers

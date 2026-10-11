@@ -236,6 +236,14 @@ void test_against_a_real_clip() {
 // A standing pose with identity rotations everywhere, so composed world
 // positions are the plain sum of the local ones. The right foot's sole (its
 // toe) sits at y = -0.95 and both wrists hang at about -0.8.
+void put(std::uintptr_t address, std::uint32_t joint, float x, float y, float z) {
+    const float scale[3] = {1.0f, 1.0f, 1.0f};
+    const float quat[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    const float pos[3] = {x, y, z};
+    std::memcpy(reinterpret_cast<void *>(address + joint * pose_stride + 0x00), scale, sizeof(scale));
+    std::memcpy(reinterpret_cast<void *>(address + joint * pose_stride + 0x10), quat, sizeof(quat));
+    std::memcpy(reinterpret_cast<void *>(address + joint * pose_stride + 0x20), pos, sizeof(pos));
+}
 std::vector<std::byte> standing_pose() {
     auto pose = sentinel_pose();
     const auto address = reinterpret_cast<std::uintptr_t>(pose.data());
@@ -279,6 +287,21 @@ void sink_right_foot(std::uintptr_t address) {
     std::memcpy(reinterpret_cast<void *>(address + 10 * pose_stride + 0x20), ankle, sizeof(ankle));
 }
 
+// The same standing leg the pose was built with, written back over a chain
+// that a test moved: hip, knee, ankle, toe (local positions, identity
+// rotations) -- i.e. "the clip authored this leg at standing height".
+void put_leg(std::uintptr_t address, std::uint32_t hip, std::uint32_t knee, std::uint32_t ankle,
+             std::uint32_t toe) {
+    const float hip_pos[3] = {hip == 8 ? 0.1f : -0.1f, 0.0f, 0.0f};
+    const float knee_pos[3] = {0.0f, -0.4f, 0.05f};
+    const float ankle_pos[3] = {0.0f, -0.4f, -0.05f};
+    const float toe_pos[3] = {0.0f, -0.05f, 0.1f};
+    std::memcpy(reinterpret_cast<void *>(address + hip * pose_stride + 0x20), hip_pos, sizeof(hip_pos));
+    std::memcpy(reinterpret_cast<void *>(address + knee * pose_stride + 0x20), knee_pos, sizeof(knee_pos));
+    std::memcpy(reinterpret_cast<void *>(address + ankle * pose_stride + 0x20), ankle_pos, sizeof(ankle_pos));
+    std::memcpy(reinterpret_cast<void *>(address + toe * pose_stride + 0x20), toe_pos, sizeof(toe_pos));
+}
+
 float lowest_foot(std::uintptr_t address) {
     const std::uint32_t right[] = {1, 7, 8, 9, 10, 11};
     float out[3]{};
@@ -296,13 +319,33 @@ float distance_between(std::uintptr_t address, const std::uint32_t *a, std::size
 }
 
 void test_floor_sample() {
-    // The floor is the game's own lowest foot point, read before the clip
-    // write: both ankles and both toes, lowest wins.
+    // The floor is the game's own feet, sampled before the clip write: per
+    // foot its lowest point (ankle or toe), plus the way that knee bends and
+    // that sole pitches. On flat ground both feet agree and the shared floor
+    // is the lowest of them.
     auto pose = standing_pose();
     const auto address = reinterpret_cast<std::uintptr_t>(pose.data());
-    float floor_y = 0.0f;
-    check(sample_floor(address, floor_y), "the standing pose has a floor");
-    check(std::abs(floor_y - (-0.95f)) < 1e-3f, "the floor is the toe height");
+    FloorSample floor{};
+    check(sample_floors(address, floor), "the standing pose has floors");
+    check(floor.valid, "both leg chains composed");
+    check(floor.legs[0].valid && floor.legs[1].valid, "both feet are valid");
+    check(std::abs(floor.legs[0].foot_y - (-0.95f)) < 1e-3f, "the right foot's floor is its toe height");
+    check(std::abs(floor.legs[1].foot_y - (-0.95f)) < 1e-3f, "the left foot's floor is its toe height");
+    check(std::abs(floor.floor_y - (-0.95f)) < 1e-3f, "the shared floor is the lowest foot");
+    check(std::abs(floor.legs[0].ankle_offset - 0.05f) < 1e-3f, "the ankle rides 5 cm above the sole");
+    // The knee in the standing pose bends forward (+z off the hip-ankle line)
+    // and the ankle->toe direction pitches forward and slightly down.
+    check(floor.legs[0].knee[2] > 0.5f, "the sampled knee bends forward");
+    check(floor.legs[0].toe_valid && floor.legs[0].toe_dir[2] > 0.5f,
+          "the sampled sole pitches forward");
+}
+
+// A sampled floor from the standing pose, for the tests that correct a clip
+// written over it.
+FloorSample standing_floor(std::uintptr_t address) {
+    FloorSample floor{};
+    check(sample_floors(address, floor), "the floor samples");
+    return floor;
 }
 
 void test_floor_lift() {
@@ -310,17 +353,16 @@ void test_floor_lift() {
     // lifts it back without stretching the leg or flipping the knee.
     auto pose = standing_pose();
     auto address = reinterpret_cast<std::uintptr_t>(pose.data());
-    float floor_y = 0.0f;
-    check(sample_floor(address, floor_y), "the floor samples before the sink");
+    const auto floor = standing_floor(address);
     sink_right_foot(address);
     const std::uint32_t hip_chain[] = {1, 7, 8};
     const std::uint32_t knee_chain[] = {1, 7, 8, 9};
     const std::uint32_t ankle_chain[] = {1, 7, 8, 9, 10};
     const float thigh_before = distance_between(address, knee_chain, 4, hip_chain, 3);
     const float shin_before = distance_between(address, ankle_chain, 5, knee_chain, 4);
-    check(lowest_foot(address) < floor_y - 0.05f, "the clip's foot is under the floor");
-    apply_floor(address, floor_y, 0.01f, 1.0f, 0.0f);
-    check(lowest_foot(address) > floor_y - 0.02f, "the foot is lifted back to the floor");
+    check(lowest_foot(address) < floor.floor_y - 0.05f, "the clip's foot is under the floor");
+    apply_floor(address, floor, 0.01f, 1.0f, 0.0f);
+    check(lowest_foot(address) > floor.floor_y - 0.02f, "the foot is lifted back to the floor");
     check(std::abs(distance_between(address, knee_chain, 4, hip_chain, 3) - thigh_before) < 1e-4f,
           "the thigh is not stretched");
     check(std::abs(distance_between(address, ankle_chain, 5, knee_chain, 4) - shin_before) < 1e-4f,
@@ -341,8 +383,23 @@ void test_floor_lift() {
     check(std::abs(hip_w - 1.0f) > 1e-4f || std::abs(field(address, 8, 0x10)) > 1e-4f, "the hip rotation changed");
     check(std::abs(knee_w - 1.0f) > 1e-4f || std::abs(field(address, 9, 0x10)) > 1e-4f,
           "the knee rotation changed");
-    check(std::abs(field(address, 10, 0x1c) - 1.0f) < 1e-4f && std::abs(field(address, 10, 0x10)) < 1e-4f,
-          "the ankle's own rotation is untouched");
+    check(untouched(address, 10, 0x2c), "the ankle's spare float is untouched");
+    // The lift tilts the foot with the shin; the flatten then turns the ankle's
+    // own rotation so the sole ends pitched like the game's planted one. That
+    // is the whole point of v2 -- flat feet -- so the ankle rotation is
+    // expected to move; the pitch itself is checked in test_floor_sole_pitch.
+    {
+        const std::uint32_t toe_chain[] = {1, 7, 8, 9, 10, 11};
+        float toe[3]{};
+        check(world_position(address, toe_chain, 6, toe), "toe composes");
+        const float sole[3] = {toe[0] - ankle[0], toe[1] - ankle[1], toe[2] - ankle[2]};
+        const float sole_len = std::sqrt(sole[0] * sole[0] + sole[1] * sole[1] + sole[2] * sole[2]);
+        check(sole_len > 1e-3f &&
+                  (sole[0] * floor.legs[0].toe_dir[0] + sole[1] * floor.legs[0].toe_dir[1] +
+                   sole[2] * floor.legs[0].toe_dir[2]) /
+                          sole_len > 0.99f,
+              "the lifted foot's sole is pitched like the game's planted one");
+    }
     // The left leg was never sunk, so the solve never touched it.
     check(std::abs(field(address, 342, 0x1c) - 1.0f) < 1e-4f, "the untouched leg keeps its rotation");
     // Strength scales the lift: half strength leaves the foot half sunk.
@@ -350,10 +407,22 @@ void test_floor_lift() {
     auto half_address = reinterpret_cast<std::uintptr_t>(half.data());
     sink_right_foot(half_address);
     const float sunk = lowest_foot(half_address);
-    apply_floor(half_address, floor_y, 0.01f, 0.5f, 0.0f);
+    apply_floor(half_address, floor, 0.01f, 0.5f, 0.0f);
     const float lifted = lowest_foot(half_address);
-    check(std::abs((lifted - sunk) - 0.5f * (floor_y - sunk)) < 0.02f, "half strength lifts half the sink");
-    // A foot above the floor is left exactly as authored.
+    check(std::abs((lifted - sunk) - 0.5f * (floor.floor_y - sunk)) < 0.02f, "half strength lifts half the sink");
+    // Strength 0 is the old system: nothing moves at all.
+    auto off = standing_pose();
+    auto off_address = reinterpret_cast<std::uintptr_t>(off.data());
+    sink_right_foot(off_address);
+    const float before[3] = {field(off_address, 8, 0x10), field(off_address, 8, 0x14), field(off_address, 8, 0x1c)};
+    apply_floor(off_address, floor, 0.01f, 0.0f, 0.0f);
+    check(std::abs(field(off_address, 8, 0x10) - before[0]) < 1e-6f &&
+              std::abs(field(off_address, 8, 0x14) - before[1]) < 1e-6f &&
+              std::abs(field(off_address, 8, 0x1c) - before[2]) < 1e-6f,
+          "strength 0 writes nothing (the noik system)");
+    // A foot above the floor on flat ground is left exactly as authored: the
+    // game's two feet agree, so the terrain is not uneven and a raised foot
+    // is the clip's authorship.
     auto kick = standing_pose();
     auto kick_address = reinterpret_cast<std::uintptr_t>(kick.data());
     const float knee_high[3] = {0.0f, 0.4f, 0.05f};
@@ -361,8 +430,200 @@ void test_floor_lift() {
     std::memcpy(reinterpret_cast<void *>(kick_address + 9 * pose_stride + 0x20), knee_high, sizeof(knee_high));
     std::memcpy(reinterpret_cast<void *>(kick_address + 10 * pose_stride + 0x20), ankle_high,
                 sizeof(ankle_high));
-    apply_floor(kick_address, floor_y, 0.01f, 1.0f, 0.0f);
+    apply_floor(kick_address, floor, 0.01f, 1.0f, 0.0f);
     check(std::abs(field(kick_address, 8, 0x1c) - 1.0f) < 1e-4f, "a foot above the floor is not moved");
+}
+
+void test_floor_knee_hint() {
+    // The game's knee bends forward; the clip bent the same knee BACKWARD
+    // (the mirrored-rig case from the in-game report: legs bending the wrong
+    // way). The game's sampled knee direction must win over the clip's.
+    auto pose = standing_pose();
+    auto address = reinterpret_cast<std::uintptr_t>(pose.data());
+    const auto floor = standing_floor(address);
+    check(floor.legs[0].knee[2] > 0.5f, "the game's knee hint bends forward");
+    // The clip: knee swung behind the hip-ankle line, ankle sunk below the
+    // floor so the solve has to run at all.
+    const float knee_back[3] = {0.0f, -0.45f, -0.08f};
+    const float ankle_back[3] = {0.0f, -0.45f, -0.02f};
+    std::memcpy(reinterpret_cast<void *>(address + 9 * pose_stride + 0x20), knee_back, sizeof(knee_back));
+    std::memcpy(reinterpret_cast<void *>(address + 10 * pose_stride + 0x20), ankle_back, sizeof(ankle_back));
+    const std::uint32_t hip_chain[] = {1, 7, 8};
+    const std::uint32_t knee_chain[] = {1, 7, 8, 9};
+    const std::uint32_t ankle_chain[] = {1, 7, 8, 9, 10};
+    check(lowest_foot(address) < floor.floor_y - 0.05f, "the clip's backward-bent leg is under the floor");
+    apply_floor(address, floor, 0.01f, 1.0f, 0.0f);
+    check(lowest_foot(address) > floor.floor_y - 0.02f, "the foot is lifted back to the floor");
+    float hip[3]{}, knee[3]{}, ankle[3]{};
+    check(world_position(address, hip_chain, 3, hip), "hip composes");
+    check(world_position(address, knee_chain, 4, knee), "knee composes");
+    check(world_position(address, ankle_chain, 5, ankle), "ankle composes");
+    const float line_z = 0.5f * (hip[2] + ankle[2]);
+    check(knee[2] > line_z, "the knee is bent the game's way, not the clip's");
+}
+
+void test_floor_uneven() {
+    // A stance straddling a ledge: the game's right foot on the ledge top
+    // (-0.65), its left foot on the ground (-0.95). The clip authored both
+    // feet at standing height. Each foot must come right for ITS surface --
+    // the right one lifted onto the ledge, not left floating below it.
+    auto pose = standing_pose();
+    auto address = reinterpret_cast<std::uintptr_t>(pose.data());
+    // Raise the game's right foot onto the ledge: ankle 0.3 higher, toe with
+    // it (the game's own foot placement on the higher surface).
+    const float knee_up[3] = {0.0f, -0.25f, 0.05f};
+    const float ankle_up[3] = {0.0f, -0.25f, -0.05f};
+    std::memcpy(reinterpret_cast<void *>(address + 9 * pose_stride + 0x20), knee_up, sizeof(knee_up));
+    std::memcpy(reinterpret_cast<void *>(address + 10 * pose_stride + 0x20), ankle_up, sizeof(ankle_up));
+    const auto floor = standing_floor(address);
+    check(std::abs(floor.legs[0].foot_y - (-0.65f)) < 1e-3f, "the right foot's floor is the ledge top");
+    check(std::abs(floor.legs[1].foot_y - (-0.95f)) < 1e-3f, "the left foot's floor is the ground");
+    check(floor.floor_y < -0.9f, "the shared floor is the lower surface");
+    // The clip then writes both legs back at standing height: its right foot
+    // now floats 0.3 below the ledge it should stand on.
+    put_leg(address, 8, 9, 10, 11);
+    const std::uint32_t ankle_chain[] = {1, 7, 8, 9, 10};
+    float ankle[3]{};
+    check(world_position(address, ankle_chain, 5, ankle), "ankle composes");
+    check(ankle[1] < floor.legs[0].foot_y - 0.2f, "the clip's right foot hangs below the ledge");
+    apply_floor(address, floor, 0.01f, 1.0f, 0.0f);
+    check(world_position(address, ankle_chain, 5, ankle), "ankle composes after");
+    // At full strength the foot stands on its own ledge; a few passes of
+    // convergence, so allow a small residual.
+    check(ankle[1] > floor.legs[0].foot_y - 0.03f, "the right foot is lifted onto its own ledge");
+    check(lowest_foot(address) > floor.legs[0].foot_y - 0.05f, "the right foot's toe clears the ledge");
+    // The left leg was already at its floor and stays there.
+    const std::uint32_t left_ankle_chain[] = {1, 7, 341, 342, 343};
+    float left[3]{};
+    check(world_position(address, left_ankle_chain, 5, left), "left ankle composes");
+    check(std::abs(left[1] - (-0.9f)) < 0.02f, "the left foot stays at the ground");
+}
+
+void test_floor_reach_down() {
+    // The other half of the ledge: the clip's foot floats ABOVE the surface
+    // under it (authored as if the ground continued), and the game's two feet
+    // disagree in height, so the terrain is uneven. The foot must reach down
+    // to its own surface instead of hanging in the air.
+    auto pose = standing_pose();
+    auto address = reinterpret_cast<std::uintptr_t>(pose.data());
+    // The game's right foot dangles just below standing -- the edge of the
+    // ledge: ankle a little deeper, toe with it.
+    const float knee_low[3] = {0.0f, -0.45f, 0.05f};
+    const float ankle_low[3] = {0.0f, -0.45f, -0.02f};
+    std::memcpy(reinterpret_cast<void *>(address + 9 * pose_stride + 0x20), knee_low, sizeof(knee_low));
+    std::memcpy(reinterpret_cast<void *>(address + 10 * pose_stride + 0x20), ankle_low, sizeof(ankle_low));
+    const auto floor = standing_floor(address);
+    check(floor.legs[0].foot_y < -1.0f, "the right foot's floor is the lower surface");
+    // The clip writes the leg raised instead: a deeply bent knee floats the
+    // foot a follow-band's worth above that surface, and extending the leg is
+    // what reaches it.
+    const float knee_raise[3] = {0.0f, -0.28f, 0.3f};  // knee forward, leg folded
+    const float ankle_raise[3] = {0.0f, -0.4f, -0.35f}; // ankle well above full extension
+    std::memcpy(reinterpret_cast<void *>(address + 9 * pose_stride + 0x20), knee_raise, sizeof(knee_raise));
+    std::memcpy(reinterpret_cast<void *>(address + 10 * pose_stride + 0x20), ankle_raise, sizeof(ankle_raise));
+    const std::uint32_t ankle_chain[] = {1, 7, 8, 9, 10};
+    float ankle[3]{};
+    check(world_position(address, ankle_chain, 5, ankle), "ankle composes");
+    const float before = ankle[1];
+    check(before > floor.legs[0].foot_y + 0.2f, "the clip's foot floats above its surface");
+    apply_floor(address, floor, 0.01f, 1.0f, 0.0f);
+    check(world_position(address, ankle_chain, 5, ankle), "ankle composes after");
+    check(ankle[1] < before - 0.1f, "the floating foot reaches down toward its surface");
+    check(lowest_foot(address) > floor.legs[0].foot_y - 0.03f, "the foot lands on its surface, not through it");
+    // On flat ground the same raised foot is authored and stays: the reach
+    // down only runs where the game's own feet disagree.
+    auto flat = standing_pose();
+    auto flat_address = reinterpret_cast<std::uintptr_t>(flat.data());
+    const auto flat_floor = standing_floor(flat_address);
+    std::memcpy(reinterpret_cast<void *>(flat_address + 9 * pose_stride + 0x20), knee_raise, sizeof(knee_raise));
+    std::memcpy(reinterpret_cast<void *>(flat_address + 10 * pose_stride + 0x20), ankle_raise, sizeof(ankle_raise));
+    float raised[3]{};
+    check(world_position(flat_address, ankle_chain, 5, raised), "raised ankle composes");
+    apply_floor(flat_address, flat_floor, 0.01f, 1.0f, 0.0f);
+    float after[3]{};
+    check(world_position(flat_address, ankle_chain, 5, after), "raised ankle composes after");
+    check(std::abs(after[1] - raised[1]) < 1e-3f, "on flat ground a raised foot is left as authored");
+    check(std::abs(field(flat_address, 10, 0x1c) - 1.0f) < 1e-4f && std::abs(field(flat_address, 10, 0x10)) < 1e-4f,
+          "its ankle rotation is untouched too");
+}
+
+void test_floor_sole_pitch() {
+    // The clip authored the right foot with the toe pitched UP (heel down,
+    // toe in the air) while standing on its floor; the game's planted sole
+    // pitches forward-down. Near the floor the sole must be flattened onto
+    // the game's pitch, without moving the foot through the ground.
+    auto pose = standing_pose();
+    auto address = reinterpret_cast<std::uintptr_t>(pose.data());
+    const auto floor = standing_floor(address);
+    // The clip: same ankle height, toe raised well above it.
+    const float toe_up[3] = {0.0f, 0.06f, 0.05f}; // toe local: up and forward
+    std::memcpy(reinterpret_cast<void *>(address + 11 * pose_stride + 0x20), toe_up, sizeof(toe_up));
+    const std::uint32_t ankle_chain[] = {1, 7, 8, 9, 10};
+    const std::uint32_t toe_chain[] = {1, 7, 8, 9, 10, 11};
+    float ankle[3]{}, toe[3]{};
+    check(world_position(address, ankle_chain, 5, ankle), "ankle composes");
+    check(world_position(address, toe_chain, 6, toe), "toe composes");
+    float before[3] = {toe[0] - ankle[0], toe[1] - ankle[1], toe[2] - ankle[2]};
+    check(before[1] > 0.01f, "the clip's toe is pitched above the ankle");
+    apply_floor(address, floor, 0.01f, 1.0f, 0.0f);
+    check(world_position(address, ankle_chain, 5, ankle), "ankle composes after");
+    check(world_position(address, toe_chain, 6, toe), "toe composes after");
+    const float after_v[3] = {toe[0] - ankle[0], toe[1] - ankle[1], toe[2] - ankle[2]};
+    const float before_len = std::sqrt(before[0] * before[0] + before[1] * before[1] + before[2] * before[2]);
+    const float after_len = std::sqrt(after_v[0] * after_v[0] + after_v[1] * after_v[1] + after_v[2] * after_v[2]);
+    check(after_v[1] < 0.0f, "the sole is flattened onto the game's pitch (toe below the ankle)");
+    // The game's ankle->toe direction, for comparison.
+    const auto &game_toe = floor.legs[0].toe_dir;
+    check(floor.legs[0].toe_valid, "the game's sole pitch sampled");
+    const float dot = (after_v[0] * game_toe[0] + after_v[1] * game_toe[1] + after_v[2] * game_toe[2]) / after_len;
+    check(dot > 0.98f, "the sole matches the game's planted pitch");
+    check(std::abs(after_len - before_len) < 1e-3f, "the ankle->toe bone length is unchanged");
+    check(lowest_foot(address) > floor.floor_y - 0.02f, "flattening did not push the toe through the floor");
+}
+
+void test_floor_torso() {
+    // A clip with the spine bent far forward: the head ends up below the
+    // floor. The pelvis is the game's (hips already safe), but the spine and
+    // head chain must be lifted clear -- rotations only, bones unpulled,
+    // pelvis untouched.
+    auto pose = standing_pose();
+    auto address = reinterpret_cast<std::uintptr_t>(pose.data());
+    const auto floor = standing_floor(address);
+    // Bend the torso down: spine joints stacked forward-down so the head
+    // composes well below the floor.
+    for (std::uint32_t joint = 43; joint <= 45; ++joint)
+        put(address, joint, 0.0f, -0.28f, 0.04f);
+    for (std::uint32_t joint = 101; joint <= 103; ++joint)
+        put(address, joint, 0.0f, -0.15f, 0.02f);
+    const std::uint32_t head_chain[] = {1, 7, 42, 43, 44, 45, 101, 102, 103};
+    const std::uint32_t hip_chain[] = {1, 7, 8};
+    const std::uint32_t chest_chain[] = {1, 7, 42, 43, 44, 45};
+    float head[3]{};
+    check(world_position(address, head_chain, 9, head), "head composes");
+    check(head[1] < floor.floor_y - 0.1f, "the clip's head is through the floor");
+    // Bone lengths: the spine from 42 to 45 measures the same before and
+    // after -- only rotations are ever written, so the chain cannot stretch.
+    const float spine_before = distance_between(address, chest_chain, 6, hip_chain, 3);
+    apply_floor(address, floor, 0.01f, 1.0f, 0.0f);
+    check(world_position(address, head_chain, 9, head), "head composes after");
+    check(head[1] > floor.floor_y - 0.02f, "the head is lifted clear of the floor");
+    // The pelvis is the game's and stays exactly as it was.
+    check(std::abs(field(address, 7, 0x10)) < 1e-6f && std::abs(field(address, 7, 0x1c) - 1.0f) < 1e-6f,
+          "the pelvis rotation is untouched");
+    // Only the root and mid of the chain turned: spine 42 and chest 45.
+    check(std::abs(field(address, 42, 0x1c) - 1.0f) > 1e-4f || std::abs(field(address, 42, 0x10)) > 1e-4f,
+          "the spine root rotation changed");
+    check(std::abs(field(address, 45, 0x1c) - 1.0f) > 1e-4f || std::abs(field(address, 45, 0x10)) > 1e-4f,
+          "the chest rotation changed");
+    // The in-between spine joints keep their local rotation: the solve only
+    // writes root and mid.
+    check(std::abs(field(address, 43, 0x1c) - 1.0f) < 1e-4f && std::abs(field(address, 44, 0x1c) - 1.0f) < 1e-4f,
+          "the spine between root and mid is untouched");
+    const float spine_after = distance_between(address, chest_chain, 6, hip_chain, 3);
+    check(std::abs(spine_after - spine_before) < 1e-4f, "the spine length is unchanged");
+    // Positions are never written.
+    check(std::abs(field(address, 43, 0x20)) < 1e-6f && std::abs(field(address, 103, 0x28) - 0.02f) < 1e-6f,
+          "the torso solve writes no positions");
 }
 
 void test_floor_hands() {
@@ -371,15 +632,14 @@ void test_floor_hands() {
     // handplant reaching for it -- stays where the clip put it.
     auto pose = standing_pose();
     auto address = reinterpret_cast<std::uintptr_t>(pose.data());
-    float floor_y = 0.0f;
-    check(sample_floor(address, floor_y), "the floor samples");
+    const auto floor = standing_floor(address);
     const float wrist[3] = {0.0f, -0.65f, 0.05f}; // below the elbow, past the floor
     std::memcpy(reinterpret_cast<void *>(address + 49 * pose_stride + 0x20), wrist, sizeof(wrist));
-    apply_floor(address, floor_y, 0.01f, 1.0f, 1.0f); // keep = 1: the game owns the legs
+    apply_floor(address, floor, 0.01f, 1.0f, 1.0f); // keep = 1: the game owns the legs
     float composed[3]{};
     const std::uint32_t wrist_chain[] = {1, 7, 42, 43, 44, 45, 46, 47, 48, 49};
     check(world_position(address, wrist_chain, 10, composed), "the wrist composes");
-    check(composed[1] > floor_y - 0.03f, "the sunk wrist is lifted above the floor");
+    check(composed[1] > floor.floor_y - 0.03f, "the sunk wrist is lifted above the floor");
     check(std::abs(field(address, 48, 0x20)) < 1e-4f, "the elbow's local position is untouched");
     check(std::abs(field(address, 49, 0x28) - 0.05f) < 1e-4f, "the wrist's local z is untouched");
     // A hand above the floor is intentional and left alone.
@@ -387,7 +647,7 @@ void test_floor_hands() {
     auto plant_address = reinterpret_cast<std::uintptr_t>(plant.data());
     const float planted[3] = {0.0f, -0.35f, 0.05f}; // wrist well above the floor
     std::memcpy(reinterpret_cast<void *>(plant_address + 49 * pose_stride + 0x20), planted, sizeof(planted));
-    apply_floor(plant_address, floor_y, 0.01f, 1.0f, 1.0f);
+    apply_floor(plant_address, floor, 0.01f, 1.0f, 1.0f);
     check(std::abs(field(plant_address, 47, 0x1c) - 1.0f) < 1e-4f, "a hand above the floor is not moved");
 }
 
@@ -396,19 +656,18 @@ void test_floor_masked_legs() {
     // The correction must not touch them; the arms still get corrected.
     auto pose = standing_pose();
     auto address = reinterpret_cast<std::uintptr_t>(pose.data());
-    float floor_y = 0.0f;
-    check(sample_floor(address, floor_y), "the floor samples");
+    const auto floor = standing_floor(address);
     sink_right_foot(address);
     const float wrist[3] = {0.0f, -0.65f, 0.05f};
     std::memcpy(reinterpret_cast<void *>(address + 49 * pose_stride + 0x20), wrist, sizeof(wrist));
-    apply_floor(address, floor_y, 0.01f, 1.0f, 1.0f);
+    apply_floor(address, floor, 0.01f, 1.0f, 1.0f);
     check(std::abs(field(address, 8, 0x1c) - 1.0f) < 1e-4f && std::abs(field(address, 9, 0x1c) - 1.0f) < 1e-4f,
           "a leg the mask kept is not corrected");
-    check(lowest_foot(address) < floor_y - 0.05f, "the game's own sunk leg stays as the game wrote it");
+    check(lowest_foot(address) < floor.floor_y - 0.05f, "the game's own sunk leg stays as the game wrote it");
     float composed[3]{};
     const std::uint32_t wrist_chain[] = {1, 7, 42, 43, 44, 45, 46, 47, 48, 49};
     check(world_position(address, wrist_chain, 10, composed), "the wrist composes");
-    check(composed[1] > floor_y - 0.03f, "the arm is still corrected while the legs are kept");
+    check(composed[1] > floor.floor_y - 0.03f, "the arm is still corrected while the legs are kept");
 }
 
 void test_interpolation() {
@@ -457,6 +716,11 @@ int main() {
         test_interpolation();
         test_floor_sample();
         test_floor_lift();
+        test_floor_knee_hint();
+        test_floor_uneven();
+        test_floor_reach_down();
+        test_floor_sole_pitch();
+        test_floor_torso();
         test_floor_hands();
         test_floor_masked_legs();
         std::cout << "pose layer tests passed\n";
