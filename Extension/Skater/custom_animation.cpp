@@ -130,6 +130,14 @@ struct Playback {
     // by mutex; `active_ik` is the resolved value for the clip now playing.
     std::unordered_map<std::string, bool> clip_ik;
     std::atomic<bool> active_ik{};
+    // Floor-correction smoothing. The sampled ground (per-foot height, knee
+    // hint, sole pitch) is read from the game's live pose every frame and
+    // jitters; near a straight leg that jitter becomes several degrees of knee
+    // swing -- the jank seen in game. This is the running low-pass of that
+    // sample, carried across frames and reset when a clip starts. Only touched
+    // by the write path on the animation thread.
+    layers::FloorSample smoothed_floor{};
+    std::uint64_t floor_smoothed_at{};
     std::atomic<std::uint64_t> handler_ticks{};
     std::atomic<std::uint64_t> handler_peak{};
     std::atomic<std::uint32_t> handler_frames{};
@@ -490,6 +498,24 @@ void write_current(Playback &p, std::uintptr_t buffer, std::uint32_t available_j
                         ? p.ik.load(std::memory_order_relaxed)
                         : 0.0f;
     const bool have_floor = ik > 0.0f && layers::sample_floors(buffer, floor);
+    // Low-pass the sampled ground across frames. The game's pose jitters a
+    // little every frame; near a straight leg that jitter amplifies into knee
+    // swing. A ~90 ms time constant (60 Hz, alpha 0.25) hides the noise while
+    // still tracking a real surface change (stepping onto a ledge) within a
+    // few frames. Reset when the sample was invalid or playback just started.
+    if (have_floor) {
+        const auto now = GetTickCount64();
+        const auto elapsed = p.floor_smoothed_at ? static_cast<unsigned>(now - p.floor_smoothed_at) : 1000u;
+        p.floor_smoothed_at = now;
+        // blend = 1 - exp(-dt/tau); approximated for small dt/tau, clamped.
+        const float tau = 90.0f;
+        const float blend_alpha = elapsed >= 1000u ? 1.0f : static_cast<float>(1.0 - std::exp(-static_cast<double>(elapsed) / tau));
+        floor = layers::smooth_floor(p.smoothed_floor, floor, blend_alpha);
+        p.smoothed_floor = floor;
+    } else {
+        p.smoothed_floor = {};
+        p.floor_smoothed_at = 0;
+    }
     const auto *frames = p.clip.data.data();
     layers::write_pose_interpolated(buffer + 2 * layers::pose_stride,
                                     frames + static_cast<std::size_t>(frame) * p.clip.joints * floats_per_joint +
@@ -885,6 +911,8 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
             p.writes.store(0, std::memory_order_release);
             p.started = GetTickCount64();
             p.active_ik.store(pending_ik, std::memory_order_relaxed);
+            p.smoothed_floor = {};
+            p.floor_smoothed_at = 0;
             p.playing.store(true, std::memory_order_release);
             set_status("Playing the recorded pose (" + std::to_string(frames) + " frames).");
             logging::log(logging::Level::info, logging::Channel::skater,
@@ -932,6 +960,8 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
         p.writes.store(0, std::memory_order_release);
         p.started = GetTickCount64();
         p.active_ik.store(pending_ik, std::memory_order_relaxed);
+        p.smoothed_floor = {};
+        p.floor_smoothed_at = 0;
         p.playing.store(true, std::memory_order_release);
         set_status("Custom animation playing: " + p.clip_name +
                    (pending_ik ? " (floor correction on for this clip)." : "."));

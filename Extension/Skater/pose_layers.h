@@ -81,6 +81,24 @@ struct FloorSample {
 };
 bool sample_floors(std::uintptr_t buffer, FloorSample &out) noexcept;
 
+// Temporal smoothing of the sampled ground.
+//
+// `sample_floors` reads the game's *live* pose every frame, and that pose
+// jitters: the planted foot drifts a millimetre or two, the knee hint wobbles
+// and the sole pitch shakes. On a nearly-straight leg the analytic solve sits
+// near the acos singularity, where a two-millimetre floor change becomes
+// several degrees of knee swing -- which is the frame-to-frame knee jank. A
+// real engine low-passes exactly these quantities; this is that filter.
+//
+// Blend the fresh sample into `state` (the running smoothed value) by
+// `alpha` in 0..1 (1 = take the fresh sample outright, 0 = hold the last).
+// The numeric fields -- floor height, per-foot height and ankle offset, and
+// the knee and toe directions (renormalised) -- are smoothed; the `valid`
+// flags come from whichever sample is kept. `state` carries across frames, so
+// the caller owns it. With no prior state the fresh sample is taken outright;
+// a fresh sample that failed to compose holds the last good one.
+FloorSample smooth_floor(FloorSample state, const FloorSample &fresh, float alpha) noexcept;
+
 // After the clip write: correct what the clip drove against the sampled
 // ground by an analytic two-bone solve per limb, so the legs and arms bend
 // instead of stretching.

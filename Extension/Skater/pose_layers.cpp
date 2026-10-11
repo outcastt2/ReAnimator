@@ -636,6 +636,46 @@ bool sample_floors(std::uintptr_t buffer, FloorSample &out) noexcept {
     return out.valid;
 }
 
+FloorSample smooth_floor(FloorSample state, const FloorSample &fresh, float alpha) noexcept {
+    // Nothing to smooth against yet: the first sample is taken outright, and a
+    // clip that has just started gets the raw answer rather than a slow fade
+    // in from nothing.
+    if (!state.valid) return fresh;
+    // The fresh read failed to compose (the skater is mid-bail, the graph is
+    // resetting): hold the last good sample rather than dropping the floor out
+    // from under the correction for a frame.
+    if (!fresh.valid) return state;
+    if (!(alpha > 0.0f)) alpha = 0.0f;
+    else if (alpha > 1.0f) alpha = 1.0f;
+    const auto blend = [alpha](float old_value, float new_value) {
+        return old_value + (new_value - old_value) * alpha;
+    };
+    FloorSample out = fresh;  // the flags come from the fresh read...
+    out.floor_y = blend(state.floor_y, fresh.floor_y);  // ...but the numbers are smoothed
+    for (int side = 0; side < 2; ++side) {
+        const LegFloor &old_leg = state.legs[side];
+        LegFloor &out_leg = out.legs[side];
+        // A leg that did not compose this frame keeps the smoothed one; a leg
+        // that never had a prior value keeps the fresh one (handled by the
+        // `state.valid` guard above).
+        if (!out_leg.valid || !old_leg.valid) continue;
+        out_leg.foot_y = blend(old_leg.foot_y, out_leg.foot_y);
+        out_leg.ankle_offset = blend(old_leg.ankle_offset, out_leg.ankle_offset);
+        for (int axis = 0; axis < 3; ++axis) {
+            out_leg.knee[axis] = blend(old_leg.knee[axis], out_leg.knee[axis]);
+            out_leg.toe_dir[axis] = blend(old_leg.toe_dir[axis], out_leg.toe_dir[axis]);
+        }
+        // A lerp of two unit vectors is not unit; renormalise, and if the two
+        // samples opposed so completely that the sum collapsed (a hint flipping
+        // 180 degrees, which a healthy knee never does), keep the fresh one.
+        if (length3(out_leg.knee) > 1e-3f) normalize3(out_leg.knee);
+        else { out_leg.knee[0] = fresh.legs[side].knee[0]; out_leg.knee[1] = fresh.legs[side].knee[1]; out_leg.knee[2] = fresh.legs[side].knee[2]; }
+        if (length3(out_leg.toe_dir) > 1e-3f) normalize3(out_leg.toe_dir);
+        else { out_leg.toe_dir[0] = fresh.legs[side].toe_dir[0]; out_leg.toe_dir[1] = fresh.legs[side].toe_dir[1]; out_leg.toe_dir[2] = fresh.legs[side].toe_dir[2]; }
+    }
+    return out;
+}
+
 void apply_floor(std::uintptr_t buffer, const FloorSample &floor, float margin, float strength,
                  float keep) noexcept {
     if (!buffer || !floor.valid || strength <= 0.0f) return;

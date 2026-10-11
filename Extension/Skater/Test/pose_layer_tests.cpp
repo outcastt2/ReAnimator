@@ -670,6 +670,64 @@ void test_floor_masked_legs() {
     check(composed[1] > floor.floor_y - 0.03f, "the arm is still corrected while the legs are kept");
 }
 
+void test_floor_smooth() {
+    // The sampled ground is read from the game's live pose and jitters every
+    // frame; smoothing must damp that jitter (the knee-swing cause) while a
+    // real surface change still gets tracked. A fresh sample with no prior
+    // state is taken outright; a failing fresh read holds the last good one.
+    FloorSample state{};
+    FloorSample a{};
+    a.valid = true;
+    a.floor_y = -0.95f;
+    for (int side = 0; side < 2; ++side) {
+        a.legs[side].valid = true;
+        a.legs[side].foot_y = -0.95f;
+        a.legs[side].ankle_offset = 0.05f;
+        a.legs[side].knee[2] = 1.0f;
+        a.legs[side].toe_valid = true;
+        a.legs[side].toe_dir[2] = 1.0f;
+    }
+    // No prior state: the fresh sample is taken outright, not faded from zero.
+    state = smooth_floor(state, a, 0.25f);
+    check(state.valid && std::abs(state.floor_y - (-0.95f)) < 1e-6f, "a first sample is taken outright");
+    check(std::abs(state.legs[0].knee[2] - 1.0f) < 1e-6f, "the first knee hint is not faded from zero");
+    // A jittered frame: the foot wobbles up 2 cm and the knee hint tilts a
+    // little. After one smoothed frame the change must be only a fraction.
+    FloorSample b = a;
+    b.floor_y = -0.93f;
+    for (int side = 0; side < 2; ++side) {
+        b.legs[side].foot_y = -0.93f;
+        b.legs[side].knee[0] = 0.1f;  // a small sideways wobble
+    }
+    const FloorSample once = smooth_floor(state, b, 0.25f);
+    check(once.floor_y < -0.93f && once.floor_y > -0.95f, "the floor is smoothed toward the jitter, not snapping to it");
+    check(once.legs[0].knee[2] > 0.9f, "the knee hint keeps most of its old direction");
+    check(std::abs(once.legs[0].knee[0] - 0.025f) < 1e-3f, "the knee wobble is damped to a fraction");
+    // Repeated frames converge to the new value: the filter is stable.
+    FloorSample run = state;
+    for (int i = 0; i < 60; ++i) run = smooth_floor(run, b, 0.25f);
+    check(std::abs(run.floor_y - (-0.93f)) < 1e-4f, "the smoothed floor converges to a held surface");
+    check(std::abs(run.legs[0].knee[0] - 0.1f) < 2e-3f, "the smoothed knee hint converges to a held direction");
+    check(std::abs(run.legs[0].knee[0] * run.legs[0].knee[0] + run.legs[0].knee[2] * run.legs[0].knee[2] - 1.0f) < 1e-3f,
+          "the converged knee hint stays renormalised");
+    // A failing fresh read holds the last good sample instead of dropping out.
+    const FloorSample held = smooth_floor(run, FloorSample{}, 1.0f);
+    check(held.valid && std::abs(held.floor_y - run.floor_y) < 1e-6f, "a failed read holds the last good floor");
+    // Renormalisation: two unit hints that sum to near zero (a 180-degree flip,
+    // which a knee never does) fall back to the fresh hint rather than a
+    // degenerate direction.
+    FloorSample opposing = run;
+    opposing.legs[0].knee[0] = 0.0f;
+    opposing.legs[0].knee[1] = 0.0f;
+    opposing.legs[0].knee[2] = 1.0f;
+    FloorSample flip = run;
+    flip.legs[0].knee[0] = 0.0f;
+    flip.legs[0].knee[1] = 0.0f;
+    flip.legs[0].knee[2] = -1.0f;
+    const FloorSample collapsed = smooth_floor(opposing, flip, 0.5f);
+    check(std::abs(collapsed.legs[0].knee[2] - (-1.0f)) < 1e-6f, "a collapsed hint keeps the fresh direction");
+}
+
 void test_interpolation() {
     // Two clip frames and a quarter of the way between them: the pose must be
     // the blend, not either frame, and a rotation must travel the short arc.
@@ -723,6 +781,7 @@ int main() {
         test_floor_torso();
         test_floor_hands();
         test_floor_masked_legs();
+        test_floor_smooth();
         std::cout << "pose layer tests passed\n";
         return 0;
     } catch (const std::exception &error) {
