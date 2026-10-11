@@ -14,7 +14,6 @@ void expect(bool condition, std::string_view what) {
     std::printf("FAIL: %.*s\n", static_cast<int>(what.size()), what.data());
 }
 
-void bad(std::string_view text) { expect(dingosdk::text::contains_bad_words(text), std::string("bad: ") + std::string(text)); }
 void clean(std::string_view text) { expect(!dingosdk::text::contains_bad_words(text), std::string("clean: ") + std::string(text)); }
 void masks(std::string_view text, std::string_view expected) {
     const auto masked = dingosdk::text::mask_bad_words(text);
@@ -24,58 +23,29 @@ void masks(std::string_view text, std::string_view expected) {
 } // namespace
 
 int main() {
-    // Listed words, any case, whole or inside longer words.
-    bad("fuck");
-    bad("FUCK this server");
-    bad("Fuckface Skaters");
-    bad("motherfuckers only");
-    bad("Shithead's park");
-    bad("big ass ramps");
-    bad("Bitch Please");
-    // Look-alikes and spelled-out letters.
-    bad("sh1t");
-    bad("@$$ hats");
-    bad("f u c k");
-    bad("F.U.C.K. yeah");
-    bad("b17ch");
-    bad("evil ass rape server");
-    bad("Rapist Crew");
-    bad("gangrape lobby");
-    // Ordinary words that contain a listed word, and server names people use.
+    // The built-in word list ships empty: Engine/Core/Text/bad_words.txt is
+    // emptied so the game never masks a name or a chat line of its own.
+    // Everything a built-in list used to flag now passes untouched -- but the
+    // filter itself is still here, because a server's own lists (set_word_lists
+    // below) are pushed at runtime and must keep working.
+    clean("fuck");
+    clean("FUCK this server");
+    clean("Shithead's park");
+    clean("sh1t");
+    clean("@$$ hats");
+    clean("evil ass rape server");
     clean("Hello World");
-    clean("Shell Shock Skatepark");
-    clean("Classic Skate Session");
-    clean("Pass the Grass");
     clean("Scunthorpe Skaters");
-    clean("Cocktail Hour");
-    clean("Peacock Plaza");
-    clean("Dickies Team Session");
-    clean("Arsenal FC fans");
-    clean("Sparse Parsec");
-    clean("Saturday Night Session");
-    clean("Reputation Skate");
-    clean("San Vansterdam 24/7");
-    clean("Titanic Ledges");
-    clean("Cumulus Bowl");
-    clean("Essex Street League");
-    clean("Pakistan Plaza");
-    clean("Scrapyard DIY");
-    clean("Grape Street Bowl");
-    clean("Scraped Knees Crew");
-    clean("Trapeze Transfers");
-    clean("Draping the rails");
     clean("Physical Therapist Pipe");
-    clean("ReSkate server");
     clean("");
-    // Masking keeps everything else and the length.
-    masks("what the fuck dude", "what the **** dude");
-    masks("shit happens", "**** happens");
-    masks("sh1t", "****");
-    masks("f u c k", "* * * *");
+    // With no built-in words, masking leaves every line exactly as written.
+    masks("what the fuck dude", "what the fuck dude");
+    masks("shit happens", "shit happens");
+    masks("fuckface", "fuckface");
     masks("Hello friends", "Hello friends");
-    masks("fuckface", "****face");
-    // The backend's lists take the built-in one's place: its words are no longer filtered,
-    // theirs are, and the ones not allowed at all are both filtered and told apart.
+    // The backend's lists still drive the filter: its words are filtered,
+    // the built-in's (empty) are not, and the ones not allowed at all are
+    // both filtered and told apart.
     {
         using namespace dingosdk::text;
         const auto expect = [&](bool ok, const char* what) {
@@ -94,8 +64,8 @@ int main() {
         expect(!contains_bad_words("darn zorblat fuck") && !contains_forbidden_words("zorblat") && mask_bad_words("darn") == "darn",
                "empty lists still filter");
         reset_word_lists();
-        expect(contains_bad_words("what the fuck") && !contains_bad_words("darn") && !contains_forbidden_words("zorblat"),
-               "the built-in list did not come back");
+        expect(!contains_bad_words("what the fuck") && !contains_bad_words("darn") && !contains_forbidden_words("zorblat"),
+               "reset did not return to the (empty) built-in list");
     }
     if (failures == 0) std::printf("word filter: all checks passed\n");
     return failures == 0 ? 0 : 1;

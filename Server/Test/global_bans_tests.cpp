@@ -41,8 +41,9 @@ void lists() {
     read = use_ban_list(R"({"categories":{"dev":[]}})");
     check(read.ok && read.changed && read.banned == 0 && !reskate_banned(cheater), "A list without bans kept one");
     // The chat word lists ride in the same answer: none changes nothing, some replace the
-    // built-in list, and the same again is not a change.
-    check(!read.words_changed && !dingosdk::text::contains_forbidden_words("zorblat") && dingosdk::text::contains_bad_words("shit"),
+    // built-in list, and the same again is not a change. The built-in list ships empty
+    // (bad_words.txt), so "shit" stays clean until a backend pushes its own words.
+    check(!read.words_changed && !dingosdk::text::contains_forbidden_words("zorblat") && !dingosdk::text::contains_bad_words("shit"),
           "An answer without word lists changed the words");
     const auto with_words = R"({"categories":{},"filtered_words":["darn"],"forbidden_words":["zorblat",""]})";
     read = use_ban_list(with_words);
