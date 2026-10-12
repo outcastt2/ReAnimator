@@ -57,6 +57,10 @@ public:
     void observe(bool held) noexcept;
     void release(std::string_view reason) noexcept;
     bool attached() const noexcept { return attached_; }
+    // Set by every release that re-arms the way a fresh press does (a fault,
+    // a walk, a world change): a latched Skitch toggle reads it to drop the
+    // latch instead of sitting on a grab the tow has already let go of.
+    bool needs_release() const noexcept { return needs_release_; }
     std::string_view status() const noexcept { return status_; }
     // Diagnostics of the last acquisition press (see TowDiag) and whether it
     // ended on the no-candidate release.

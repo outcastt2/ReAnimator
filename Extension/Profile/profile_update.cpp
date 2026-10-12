@@ -74,6 +74,8 @@ void Store::Update::encode(Json& patch) {
         (void)profile::up_velocity_binding(value);
         (void)profile::skitch_key_binding(value);
         (void)profile::skitch_combo_binding(value);
+        (void)profile::skitch_toggle_key_binding(value);
+        (void)profile::skitch_toggle_combo_binding(value);
         (void)profile::offboard_up_velocity_binding(value);
         remove("player_settings", [](const Json& row) { return row[0] != "options"; });
         auto residual = value.settings;
