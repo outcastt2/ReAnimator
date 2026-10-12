@@ -297,6 +297,28 @@ void register_movement_commands(Commands &registry) {
         out(saved ? local_profile_controller_bindings().status : "error: Invalid key or save failed.");
     };
     registry.add(std::move(skitch_key_bind));
+    auto skitch_toggle_bind =
+        action("bind skitchtoggle", "Bind a controller combo or keyboard key to Skitch toggle (press once to latch the grab); 0 clears it", Group::movement, {mask});
+    skitch_toggle_bind.inspect = [](const Model &m) {
+        return State{m.bindings.available, {}, "Controller bindings are unavailable.", {}, false};
+    };
+    skitch_toggle_bind.run = [](const Model &, const Values &args, const Output &out) {
+        const bool saved = set_local_skitch_toggle_combo_binding(static_cast<std::uint32_t>(std::get<std::uint64_t>(args[0])));
+        out(saved ? local_profile_controller_bindings().status : "error: Invalid binding or save failed.");
+    };
+    registry.add(std::move(skitch_toggle_bind));
+    auto skitch_toggle_key_bind = action("bind skitchtogglekey",
+        "Bind the keyboard key for Skitch toggle (press once to latch the grab); 0 disables the keyboard key",
+        Group::movement, {skitch_key_argument});
+    skitch_toggle_key_bind.inspect = [](const Model &m) {
+        return State{m.bindings.available, {}, "Controller bindings are unavailable.", {}, false};
+    };
+    skitch_toggle_key_bind.run = [](const Model &, const Values &args, const Output &out) {
+        const auto key = static_cast<std::uint32_t>(std::get<std::uint64_t>(args[0]));
+        const bool saved = set_local_skitch_toggle_key_binding(key);
+        out(saved ? local_profile_controller_bindings().status : "error: Invalid key or save failed.");
+    };
+    registry.add(std::move(skitch_toggle_key_bind));
 
     // Prototype: spawn a native effect blueprint and keep it on the skater's head.
     // The blueprint must already be loaded (wear a costume that uses it).

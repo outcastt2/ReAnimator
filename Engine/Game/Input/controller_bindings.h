@@ -116,6 +116,10 @@ struct ControllerBindingsModel {
     std::array<std::uint32_t, action_binds.size()> action_combos{}; // by action_binds
     std::uint32_t skitch_combo{default_skitch_combo}; // held while towing; zero disables controller Skitch
     std::uint32_t skitch_key{'V'}; // virtual-key code; zero disables keyboard Skitch
+    // Skitch toggle: one press latches the grab, the next releases it. Both
+    // zero by default, like any action that fires once per press.
+    std::uint32_t skitch_toggle_combo{};
+    std::uint32_t skitch_toggle_key{}; // virtual-key code; zero disables keyboard Skitch toggle
     std::string status;
 };
 inline std::string controller_combo_label(std::uint32_t value, ControllerStyle style = ControllerStyle::xbox) {

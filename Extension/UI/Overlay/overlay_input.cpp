@@ -451,10 +451,10 @@ dingosdk::overlay::FlightInput read_player_flight_controller() {
 }
 }
 
-extern "C" void DingoSDKOverlayReadSkitchInput(bool* active, bool* held, float* steering) {
+extern "C" void DingoSDKOverlayReadSkitchInput(bool* active, bool* held, float* steering, bool* toggle) {
     if (!active || !held || !steering) return;
     struct PreserveError { DWORD value = GetLastError(); ~PreserveError() { SetLastError(value); } } preserve;
-    *active = false; *held = false; *steering=0;
+    *active = false; *held = false; *steering=0; if (toggle) *toggle = false;
     auto& s = state(); const HWND window = s.window.load();
     s.skitch_input_state.store(0, std::memory_order_relaxed);
     if (!window || s.stop.load() || s.failed.load() || interactive_visible(s) || !game_window_foreground(window)) return;
@@ -473,25 +473,35 @@ extern "C" void DingoSDKOverlayReadSkitchInput(bool* active, bool* held, float* 
     if (pad.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) buttons |= 0x10000;
     if (pad.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) buttons |= 0x20000;
     const bool connected = sample.device != 0;
-    const bool combo_down = [&] {
-        if (!skitch_combo) return false;
-        if (dingosdk::keyboard_binding(skitch_combo)) {
-            if ((skitch_combo & 0xc0000000u) == dingosdk::keyboard_binding_tag)
-                return (GetAsyncKeyState(static_cast<int>(skitch_combo & 0xffu)) & 0x8000) != 0;
+    const auto combo_down = [&](std::uint32_t combo) {
+        if (!combo) return false;
+        if (dingosdk::keyboard_binding(combo)) {
+            if ((combo & 0xc0000000u) == dingosdk::keyboard_binding_tag)
+                return (GetAsyncKeyState(static_cast<int>(combo & 0xffu)) & 0x8000) != 0;
             for (unsigned slot = 0; slot < 5; ++slot) {
-                const auto id = (skitch_combo >> (slot * 6)) & 0x3fu;
+                const auto id = (combo >> (slot * 6)) & 0x3fu;
                 if (!id) break;
                 const auto key = dingosdk::keyboard_key_from_id(id);
                 if (!key || !(GetAsyncKeyState(static_cast<int>(key)) & 0x8000)) return false;
             }
             return true;
         }
-        return connected && (buttons & skitch_combo) == skitch_combo;
-    }();
-    *held = (skitch_key && (GetAsyncKeyState(static_cast<int>(skitch_key)) & 0x8000) != 0) || combo_down;
+        return connected && (buttons & combo) == combo;
+    };
+    const bool held_combo = combo_down(skitch_combo);
+    *held = (skitch_key && (GetAsyncKeyState(static_cast<int>(skitch_key)) & 0x8000) != 0) || held_combo;
+    // Skitch toggle (unbound by default): the same two ways to hold it, read
+    // under the same gates so a press in a menu is never a hidden latch.
+    if (toggle) {
+        const auto toggle_key = dingosdk::local_profile_skitch_toggle_key_binding();
+        *toggle = (toggle_key && (GetAsyncKeyState(static_cast<int>(toggle_key)) & 0x8000) != 0) ||
+            combo_down(dingosdk::local_profile_skitch_toggle_combo_binding());
+    }
     // Observed for the runtime's press diagnostic: bit0 pad connected,
-    // bit1 the bound combo is fully held right now (keyboard or controller).
-    s.skitch_input_state.store((connected ? 1u : 0u) | (combo_down ? 2u : 0u), std::memory_order_relaxed);
+    // bit1 the bound combo is fully held right now (keyboard or controller),
+    // bit2 the Skitch toggle bind is down right now.
+    s.skitch_input_state.store((connected ? 1u : 0u) | (held_combo ? 2u : 0u) |
+        ((toggle && *toggle) ? 4u : 0u), std::memory_order_relaxed);
 }
 // Which gate bit suppressed the skitch input (1 window, 2 stop, 4 failed,
 // 8 interactive menu, 16 foreground). Read by the runtime's skitch input

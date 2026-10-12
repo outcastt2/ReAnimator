@@ -70,6 +70,9 @@ struct SkateMenu {
     bool recording_skitch_key{};
     std::array<bool, 256> skitch_keys_down{};
     double skitch_key_capture_until{};
+    bool recording_skitch_toggle_key{};
+    std::array<bool, 256> skitch_toggle_keys_down{};
+    double skitch_toggle_key_capture_until{};
     int last_menu_frame = -1;
     // Live while the scale slider is held; the saved value is authoritative otherwise.
     float scale = default_menu_scale;
