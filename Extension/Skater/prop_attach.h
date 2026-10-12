@@ -46,6 +46,11 @@ void request_prop_pose(unsigned seconds);
 // of a graph parameter lives next to its asset reference, not in the asset.
 // `extra` is one more asset name to resolve, or empty.
 void request_prop_assets(std::string extra, unsigned seconds);
+// The decisive clip probe: resolve a named gesture clip, follow its +0x28
+// instance and that object's internal pointers, and compare every one against
+// the rig's output pose buffer. Read-only; decides whether the clip's live data
+// is an animgraph *input* (swappable for native IK) or its *output* (not).
+void request_prop_clip(std::string name);
 // Write test: hold the three layer weights that go to 1.0 during a prop gesture
 // at 1.0 for `seconds`, then restore the original values. The stop call restores
 // immediately.

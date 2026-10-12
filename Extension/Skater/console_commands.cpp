@@ -332,7 +332,7 @@ void register_movement_commands(Commands &registry) {
     // Hand props: the game's own gesture props follow a custom animation, so the
     // trigger is what has to be found before anything is written.
     auto prop = action("prop",
-        "Hand props: prop | prop list [name] | prop watch [name] [seconds] | prop trace [seconds] - gesture props and their creation",
+        "Hand props: prop | prop list [name] | prop watch [name] [seconds] | prop clip <name> | prop trace [seconds] - gesture props, creation, and the clip probe",
         Group::movement, {argument("mode", Type::text, true), argument("name", Type::text, true),
                           argument("seconds|side", Type::text, true)});
     prop.execution = Execution::local;
@@ -394,6 +394,12 @@ void register_movement_commands(Commands &registry) {
             out("Hand props: resolving the phone's graph assets by name, then watching where the animation instance "
                 "references them for " + std::to_string(seconds) +
                 "s; idle ~10s, then do the selfie (or hold the menu phone).");
+            return;
+        }
+        if (mode == "clip") {
+            skater::request_prop_clip(name);
+            out("Clip probe: resolving \"" + name + "\", following its +0x28 data and comparing against the rig's "
+                "output pose (see the log). Trigger that gesture first so it is loaded.");
             return;
         }
         if (mode == "poke") {
