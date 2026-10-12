@@ -162,6 +162,11 @@ struct State {
     HANDLE provider_event = nullptr;
     void* dll_notification_cookie = nullptr;
     Hook factory, create, create_hwnd, present, present1, resize, resize1, fullscreen;
+    // The same four of other swapchain implementations: DXGI's own under a wrapper the game
+    // was given (Streamline's), which is what presents when something else presents for the
+    // game (Intel's frame generation does).
+    static constexpr std::size_t more_swapchains = 3;
+    std::array<Hook, more_swapchains> present_more, present1_more, resize_more, resize1_more;
     Hook clip_cursor, set_cursor_pos;
     std::vector<Binding> bindings;
     IUnknown* swapchain_identity = nullptr;
@@ -287,6 +292,9 @@ void draw_chat();
 // The map download card (map_download_card.cpp): whether there is one this frame, and drawing it.
 bool map_download_pending();
 void draw_map_download();
+// The vote for the next map as its popup: the maps to pick from. False when it is not up (it
+// was answered or closed, or the vote is over), and the vote is drawn as the poll it is.
+bool draw_map_vote(const MultiplayerVote& vote);
 // Its icon on the way to the GPU: decoded pixels the render thread takes once, then says where
 // they went; lost when the device is torn down, after which they are handed out again.
 struct CardPixels {

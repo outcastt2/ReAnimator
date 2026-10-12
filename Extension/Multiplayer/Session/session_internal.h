@@ -225,7 +225,14 @@ struct Session {
     SteamServerBrowser servers;
     // Guest of a dedicated server: whether the roster lists us as an admin,
     // and the server's voice range from it.
+    // On a dedicated server: what the player's role gives them (its permissions packet), and the
+    // tag it wears (the roster's). server_admin: it has at least one of the server's commands.
     bool server_admin{};
+    std::string role, own_tag;
+    std::uint32_t own_tag_color{};
+    bool role_all_commands{};
+    std::vector<std::string> role_commands;
+    std::uint32_t role_permissions{};
     float roster_voice_range = default_voice_range;
     // The colours of the dedicated server's own chat lines, as its roster gives them.
     std::uint32_t server_chat_badge = default_server_chat_badge, server_chat_text = default_server_chat_text;
@@ -439,7 +446,7 @@ bool identity_link(Session &s, std::uint64_t other);
 void add_chat(Session &s, std::uint64_t sender, std::string name, std::string text, bool local = false, bool marks = true);
 // The colour and badge of one of the backend's categories.
 std::pair<std::uint32_t, std::string> mark_role(IdentityList list);
-// A player's role colour and badge ("Dev", "Staff", "Content Creator", "Centrix", "Homie", "Admin", "Host", "Friend" or none), shown in chat
+// A player's role colour and badge ("Dev", "ReSkate Admin", "Content Creator", "Centrix", "Homie", "Admin", "Host", "Friend" or none), shown in chat
 // and on their nametag. `local`: the local player.
 std::pair<std::uint32_t, std::string> player_role(Session &s, std::uint64_t id, bool local, bool marks = true);
 // Sends one line from this player; returns why not when it cannot.
@@ -455,6 +462,7 @@ std::string answer_server_poll(Session &s, std::size_t answer);
 inline std::atomic<bool> server_vote_open_flag{};
 inline std::atomic<MapPackageLookup> map_package_lookup{};
 inline std::atomic<bool> fetching_map_flag{};
+inline std::atomic<bool> map_load_held{};
 // A guest without the map is downloading it: the clock they are loading against starts over
 // each time they say so, for as long as map_fetch_limit_us from the first time.
 inline void guest_fetching(Peer &peer, std::uint64_t now) {
@@ -477,6 +485,16 @@ inline std::string host_map_package(std::string_view destination) {
     }
 }
 inline std::atomic<unsigned> server_poll_answers_flag{};
+// The server's maps for its next-map vote (session.h: next_maps), for the thread that fetches their pictures.
+inline std::mutex next_maps_mutex;
+inline std::vector<NextMapWanted> next_maps_shared;
+inline std::atomic<unsigned> next_maps_serial_value{};
+inline void set_next_maps(std::vector<NextMapWanted> maps) {
+    std::lock_guard lock(next_maps_mutex);
+    if (maps.empty() && next_maps_shared.empty()) return;
+    next_maps_shared = std::move(maps);
+    next_maps_serial_value.fetch_add(1, std::memory_order_relaxed);
+}
 // "/p <message>" in a lobby: one line for the local player's party only, relayed by the host.
 std::string send_party_chat(Session &s, std::string_view typed);
 // The "/" commands this session offers (the chat overlay lists them as the player types "/").
