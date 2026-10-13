@@ -6,6 +6,7 @@
 #include "tick_settings.h"
 #include "voice_settings.h"
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -72,6 +73,8 @@ struct MultiplayerPlayer {
     // The player's party (0 = none), whether they lead it, and whether it is the local player's.
     std::uint32_t party{};
     bool party_leader{}, party_member{};
+    // The local player made this player's placed objects solid; they are ghosts otherwise.
+    bool objects_solid{};
 };
 // A party invite waiting for an answer (dedicated servers).
 struct MultiplayerPartyInvite {
@@ -91,6 +94,9 @@ struct MultiplayerHostPreferences {
     unsigned tps = multiplayer_default_tps;
     std::string lobby_name;
 };
+// The least time between two searches of the lobby and server lists, whoever asks: the
+// browser's refresh, a page opening, the console. The browser counts it down.
+inline constexpr std::uint64_t multiplayer_browse_interval_us = 10000000;
 // Session text chat. A message is UTF-8 without control characters, at most
 // this many bytes; the log keeps the most recent lines of the session.
 inline constexpr std::size_t multiplayer_chat_max_bytes = 200;
@@ -282,6 +288,8 @@ struct MultiplayerModel {
     bool public_host{}, lobby_listed{}, lobby_searching{}, lobby_joining{}, lobby_searched{};
     std::uint64_t public_lobby{}; // Verified public listing, never a private invitation.
     std::string lobby_status, browser_status = "Refresh to find public ReSkate lobbies.";
+    // When the lists may be searched again, on the steady clock in microseconds (browse_wait).
+    std::uint64_t browse_ready_us{};
     std::vector<MultiplayerLobby> lobbies;
     bool network_telemetry{};
     unsigned prioritized_connections{};
@@ -293,6 +301,12 @@ struct MultiplayerModel {
         raw_sent_bytes{};
 };
 // Whether the player's role on the dedicated server they are on has one of its commands.
+// Whole seconds until the lobby and server lists may be searched again; 0 when they may be now.
+inline int browse_wait(const MultiplayerModel& model) noexcept {
+    const auto now = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    return model.browse_ready_us > now ? static_cast<int>((model.browse_ready_us - now + 999999) / 1000000) : 0;
+}
 inline bool server_can(const MultiplayerModel& model, std::string_view command) noexcept {
     return model.dedicated && role_allows(model.server_all_commands, model.server_commands, command);
 }

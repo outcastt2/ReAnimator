@@ -1,6 +1,7 @@
 #include "session_internal.h"
 #include "Extension/Skater/Skitch/player_skitch.h"
 #include "Extension/Skater/Skitch/reskate_pose_bridge.h"
+#include "Engine/Core/Debug/trace.h"
 #include "Extension/Multiplayer/Hud/native_player_ui.h"
 #include "Extension/Multiplayer/Hud/native_indicators.h"
 #include "Extension/Multiplayer/Hud/native_party.h"
@@ -72,6 +73,10 @@ void reset_peer(Session &s, std::size_t slot) {
     s.peers[slot] = {};
 }
 void stop(Session &s, std::string reason) {
+    s.local_typing_until = 0;
+    // A join that ends before the host's map was ready never got in.
+    if (s.mode == Mode::join && s.awaiting_map && !s.travelling && s.join_started)
+        trace::record("multiplayer.join", "app.join", std::chrono::milliseconds((now_us() - s.join_started) / 1000), false);
     s.voice.reset();
     s.voice_policy = {};
     s.tps = multiplayer_default_tps;
@@ -340,6 +345,8 @@ void publish_party(Session &s) {
     // Nobody is in one just for being in the same lobby or on the same server.
     set_native_party_changes(session);
     const bool shown = session ? s.local_party != 0 : s.mode != Mode::off;
+    // What a dedicated server placed (its parks) says "Server", as its chat lines do.
+    set_native_party_server(dedicated_host(s) ? s.host_id : 0, "Server");
     update_native_party(s.base, roster, capacity, shown);
 }
 // Links the players' own throwdowns (Extension/Throwdowns/throwdown_relay.cpp). Runs
@@ -487,6 +494,17 @@ void render(Session &s, std::uintptr_t client, const NativeFrame &local, std::ui
         std::reverse(result.begin(), result.end()); // oldest first
         return result;
     };
+    // Grey discs while they typed recently. The step is local, about three a second.
+    // ".", "..", "..." is one, two, then three discs; the overlay draws them.
+    const auto typing_bubble = [&](std::uint64_t until) {
+        NametagBubble line;
+        if (!until || now >= until) return line;
+        static constexpr const char *steps[] = {".", "..", "..."};
+        line.text = steps[(now / 333000) % 3];
+        line.hint = true;
+        line.appear = line.fade = 1.f;
+        return line;
+    };
     // Who is talking, as last published for the UI (10 Hz), without copying the voice model.
     const auto &voices = s.view.voice.players;
     const auto label = [&](const Peer &p) {
@@ -500,6 +518,8 @@ void render(Session &s, std::uintptr_t client, const NativeFrame &local, std::ui
         tag.nameless = s.nametags_friends && !std::binary_search(s.friend_ids.begin(), s.friend_ids.end(), p.member.id);
         tag.talking = std::any_of(voices.begin(), voices.end(), [&](const auto &v) { return v.id == p.member.id && v.speaking; });
         tag.bubbles = recent_bubbles(p.member.id);
+        if (bubbles)
+            if (auto hint = typing_bubble(p.typing_until); !hint.text.empty()) tag.bubbles.push_back(std::move(hint));
         nametags.push_back(std::move(tag));
     };
     // Creating a player's actor (skater, skateboard and both recipes) or re-applying a
@@ -719,9 +739,12 @@ void render(Session &s, std::uintptr_t client, const NativeFrame &local, std::ui
         }
     }
     player_skitch::tick(s.base,client,local,skitch_world,s.transport.status().local_id,now,skitch_candidates);
-    // The local player's own lines, above their own skater, when asked for.
-    if (labels && bubbles && s.chat_bubbles_own && local.ready) {
-        auto own = recent_bubbles(s.transport.status().local_id);
+    // The local player's own lines, above their own skater, when asked for. The typing
+    // preview uses the same three-second window other players see, and shows even when
+    // own chat lines are hidden.
+    if (labels && bubbles && local.ready) {
+        auto own = s.chat_bubbles_own ? recent_bubbles(s.transport.status().local_id) : std::vector<NametagBubble>{};
+        if (auto hint = typing_bubble(s.local_typing_until); !hint.text.empty()) own.push_back(std::move(hint));
         if (!own.empty()) {
             NametagPlayer tag;
             tag.head = local.pose.root.position;
@@ -744,6 +767,7 @@ MultiplayerModel model() {
     return s.view;
 }
 std::string take_leave_notice() { return std::exchange(session().leave_notice, {}); }
+std::string take_removed_notice() { return std::exchange(session().removed_notice, {}); }
 std::optional<MapNeed> take_map_need() { return std::exchange(session().map_need, std::nullopt); }
 void set_map_package_lookup(MapPackageLookup lookup) noexcept { map_package_lookup.store(lookup, std::memory_order_relaxed); }
 bool fetching_map() noexcept { return fetching_map_flag.load(std::memory_order_relaxed); }
@@ -828,6 +852,8 @@ bool prepare_join_map(Session &s, bool ready, std::string_view current, MapLoade
             s.status = "Host map loaded. Waiting for your skater...";
             return false;
         }
+        if (!s.travelling && s.join_started)
+            trace::record("multiplayer.join", "app.join", std::chrono::milliseconds((now - s.join_started) / 1000));
         s.awaiting_map = false;
         s.fetching_since = 0;
         fetching_map_flag.store(false, std::memory_order_relaxed);

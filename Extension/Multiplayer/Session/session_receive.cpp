@@ -444,6 +444,11 @@ void networking(Session &s, const NativeFrame &local, std::uint64_t now) {
         }
     }
     if (s.mode == Mode::join && physical(s.host_id) == links.end()) {
+        // What the other end said as it closed the link, when it was said to this player
+        // ("You were kicked...", "You are banned...", "Your mods..."), is put in front of
+        // them (take_removed_notice): otherwise it is only the status line of a menu they
+        // may never open. A link that just went away says nothing of the kind.
+        if (const auto said = s.transport.status().detail; said.starts_with("You ") || said.starts_with("Your ")) s.removed_notice = said;
         stop(s, s.transport.status().detail);
         return;
     }
@@ -1026,6 +1031,26 @@ void networking(Session &s, const NativeFrame &local, std::uint64_t now) {
             }
             if (owes_proof(s, *sender)) relayed_chat(s, *sender, p, now);
             else add_chat(s, sender->member.id, server ? std::string("Server") : chat_name(s, *sender), p.text);
+            if (s.mode == Mode::host) broadcast(s, p, true, false, now, p.source);
+            continue;
+        }
+        // Grey dots above the sender. Not a chat line. "On" is held to a few a second so a
+        // modified client cannot flood the relay, and "off" only clears dots that are up, so
+        // it cannot outpace "on".
+        if (p.kind == PacketKind::typing) {
+            auto *sender = find_peer(s, p.source);
+            if (direct_link || !sender || !sender->handshaken) continue;
+            if (!routed_source(p, sender->member, message.peer, s.mode == Mode::host, s.host_id))
+                continue;
+            if (p.typing) {
+                if (sender->typing_notice && now < sender->typing_notice + 200000) continue;
+                sender->typing_notice = now;
+                sender->typing_until = now + typing_hold_us;
+            } else {
+                if (!sender->typing_until) continue;
+                sender->typing_until = 0;
+            }
+            sender->last_packet = now;
             if (s.mode == Mode::host) broadcast(s, p, true, false, now, p.source);
             continue;
         }
