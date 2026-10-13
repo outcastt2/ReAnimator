@@ -70,6 +70,9 @@ inline std::uint32_t keyboard_binding_from_keys(const std::array<std::uint64_t, 
 inline constexpr bool valid_controller_combo(std::uint32_t value) noexcept {
     return (value & ~controller_button_mask) == 0;
 }
+// Skitch's controller default is R1 (RB on Xbox pads): the value a profile
+// that never saved a binding reports. An explicit 0 in the profile clears it.
+inline constexpr std::uint32_t default_skitch_combo = 0x200;
 inline constexpr bool valid_action_binding(std::uint32_t value) noexcept {
     return valid_controller_combo(value) || keyboard_binding(value);
 }
@@ -111,6 +114,12 @@ struct ControllerBindingsModel {
     std::uint32_t offboard_up_velocity_combo{};
     std::uint32_t vote_yes_combo{}, vote_no_combo{}; // answering a dedicated server's vote
     std::array<std::uint32_t, action_binds.size()> action_combos{}; // by action_binds
+    std::uint32_t skitch_combo{default_skitch_combo}; // held while towing; zero disables controller Skitch
+    std::uint32_t skitch_key{'V'}; // virtual-key code; zero disables keyboard Skitch
+    // Skitch toggle: one press latches the grab, the next releases it. Both
+    // zero by default, like any action that fires once per press.
+    std::uint32_t skitch_toggle_combo{};
+    std::uint32_t skitch_toggle_key{}; // virtual-key code; zero disables keyboard Skitch toggle
     std::string status;
 };
 inline std::string controller_combo_label(std::uint32_t value, ControllerStyle style = ControllerStyle::xbox) {

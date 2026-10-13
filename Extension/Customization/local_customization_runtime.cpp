@@ -137,22 +137,35 @@ bool refresh_cosmetic_catalog() {
         !read(manager + 0x3c, current_count) || current_count != count) return false;
     const auto& catalogs = content_cache::catalogs();
     c.ownership_unavailable = !catalogs.available;
-    std::vector<std::string> keys, objects, reserved_keys, reserved_objects;
+    // Gestures and build items are unlocked in full; every other cosmetic keeps
+    // the upstream open-catalogue rule, and only reserved items are revoked.
+    std::vector<std::string> seed_cosmetics, seed_objects, locked_cosmetics, locked_objects;
     for (const auto& [key, info] : items) {
         std::string folded = key;
         for (auto& letter : folded) if (letter >= 'A' && letter <= 'Z') letter = static_cast<char>(letter + ('a' - 'A'));
-        const bool held = catalogs.reserved(folded);
-        (info.build_kit ? (held ? reserved_objects : objects) : (held ? reserved_keys : keys)).push_back(key);
+        // Entitlement-granted collab collections ("Own_Own_...") are absent from
+        // the open content cache entirely -- it ships only content ReSkate can
+        // distribute -- so reserved() cannot see them. Treat them as reserved:
+        // they are the paid brand packs, and an owned paid item whose backing
+        // data the cache does not describe has crashed the client's item
+        // previews (a shared-pointer copy of an object that is not there).
+        const bool held = catalogs.reserved(folded) || folded.starts_with("own_own_");
+        if (info.build_kit) {
+            (profile::unlock_build_items ? seed_objects : locked_objects).push_back(key);
+        } else if (key.starts_with("own_rctn_gesture") || info.category.starts_with("gestures")) {
+            (profile::unlock_gesture_items ? seed_cosmetics : locked_cosmetics).push_back(key);
+        } else if (!held || profile::unlock_reserved_cosmetics) {
+            // Upstream ReSkate: the open catalogue is unlocked, which is the
+            // base game clothing and everything a mod installed.
+            seed_cosmetics.push_back(key);
+        } else {
+            locked_cosmetics.push_back(key);
+        }
     }
     if (!c.ownership_unavailable) {
-        // The unlock options already default to true and are named for unlocking the whole
-        // catalogue, so seed reserved items alongside the open ones. reconcile_inventory()
-        // leaves them owned for the same reason.
-        keys.insert(keys.end(), reserved_keys.begin(), reserved_keys.end());
-        objects.insert(objects.end(), reserved_objects.begin(), reserved_objects.end());
-        s.store->seed_cosmetic_inventory(keys);
-        s.store->seed_object_inventory(objects);
-        s.store->reconcile_inventory(reserved_keys, reserved_objects);
+        s.store->seed_cosmetic_inventory(seed_cosmetics);
+        s.store->seed_object_inventory(seed_objects);
+        s.store->reconcile_inventory(locked_cosmetics, locked_objects);
     }
     {
         std::set<std::uint32_t> hashes;
@@ -164,8 +177,9 @@ bool refresh_cosmetic_catalog() {
     c.items = std::move(items); c.item_count = count; c.item_manager = manager;
     ++c.items_generation;
     std::ostringstream event;
-    event << "{\"event\":\"local_cosmetic_catalog\",\"installed\":" << keys.size()
-          << ",\"objects\":" << objects.size() << '}';
+    event << "{\"event\":\"local_cosmetic_catalog\",\"installed\":"
+          << seed_cosmetics.size() + locked_cosmetics.size() << ",\"objects\":"
+          << seed_objects.size() + locked_objects.size() << '}';
     dingosdk::logging::event(dingosdk::logging::Channel::customization, event.str().c_str());
     return true;
 }
@@ -508,23 +522,24 @@ bool load_cosmetic_hook(const void* wrapper, void* destination) {
             for (std::size_t j = 0; j < expected.items.size(); ++j) {
                 const auto match = saved_slots.find(expected.items[j].slot);
                 const auto* slot = match == saved_slots.end() ? &expected.items[j] : match->second;
-                if (match == saved_slots.end()) ++added;
+                const bool from_saved = match != saved_slots.end();
+                if (!from_saved) ++added;
                 else saved_slots.erase(match);
-                if (hidden.contains(slot->slot)) {
+                if (hidden.contains(expected.items[j].slot)) {
                     // A hidden slot is written empty whatever the preset holds. That is the same
                     // shape the game already uses for its own unworn slots, so it renders as
                     // nothing rather than as a missing item. The held entry keeps the saved item
                     // out of harm's way: with an empty fallback the save path sees the slot still
                     // showing the substitute and restores what the player actually picked.
-                    held.push_back({i, *slot, {}});
+                    if (from_saved) held.push_back({i, *slot, {}});
                     words.emplace_back(0); // An item with no parameters to vary.
-                    item_arrays.back().data()[j] = {"", words.back().data(), 0, slot->slot};
+                    item_arrays.back().data()[j] = {"", words.back().data(), 0, expected.items[j].slot};
                     dingosdk::logging::log(dingosdk::logging::Level::info, dingosdk::logging::Channel::customization,
-                        "Hiding slot {} (hash {}) for preset {}.", slot->slot,
+                        "Hiding slot {} (hash {}) for preset {}.", expected.items[j].slot,
                         cosmetic_hash(slot->asset), id);
                     continue;
                 }
-                if (!slot->asset.empty()) {
+                if (from_saved && !slot->asset.empty()) {
                     // An item that is no longer installed (a removed mod, a catalog
                     // change) or no longer fits its slot falls back to the slot's
                     // default. Rejecting the whole outfit would also block every

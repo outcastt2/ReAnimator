@@ -15,6 +15,12 @@ namespace dingosdk::skater {
 // else is a path to a .rska clip file.
 void request_pose_playback(std::string clip);
 void request_pose_playback_stop();
+// Floor correction is opt-in per clip: off unless `poseanim <file> ik` was
+// given, remembered per clip name, so re-running `poseanim <file>` after a
+// quickswap re-export keeps the flag; `set_pose_clip_ik(name, false)` (or
+// `poseanim <file> noik`) clears it.
+void set_pose_clip_ik(std::string_view clip, bool ik) noexcept;
+bool pose_clip_ik(std::string_view clip) noexcept;
 // Which joints a custom animation is allowed to drive. The game can keep the
 // pelvis and both legs, so a clip layers on top of walking or a board stance
 // the way the game's own moving gestures do.
@@ -33,6 +39,17 @@ std::string save_recorded_clip(std::string_view path);
 // Queue a dump of the live skeleton resource beside the log (read-only).
 void request_skeleton_dump();
 std::string pose_playback_status();
+// What this tool's per-frame work actually costs, averaged since playback began.
+// It runs inside the engine's frame; this is how it answers for itself.
+std::string pose_playback_cost();
+// The two-second geometry summary in the log. Off by default.
+void set_pose_trace(bool enabled) noexcept;
+bool pose_trace();
+// Floor correction strength for the clip's feet and hands, 0..1 (0 off, the
+// default 1). The game plants its own feet before this tool's write; a clip
+// that sinks below them is lifted back with a two-bone solve.
+void set_pose_ik(float strength) noexcept;
+float pose_ik() noexcept;
 // Per-frame housekeeping on the client thread (start/stop, local component).
 void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept;
 // The animation-evaluation listener: overwrites the pose before it is rendered.

@@ -51,4 +51,75 @@ float ramp_weight(float weight, float target, std::uint64_t elapsed_ms, std::uin
 void write_pose(std::uintptr_t buffer, const float *frame, std::uint32_t first, std::uint32_t count,
                 float keep) noexcept;
 
+// The same write, interpolating between two clip frames: a clip authored at
+// 24 fps played back at 60 Hz snaps between frames otherwise, which reads as a
+// stutter. Pass the last frame and the first frame as the pair and the loop
+// closes without a jump.
+void write_pose_interpolated(std::uintptr_t buffer, const float *frame_a, const float *frame_b, float alpha,
+                             std::uint32_t first, std::uint32_t count, float keep) noexcept;
+
+// Floor correction. A clip baked in Blender has no idea where the game's
+// floor is, so its feet sink into the board or the ground. The game's own
+// gesture IK already answered that question in the very pose this unit
+// replaces: the engine's feet are planted on whatever the skater stands on.
+// The two leg chains, sampled just before the clip is written, carry that
+// answer -- per foot, so a stance with the feet on two different elevations
+// (a ledge, a stair) comes out right, plus the way each knee bends and the
+// pitch of each planted foot.
+struct LegFloor {
+    bool valid = false;         // the chain composed at all
+    bool toe_valid = false;     // the ankle->toe vector was long enough to trust
+    float foot_y = 0.0f;        // world Y of this foot's lowest point (ankle, toe)
+    float ankle_offset = 0.0f;  // the game's ankle rides this far above its foot
+    float knee[3]{};            // unit: the way the game's knee bends (world)
+    float toe_dir[3]{};         // unit: the game's ankle->toe direction (the sole's pitch)
+};
+struct FloorSample {
+    bool valid = false;
+    float floor_y = 0.0f;       // lowest of both feet: what hands and the torso clear
+    LegFloor legs[2]{};         // 0 = right chain, 1 = left chain
+};
+bool sample_floors(std::uintptr_t buffer, FloorSample &out) noexcept;
+
+// Temporal smoothing of the sampled ground.
+//
+// `sample_floors` reads the game's *live* pose every frame, and that pose
+// jitters: the planted foot drifts a millimetre or two, the knee hint wobbles
+// and the sole pitch shakes. On a nearly-straight leg the analytic solve sits
+// near the acos singularity, where a two-millimetre floor change becomes
+// several degrees of knee swing -- which is the frame-to-frame knee jank. A
+// real engine low-passes exactly these quantities; this is that filter.
+//
+// Blend the fresh sample into `state` (the running smoothed value) by
+// `alpha` in 0..1 (1 = take the fresh sample outright, 0 = hold the last).
+// The numeric fields -- floor height, per-foot height and ankle offset, and
+// the knee and toe directions (renormalised) -- are smoothed; the `valid`
+// flags come from whichever sample is kept. `state` carries across frames, so
+// the caller owns it. With no prior state the fresh sample is taken outright;
+// a fresh sample that failed to compose holds the last good one.
+FloorSample smooth_floor(FloorSample state, const FloorSample &fresh, float alpha) noexcept;
+
+// After the clip write: correct what the clip drove against the sampled
+// ground by an analytic two-bone solve per limb, so the legs and arms bend
+// instead of stretching.
+//   legs  per-leg floor: lift what clips through, and -- only where the
+//         game's own two feet sit at different heights, i.e. the terrain is
+//         uneven -- follow the leg's own foot down or up within a band, so a
+//         dangling foot reaches its surface instead of floating. While the
+//         foot is near its floor the sole is also pitched flat onto the
+//         game's planted-foot direction and the ankle held at the height
+//         that keeps the toe on the ground.
+//   torso the spine+head chain is lifted clear of the floor plane (the
+//         pelvis is the game's, so the hips are already safe)
+//   arms  always clip-driven: lifted clear of the floor plane; a hand
+//         resting on the floor is a handplant and stays
+// `margin` is the tolerated sink (authored near-floor poses and joint noise
+// are left alone); `strength` scales every correction, 0 disables. Legs
+// respect the mask (scaled by 1 - keep: a leg the mask kept is the game's
+// own planted foot and is never touched). Only rotations are written; every
+// position, scale and spare float in the buffer stays exactly as the clip
+// (or the game) left it.
+void apply_floor(std::uintptr_t buffer, const FloorSample &floor, float margin, float strength,
+                 float keep) noexcept;
+
 } // namespace dingosdk::skater::layers

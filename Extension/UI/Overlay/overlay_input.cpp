@@ -1,3 +1,5 @@
+#include "Extension/Skater/Skitch/tow_controller.h"
+#include "Extension/Profile/local_profile_runtime.h"
 #include "Engine/Core/Platform/launcher_support.h"
 #include "Engine/Core/Log/logging.h"
 #include "Extension/Boot/exit_watch.h"
@@ -449,6 +451,77 @@ dingosdk::overlay::FlightInput read_player_flight_controller() {
 }
 }
 
+extern "C" void DingoSDKOverlayReadSkitchInput(bool* active, bool* held, float* steering, bool* toggle) {
+    if (!active || !held || !steering) return;
+    struct PreserveError { DWORD value = GetLastError(); ~PreserveError() { SetLastError(value); } } preserve;
+    *active = false; *held = false; *steering=0; if (toggle) *toggle = false;
+    auto& s = state(); const HWND window = s.window.load();
+    s.skitch_input_state.store(0, std::memory_order_relaxed);
+    if (!window || s.stop.load() || s.failed.load() || interactive_visible(s) || !game_window_foreground(window)) return;
+    OverlayInputAccess access;
+    const auto sample = read_controller_sample();
+    *active = true;
+    if(sample.device) *steering=skateskitch::skitch_steering_axis(static_cast<float>(sample.pad.sThumbLX)/32768.f);
+    const auto skitch_key = dingosdk::local_profile_skitch_key_binding();
+    // The bound combo (R1 by default) matches the same way the other action
+    // binds do: a keyboard binding — single key or chord — is read from the
+    // OS key state, a controller combo from raw XInput bits plus the
+    // synthetic trigger bits above the dead zone.
+    const auto skitch_combo = dingosdk::local_profile_skitch_combo_binding();
+    const auto& pad = sample.pad;
+    std::uint32_t buttons = pad.wButtons & dingosdk::controller_button_mask;
+    if (pad.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) buttons |= 0x10000;
+    if (pad.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) buttons |= 0x20000;
+    const bool connected = sample.device != 0;
+    const auto combo_down = [&](std::uint32_t combo) {
+        if (!combo) return false;
+        if (dingosdk::keyboard_binding(combo)) {
+            if ((combo & 0xc0000000u) == dingosdk::keyboard_binding_tag)
+                return (GetAsyncKeyState(static_cast<int>(combo & 0xffu)) & 0x8000) != 0;
+            for (unsigned slot = 0; slot < 5; ++slot) {
+                const auto id = (combo >> (slot * 6)) & 0x3fu;
+                if (!id) break;
+                const auto key = dingosdk::keyboard_key_from_id(id);
+                if (!key || !(GetAsyncKeyState(static_cast<int>(key)) & 0x8000)) return false;
+            }
+            return true;
+        }
+        return connected && (buttons & combo) == combo;
+    };
+    const bool held_combo = combo_down(skitch_combo);
+    *held = (skitch_key && (GetAsyncKeyState(static_cast<int>(skitch_key)) & 0x8000) != 0) || held_combo;
+    // Skitch toggle (unbound by default): the same two ways to hold it, read
+    // under the same gates so a press in a menu is never a hidden latch.
+    if (toggle) {
+        const auto toggle_key = dingosdk::local_profile_skitch_toggle_key_binding();
+        *toggle = (toggle_key && (GetAsyncKeyState(static_cast<int>(toggle_key)) & 0x8000) != 0) ||
+            combo_down(dingosdk::local_profile_skitch_toggle_combo_binding());
+    }
+    // Observed for the runtime's press diagnostic: bit0 pad connected,
+    // bit1 the bound combo is fully held right now (keyboard or controller),
+    // bit2 the Skitch toggle bind is down right now.
+    s.skitch_input_state.store((connected ? 1u : 0u) | (held_combo ? 2u : 0u) |
+        ((toggle && *toggle) ? 4u : 0u), std::memory_order_relaxed);
+}
+// Which gate bit suppressed the skitch input (1 window, 2 stop, 4 failed,
+// 8 interactive menu, 16 foreground). Read by the runtime's skitch input
+// diagnostics so a press that reads nothing can say which gate closed.
+extern "C" unsigned DingoSDKOverlaySkitchInputFlags() {
+    const auto& s = state();
+    const HWND window = s.window.load();
+    unsigned flags = 0;
+    if (window) flags |= 1u;
+    if (s.stop.load()) flags |= 2u;
+    if (s.failed.load()) flags |= 4u;
+    if (interactive_visible(s)) flags |= 8u;
+    if (window && game_window_foreground(window)) flags |= 16u;
+    return flags;
+}
+// The last DingoSDKOverlayReadSkitchInput observation, for the press
+// diagnostic: bit0 pad connected, bit1 the bound combo fully held.
+extern "C" unsigned DingoSDKOverlaySkitchComboState() {
+    return state().skitch_input_state.load(std::memory_order_relaxed);
+}
 extern "C" void DingoSDKOverlaySetFreecamInputCapture(bool active) {
     const bool previous = state().freecam_controller_active.exchange(active, std::memory_order_relaxed);
     if (previous != active)
