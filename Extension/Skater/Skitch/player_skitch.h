@@ -33,4 +33,8 @@ bool grip_holding() noexcept;
 void set_enabled(bool) noexcept;
 bool enabled() noexcept;
 std::string status();
+// Increments on each physical press of the skitch input (keyboard key or
+// the bound controller combo), so other systems can log one diagnostic line
+// per press attempt.
+std::uint64_t press_serial() noexcept;
 } // namespace dingosdk::player_skitch

@@ -61,7 +61,9 @@ bool queue_local_park_paste(const EditorPasteRequest &);
 void tick_local_park_editor() noexcept;
 ControllerBindingsModel local_profile_controller_bindings();
 std::uint32_t local_profile_skitch_key_binding() noexcept;
-bool set_local_skitch_key_binding(std::uint32_t);
+std::uint32_t local_profile_skitch_combo_binding() noexcept;
+std::uint32_t local_profile_skitch_toggle_key_binding() noexcept;
+std::uint32_t local_profile_skitch_toggle_combo_binding() noexcept;
 bool set_local_freecam_controller(bool);
 bool local_freecam_controller();
 bool set_local_freecam_controller_binding(std::uint32_t);
@@ -75,6 +77,10 @@ bool set_local_noclip_binding(std::uint32_t);
 bool set_local_forward_velocity_binding(std::uint32_t);
 bool set_local_up_velocity_binding(std::uint32_t);
 bool set_local_offboard_up_velocity_binding(std::uint32_t);
+bool set_local_skitch_key_binding(std::uint32_t);
+bool set_local_skitch_combo_binding(std::uint32_t);
+bool set_local_skitch_toggle_key_binding(std::uint32_t);
+bool set_local_skitch_toggle_combo_binding(std::uint32_t);
 bool set_local_object_persistence(bool enabled);
 bool clear_local_persisted_objects(std::string_view map);
 bool delete_local_placed_object(std::string_view map, std::uint64_t token);
@@ -91,6 +97,7 @@ bool set_local_progression(const std::vector<std::string>& arguments);
 // Small ReSkate-owned booleans saved beside the profile under a "ReSkate."
 // prefix. Absent until first written; never exposed to the game's own settings.
 namespace profile_runtime {
+bool local_profile_store_ready() noexcept;
 std::optional<bool> local_preference(std::string_view key) noexcept;
 void set_local_preference(std::string_view key, bool value) noexcept;
 // The same "ReSkate." store for numbers and text. A key keeps the type it was
@@ -101,6 +108,11 @@ void set_local_values(const std::vector<std::pair<std::string, Json>>& values) n
 // read it every frame without touching the database.
 float local_menu_scale() noexcept;
 bool set_local_menu_scale(float value) noexcept;
+// The game's camera height option (UseHighCam, true is the high camera) as the game writes it,
+// which its camera height button does: the listener returns the height to keep instead. Runs on
+// the thread that writes the option.
+using CameraHeightWrite = bool (*)(bool high) noexcept;
+void set_camera_height_write_listener(CameraHeightWrite listener) noexcept;
 }
 PlayerCardModel local_profile_player_card();
 // Renames only the local RIP Card. An empty name restores the Steam name.

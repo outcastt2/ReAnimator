@@ -3,14 +3,16 @@
 #include "Extension/Profile/local_profile_runtime.h"
 #include "ai_skaters.h"
 #include "Skitch/player_skitch.h"
+#include "Skitch/drag_state.h"
 #include "effect_attach.h"
 #include "custom_animation.h"
 #include "prop_attach.h"
+#include <cstdlib>
 #include <format>
 #include <string>
 namespace dingosdk::console {
 void register_movement_commands(Commands &registry) {
-    auto skitch = variable("skitch", "Player hip towing: hold V or LB+RB nearby", Group::movement, argument("0|1", Type::boolean));
+    auto skitch = variable("skitch", "Player hip towing: hold V or R1 (both rebindable) nearby", Group::movement, argument("0|1", Type::boolean));
     skitch.inspect = [](const Model&) { return boolean_state(true,player_skitch::enabled(),{},player_skitch::status()); };
     skitch.run = [](const Model&,const Values& args,const Output&) { player_skitch::set_enabled(std::get<bool>(args[0])); };
     skitch.reset = [](const Model&,const Output&) { player_skitch::set_enabled(false); };
@@ -270,11 +272,21 @@ void register_movement_commands(Commands &registry) {
         out(saved ? local_profile_controller_bindings().status : "error: Invalid binding or save failed.");
     };
     registry.add(std::move(up_bind));
+    auto skitch_bind =
+        action("bind skitch", "Bind a controller combo or keyboard key to Skitch; 0 clears the binding (default R1)", Group::movement, {mask});
+    skitch_bind.inspect = [](const Model &m) {
+        return State{m.bindings.available, {}, "Controller bindings are unavailable.", {}, false};
+    };
+    skitch_bind.run = [](const Model &, const Values &args, const Output &out) {
+        const bool saved = set_local_skitch_combo_binding(static_cast<std::uint32_t>(std::get<std::uint64_t>(args[0])));
+        out(saved ? local_profile_controller_bindings().status : "error: Invalid binding or save failed.");
+    };
+    registry.add(std::move(skitch_bind));
     auto skitch_key_argument = argument("virtual_key", Type::unsigned_integer);
     skitch_key_argument.minimum = 0;
     skitch_key_argument.maximum = 255;
     auto skitch_key_bind = action("bind skitchkey",
-        "Bind the keyboard key for player skitching; 0 disables the keyboard key (controller LB+RB remains)",
+        "Bind the keyboard key for player skitching; 0 disables the keyboard key (the controller binding remains)",
         Group::movement, {skitch_key_argument});
     skitch_key_bind.inspect = [](const Model &m) {
         return State{m.bindings.available, {}, "Controller bindings are unavailable.", {}, false};
@@ -285,6 +297,28 @@ void register_movement_commands(Commands &registry) {
         out(saved ? local_profile_controller_bindings().status : "error: Invalid key or save failed.");
     };
     registry.add(std::move(skitch_key_bind));
+    auto skitch_toggle_bind =
+        action("bind skitchtoggle", "Bind a controller combo or keyboard key to Skitch toggle (press once to latch the grab); 0 clears it", Group::movement, {mask});
+    skitch_toggle_bind.inspect = [](const Model &m) {
+        return State{m.bindings.available, {}, "Controller bindings are unavailable.", {}, false};
+    };
+    skitch_toggle_bind.run = [](const Model &, const Values &args, const Output &out) {
+        const bool saved = set_local_skitch_toggle_combo_binding(static_cast<std::uint32_t>(std::get<std::uint64_t>(args[0])));
+        out(saved ? local_profile_controller_bindings().status : "error: Invalid binding or save failed.");
+    };
+    registry.add(std::move(skitch_toggle_bind));
+    auto skitch_toggle_key_bind = action("bind skitchtogglekey",
+        "Bind the keyboard key for Skitch toggle (press once to latch the grab); 0 disables the keyboard key",
+        Group::movement, {skitch_key_argument});
+    skitch_toggle_key_bind.inspect = [](const Model &m) {
+        return State{m.bindings.available, {}, "Controller bindings are unavailable.", {}, false};
+    };
+    skitch_toggle_key_bind.run = [](const Model &, const Values &args, const Output &out) {
+        const auto key = static_cast<std::uint32_t>(std::get<std::uint64_t>(args[0]));
+        const bool saved = set_local_skitch_toggle_key_binding(key);
+        out(saved ? local_profile_controller_bindings().status : "error: Invalid key or save failed.");
+    };
+    registry.add(std::move(skitch_toggle_key_bind));
 
     // Prototype: spawn a native effect blueprint and keep it on the skater's head.
     // The blueprint must already be loaded (wear a costume that uses it).
@@ -320,7 +354,7 @@ void register_movement_commands(Commands &registry) {
     // Hand props: the game's own gesture props follow a custom animation, so the
     // trigger is what has to be found before anything is written.
     auto prop = action("prop",
-        "Hand props: prop | prop list [name] | prop watch [name] [seconds] | prop trace [seconds] - gesture props and their creation",
+        "Hand props: prop | prop list [name] | prop watch [name] [seconds] | prop clip <name> | prop trace [seconds] - gesture props, creation, and the clip probe",
         Group::movement, {argument("mode", Type::text, true), argument("name", Type::text, true),
                           argument("seconds|side", Type::text, true)});
     prop.execution = Execution::local;
@@ -382,6 +416,12 @@ void register_movement_commands(Commands &registry) {
             out("Hand props: resolving the phone's graph assets by name, then watching where the animation instance "
                 "references them for " + std::to_string(seconds) +
                 "s; idle ~10s, then do the selfie (or hold the menu phone).");
+            return;
+        }
+        if (mode == "clip") {
+            skater::request_prop_clip(name);
+            out("Clip probe: resolving \"" + name + "\", following its +0x28 data and comparing against the rig's "
+                "output pose (see the log). Trigger that gesture first so it is loaded.");
             return;
         }
         if (mode == "poke") {
@@ -569,25 +609,85 @@ void register_movement_commands(Commands &registry) {
     // Native ragdoll drag: the bail motion states (Falling, FollowRagdoll,
     // FollowAnimatedRagdoll) are animation-driven and recompute their position
     // from the context every update, so the render-pose drag could only move
+    // what is drawn. This hooks the three state updates and, while armed,
+    // replaces the motion with the tether follow slot through the engine's own
+    // placement channel -- the core, the render placement and the camera follow.
+    auto dragstate = action("dragstate",
+        "Native ragdoll drag: dragstate on | dragstate off | dragstate status | dragstate probe [seconds]",
+        Group::gameplay, {argument("mode", Type::text, true), argument("seconds", Type::text, true)});
+    dragstate.execution = Execution::local;
+    dragstate.inspect = [](const Model &) {
+        return State{true, {}, {}, dingosdk::player_skitch::drag_state_status(), false};
+    };
+    dragstate.run = [](const Model &, const Values &args, const Output &out) {
+        const auto text = [&](std::size_t index) -> std::string {
+            if (index >= args.size() || !std::holds_alternative<std::string>(args[index])) return {};
+            return lower(std::get<std::string>(args[index]));
+        };
+        const auto mode = text(0);
+        if (mode == "on" || mode == "off") {
+            const bool on = mode == "on";
+            dingosdk::player_skitch::set_drag_state(on);
+            out(on ? "Drag state: armed. Skitch a player, hold the grab, bail: the tether motion now drives the "
+                     "ragdoll through the engine's own placement channel (camera follows)."
+                   : "Drag state: off. Bail motion returns to the native ragdoll states.");
+            return;
+        }
+        if (mode == "probe") {
+            unsigned seconds = 20;
+            try {
+                if (const auto value = text(1); !value.empty()) seconds = static_cast<unsigned>(std::stoul(value));
+            } catch (...) {
+            }
+            dingosdk::player_skitch::drag_state_probe(seconds);
+            out("Drag state: logging the driven position against the goal for " + std::to_string(seconds) + "s.");
+            return;
+        }
+        out(dingosdk::player_skitch::drag_state_status());
+    };
+    registry.add(std::move(dragstate));
+
     // Route B: overwrite the local skater's pose with a baked custom animation.
     auto poseanim = action("poseanim",
-        "Custom animation: poseanim test | record | off | play | save <path> | mask auto|full|legs | trace 0|1 | <file>.rska",
-        Group::movement, {argument("clip", Type::text, true), argument("path", Type::text, true)});
+        "Custom animation: poseanim test | record | off | play | save <path> | mask auto|full|legs | ik <0..1> | "
+        "trace 0|1 | <file>.rska [ik|noik]",
+        Group::movement, {argument("clip", Type::text, true), argument("path", Type::text, true),
+                          argument("flag", Type::text, true)});
     poseanim.execution = Execution::local;
     poseanim.inspect = [](const Model &) {
         return State{true, {}, {},
-                     skater::pose_playback_status() + "  [mask: " + skater::pose_mask_name() + "]", false};
+                     skater::pose_playback_status() + "  [mask: " + skater::pose_mask_name() +
+                         ", ik: " + std::to_string(skater::pose_ik()).substr(0, 4) + "]", false};
     };
     poseanim.run = [](const Model &, const Values &args, const Output &out) {
         if (args.empty()) {
             out(skater::pose_playback_status());
             out("Masking: " + skater::pose_mask_name() + ".");
+            out("Floor correction: " + std::to_string(skater::pose_ik()).substr(0, 4) +
+                " (per clip: poseanim <file> ik opts a clip in; off by default).");
             out(skater::pose_playback_cost());
             out(std::string("Layer trace: ") + (skater::pose_trace() ? "on" : "off") + " (poseanim trace 0|1).");
             return;
         }
         const auto clip = std::get<std::string>(args[0]);
         if (lower(clip) == "off") { skater::request_pose_playback_stop(); out("Stopping custom animation..."); return; }
+        if (lower(clip) == "ik") {
+            // How hard a clip that sinks below the game's planted feet is
+            // lifted back. 0 leaves the clip exactly as authored.
+            const auto mode = args.size() > 1 ? lower(std::get<std::string>(args[1])) : std::string{};
+            char *end = nullptr;
+            const float strength = mode.empty() ? -1.0f : std::strtof(mode.c_str(), &end);
+            if (end == mode.c_str() || strength < 0.0f || strength > 1.0f) {
+                out("usage: poseanim ik <0..1>  (currently " + std::to_string(skater::pose_ik()).substr(0, 4) + ")");
+                return;
+            }
+            skater::set_pose_ik(strength);
+            out(strength > 0.0f
+                    ? "Floor correction: " + std::to_string(strength).substr(0, 4) +
+                          " (the clip's feet and hands are lifted above the game's floor)."
+                    : "Floor correction off: the clip's limbs are written as authored.");
+            return;
+        }
         if (lower(clip) == "trace") {
             const auto mode = args.size() > 1 ? std::get<std::string>(args[1]) : std::string{};
             const bool enabled = mode == "1" || lower(mode) == "on";
@@ -618,8 +718,19 @@ void register_movement_commands(Commands &registry) {
             // the file, which is what a bare name does too.
             if (args.size() > 1) {
                 const auto name = std::get<std::string>(args[1]);
+                // An optional trailing ik/noik opts this clip into floor
+                // correction and is remembered for the next run of the same name.
+                if (args.size() > 2) {
+                    const auto flag = lower(std::get<std::string>(args[2]));
+                    if (flag != "ik" && flag != "noik") {
+                        out("usage: poseanim play <file>.rska [ik|noik]");
+                        return;
+                    }
+                    skater::set_pose_clip_ik(name, flag == "ik");
+                }
                 skater::request_pose_playback(name);
-                out("Playing " + name + "...");
+                out("Playing " + name +
+                    (skater::pose_clip_ik(name) ? " (floor correction on for this clip)..." : "..."));
             } else {
                 skater::request_pose_record_playback();
                 out("Playing the recorded pose...");
@@ -633,8 +744,22 @@ void register_movement_commands(Commands &registry) {
             out(error.empty() ? "Saved: " + path : "error: " + error);
             return;
         }
+        // A bare file name plays it; an optional trailing ik/noik opts this
+        // clip into floor correction -- "poseanim dance ik" plays the clip with
+        // the leg, foot and torso correction on and remembers that for the
+        // next run of the same name. Without the flag a clip is written
+        // exactly as authored.
+        if (args.size() > 1) {
+            const auto flag = lower(std::get<std::string>(args[1]));
+            if (flag != "ik" && flag != "noik") {
+                out("usage: poseanim <file>.rska [ik|noik]");
+                return;
+            }
+            skater::set_pose_clip_ik(clip, flag == "ik");
+        }
         skater::request_pose_playback(clip);
-        out("Starting custom animation " + clip + "...");
+        out("Starting custom animation " + clip +
+            (skater::pose_clip_ik(clip) ? " (floor correction on for this clip)..." : "..."));
     };
     registry.add(std::move(poseanim));
 

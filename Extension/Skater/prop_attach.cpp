@@ -87,6 +87,9 @@ struct State {
     bool assets_pending{};
     std::string assets_extra;
     unsigned assets_seconds{45};
+    // The decisive clip probe: a one-shot synchronous dump, armed by name.
+    bool clip_pending{};
+    std::string clip_name;
     bool poke_pending{};
     bool poke_stop_pending{};
     unsigned poke_seconds{12};
@@ -1203,6 +1206,78 @@ void arm_assets(Ptr base, Ptr client, const std::string &extra, unsigned seconds
 }
 
 // ---------------------------------------------------------------------------
+// The decisive clip probe. A custom animation only gets the game's own IK if it
+// is an *input* the animgraph samples from; if the clip's runtime data is the
+// graph's *output* pose, replacing it buys nothing (the graph already wrote its
+// result, IK and all, into that buffer). This resolves a named gesture clip,
+// follows its +0x28 instance object and that object's internal pointers, and
+// compares every one of them against the rig's output pose buffer
+// (read_native_pose_layout). Read-only: nothing is written, so it cannot take
+// the game down. The log is enough to decide input-vs-output offline.
+//
+//   prop clip c_proto_ofbnb_gesture_wave_loop_lfoot_01
+void clip_data_dump(Ptr base, Ptr client, const std::string &name) {
+    Local local;
+    if (!resolve_local(base, client, local)) {
+        set_status("Clip: the local skater is not ready.");
+        return;
+    }
+    // The rig's output pose: what the renderer reads after the graph and IK.
+    const auto reader = [](Ptr address, void *out, std::size_t size) { return memory::read_bytes(address, out, size); };
+    const auto pose = multiplayer::read_native_pose_layout(reader, base, local.holder, 512);
+    logging::log(logging::Level::info, logging::Channel::skater, "Clip: output pose buffer={:#x} count={}",
+                 pose.buffer, pose.count);
+    // The first three joints, so the transform format (0x30 stride) is visible
+    // beside whatever the clip's own data turns out to be.
+    if (pose.buffer) dump_region(pose.buffer, 3 * 0x30, "output pose");
+
+    bool faulted{};
+    Ptr asset = find_named_asset(base, ("animation/dingo/" + name).c_str(), faulted);
+    if (!asset) asset = find_named_asset(base, name.c_str(), faulted);
+    if (!asset) {
+        set_status("Clip: " + name + " is not loaded (trigger the gesture first, then rerun).");
+        return;
+    }
+    logging::log(logging::Level::info, logging::Channel::skater, "Clip: {} asset={:#x}", name, asset);
+    dump_region(asset, 0x40, name + " asset");
+    std::uint32_t data32{};
+    if (!memory::read_bytes(asset + 0x28, &data32, sizeof(data32)) || !data32) {
+        set_status("Clip: " + name + " has no +0x28 data pointer.");
+        return;
+    }
+    const Ptr data = static_cast<Ptr>(data32) & ~Ptr{7};
+    logging::log(logging::Level::info, logging::Channel::skater,
+                 "Clip: {} +0x28 -> {:#x} {}", name, data,
+                 data == pose.buffer ? "(== OUTPUT POSE: graph output, not an input)"
+                                     : "(distinct from the output pose)");
+    dump_region(data, 0x200, name + " data");
+    // The asset lays pointers out as {ptr32 at an 8-aligned offset, tag 0..2 at
+    // +4}. Follow the same shape inside the data object: any 8-aligned word that
+    // reads as a plausible heap pointer with a small tag beside it. Report which
+    // (if any) land on the output pose buffer -- that is the swap question.
+    unsigned followed{};
+    for (std::size_t off = 0; off + 8 <= 0x200; off += 8) {
+        std::uint32_t word{}, tag{};
+        if (!memory::read_bytes(data + off, &word, 4) || !memory::read_bytes(data + off + 4, &tag, 4)) break;
+        if (!word || word < 0x10000 || tag > 2) continue;
+        const Ptr candidate = static_cast<Ptr>(word);
+        // Readable and not the object itself.
+        std::uint32_t probe{};
+        if (!memory::read_bytes(candidate, &probe, sizeof(probe))) continue;
+        ++followed;
+        const char *verdict = candidate == pose.buffer ? "  <== OUTPUT POSE"
+                              : candidate == asset      ? "  <== the asset itself"
+                                                        : "";
+        logging::log(logging::Level::info, logging::Channel::skater,
+                     "Clip: {} data+{:#x} -> {:#x} (tag {}){}", name, off, candidate, tag, verdict);
+        dump_region(candidate, 0x40, std::format("{} data+{:#x}", name, off));
+    }
+    set_status(std::format("Clip: {} asset={:#x} data={:#x} output={:#x}; {} internal pointer(s) dumped. {}",
+                           name, asset, data, pose.buffer, followed,
+                           data == pose.buffer ? "The data IS the output pose." : "The data is NOT the output pose."));
+}
+
+// ---------------------------------------------------------------------------
 // Ragdoll mode switchboard. The offboard wipeout follows a motion object whose
 // class, state and behaviour are chosen through SkaterCorePhysicsRagdollConfig:
 // the schema gives seventeen asset references at +0x28..+0xa8, of which
@@ -1755,6 +1830,12 @@ void request_prop_assets(std::string extra, unsigned seconds) {
     s.assets_seconds = seconds;
     s.assets_pending = true;
 }
+void request_prop_clip(std::string name) {
+    auto &s = state();
+    std::lock_guard lock(s.mutex);
+    s.clip_name = std::move(name);
+    s.clip_pending = true;
+}
 void request_prop_poke(unsigned seconds) {
     auto &s = state();
     std::lock_guard lock(s.mutex);
@@ -1879,6 +1960,8 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
         bool want_report{}, want_watch{}, want_weight{}, want_pose{}, want_assets{}, want_poke{}, want_poke_stop{};
         bool want_trace{}, want_trace_off{}, want_derive{}, want_hand_attach{}, want_hand_detach{};
         bool want_morph_find{}, want_morph_unclamp{}, want_morph_clamp{};
+        bool want_clip{};
+        std::string clip_name;
         bool want_ragdoll_config{}, want_ragdoll_bools{}, want_ragdoll_watch{}, want_ragdoll_set{},
             want_ragdoll_stop{}, want_ragdoll_refs{}, want_ragdoll_data{};
         unsigned ragdoll_watch_seconds{30};
@@ -1905,6 +1988,8 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
             want_weight = s.weight_pending;
             want_pose = s.pose_pending;
             want_assets = s.assets_pending;
+            want_clip = s.clip_pending;
+            clip_name = s.clip_name;
             want_poke = s.poke_pending;
             want_poke_stop = s.poke_stop_pending;
             want_trace = s.trace_pending;
@@ -1941,6 +2026,7 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
             hand_left = s.hand_left;
             morph_max = s.morph_unclamp_max;
             s.report_pending = s.watch_pending = s.weight_pending = s.pose_pending = s.assets_pending = false;
+            s.clip_pending = false;
             s.poke_pending = s.poke_stop_pending = false;
             s.trace_pending = s.trace_off_pending = s.derive_pending = false;
             s.hand_attach_pending = s.hand_detach_pending = false;
@@ -2029,6 +2115,7 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
             }
             if (GetTickCount64() >= s.ragdoll_until) ragdoll_stop(true);
         }
+        if (want_clip) clip_data_dump(base, client, clip_name);
         if (want_report) report(base, filter);
         if (want_assets) arm_assets(base, client, assets_extra, assets_seconds);
         else if (want_pose) arm_pose(base, client, pose_seconds);

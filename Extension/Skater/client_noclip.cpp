@@ -11,6 +11,7 @@
 #include "Engine/Game/Build/20260929/skater_entities.h"
 #include "free_flight.h"
 #include "Skitch/player_skitch.h"
+#include "Skitch/drag_state.h"
 #include <cmath>
 
 namespace dingosdk::client_source::detail {
@@ -427,6 +428,11 @@ void noclip_physics_update(std::uintptr_t core) {
     noclip_apply_velocity(core);
     trainer_apply_jump_scale(core);
     trainer_push_speed(core);
+    // The ragdoll drag uses the same lever as the jump scaling: the native
+    // velocity has just been computed and the state's position integration
+    // follows, so replacing the velocity here carries the bail through the
+    // engine's own placement publish.
+    player_skitch::drag_state_apply(core);
 }
 bool noclip_motion_target(std::uintptr_t rig, std::uintptr_t context,
     const std::array<float,16>* supplied, std::array<float,16>& target) noexcept {
@@ -511,8 +517,10 @@ void noclip_skater_motion(std::uintptr_t rig, std::uintptr_t context,
     const auto original = source_state().motion_original.load(std::memory_order_acquire);
     alignas(16) std::array<float,16> target{};
     const auto* motion = supplied;
-    // The debug flight owns the target while it is active.
+    // The debug flight owns the target while it is active; otherwise the
+    // skitch drag drives the same channel toward the tether follow slot.
     if (noclip_motion_target(rig, context, supplied, target)) motion = &target;
+    else if (player_skitch::drag_state_motion(rig, context, supplied, target)) motion = &target;
     if (original) original(rig, context, motion, flags);
     if (source_state().offboard_boost_core.load(std::memory_order_acquire)) {
         std::uintptr_t core{};

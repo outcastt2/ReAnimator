@@ -70,10 +70,20 @@ void ui_page(SkateMenu& menu, const Model& model, const CallbacksV3& callbacks) 
 void binds_page(SkateMenu& menu, const Model& model, const CallbacksV3& callbacks) {
     begin_card(menu, "controller-binds", "ACTION BINDS");
     const bool available = model.bindings.available && callbacks.queue_console_command;
+    // The Skitch controller row comes after the action_binds rows; the save
+    // chain maps each row id to the "bind <name>" command it queues.
+    const int skitch_action = 10 + static_cast<int>(action_binds.size());
+    const int skitch_toggle_action = skitch_action + 1;
     const auto save = [&](int action, std::uint32_t combo) {
         std::array<char, 512> result{};
         const auto command = std::string("bind ") +
-            (action >= 10 ? std::string(action_binds[static_cast<std::size_t>(action - 10)].name) + " " : action == 1 ? "freecamcontroller " : action == 2 ? "freecam " : action == 3 ? "noclip " : action == 4 ? "forwardvelocity " : action == 5 ? "upvelocity " : action == 6 ? "tptofreecam " : action == 8 ? "voteyes " : action == 9 ? "voteno " : "offboardupvelocity ") + std::to_string(combo);
+            (action >= 10 && action < 10 + static_cast<int>(action_binds.size()) ?
+                std::string(action_binds[static_cast<std::size_t>(action - 10)].name) + " " :
+                action == 1 ? "freecamcontroller " : action == 2 ? "freecam " : action == 3 ? "noclip " :
+                action == 4 ? "forwardvelocity " : action == 5 ? "upvelocity " : action == 6 ? "tptofreecam " :
+                action == 8 ? "voteyes " : action == 9 ? "voteno " :
+                action == skitch_action ? "skitch " : action == skitch_toggle_action ? "skitchtoggle " : "offboardupvelocity ") +
+            std::to_string(combo);
         const bool queued = callbacks.queue_console_command(callbacks.user, command.c_str(), result.data(), result.size());
         result.back() = '\0';
         feedback(menu, result[0] ? result.data() : queued ? "Saving binding..." : "Could not queue binding.");
@@ -132,11 +142,13 @@ void binds_page(SkateMenu& menu, const Model& model, const CallbacksV3& callback
         row(9, "Vote no", model.bindings.vote_no_combo);
         for (std::size_t i = 0; i < action_binds.size(); ++i)
             row(10 + static_cast<int>(i), action_binds[i].label.data(), model.bindings.action_combos[i]);
+        row(skitch_action, "Skitch", model.bindings.skitch_combo);
+        row(skitch_toggle_action, "Skitch toggle", model.bindings.skitch_toggle_combo);
         ImGui::EndTable();
     }
-    // The keyboard Skitch key sits immediately below the controller boost
-    // bindings. LB+RB remains as a controller alternative; this changes only
-    // the keyboard key (default V).
+    // The Skitch key sits immediately below the action binds (its own
+    // binding is the Skitch row above). Either input works; this field
+    // changes only the dedicated keyboard key (default V).
     field(menu, "Skitch keyboard key");
     const auto skitch_key_label = menu.recording_skitch_key ? std::string("Press a key...") :
         model.bindings.skitch_key ? dingosdk::launcher::key_name(model.bindings.skitch_key) : std::string("Not bound");
@@ -182,13 +194,60 @@ void binds_page(SkateMenu& menu, const Model& model, const CallbacksV3& callback
             if (ImGui::SmallButton("Cancel key binding")) menu.recording_skitch_key = false;
         }
     }
+    // The Skitch toggle key: the same capture as the Skitch key above, for
+    // the bind that latches the grab with one press and releases it with the
+    // next. Unbound by default; either input may be given one or both.
+    field(menu, "Skitch toggle keyboard key");
+    const auto skitch_toggle_key_label = menu.recording_skitch_toggle_key ? std::string("Press a key...") :
+        model.bindings.skitch_toggle_key ? dingosdk::launcher::key_name(model.bindings.skitch_toggle_key) : std::string("Not bound");
+    if (ImGui::Button((skitch_toggle_key_label + "###skitch-toggle-key").c_str(), ImVec2(
+            ImGui::GetContentRegionAvail().x - clear_width - ImGui::GetStyle().ItemSpacing.x, 0))) {
+        menu.recording_skitch_toggle_key = true;
+        menu.recording_bind = 0;
+        menu.skitch_toggle_key_capture_until = ImGui::GetTime() + 30;
+        menu.feedback.clear();
+        dingosdk::overlay::detail::OverlayInputAccess access;
+        for (int key = 0; key < 256; ++key)
+            menu.skitch_toggle_keys_down[key] = (GetAsyncKeyState(key) & 0x8000) != 0;
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!model.bindings.available || menu.recording_skitch_toggle_key || model.bindings.skitch_toggle_key == 0);
+    if (ImGui::Button("Clear##skitch-toggle-key", ImVec2(-1, 0)))
+        send_console(menu, callbacks, "bind skitchtogglekey 0");
+    ImGui::EndDisabled();
+    if (menu.recording_skitch_toggle_key) {
+        dingosdk::overlay::detail::OverlayInputAccess access;
+        if (!available || ImGui::GetTime() >= menu.skitch_toggle_key_capture_until) {
+            menu.recording_skitch_toggle_key = false;
+            feedback(menu, "Key capture cancelled. The current binding is unchanged.");
+        } else if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
+            menu.recording_skitch_toggle_key = false;
+        } else {
+            for (int key = 1; key < 256; ++key) {
+                const bool down = (GetAsyncKeyState(key) & 0x8000) != 0;
+                const bool pressed = down && !menu.skitch_toggle_keys_down[key];
+                menu.skitch_toggle_keys_down[key] = down;
+                if (!pressed || key == VK_LBUTTON || key == VK_RBUTTON || key == VK_MBUTTON ||
+                    key == VK_SHIFT || key == VK_CONTROL || key == VK_MENU ||
+                    key == VK_LSHIFT || key == VK_RSHIFT || key == VK_LCONTROL || key == VK_RCONTROL ||
+                    key == VK_LMENU || key == VK_RMENU) continue;
+                menu.recording_skitch_toggle_key = false;
+                send_console(menu, callbacks, "bind skitchtogglekey " + std::to_string(key));
+                break;
+            }
+        }
+        if (menu.recording_skitch_toggle_key) {
+            note("Press a keyboard key to bind Skitch toggle. Escape cancels; mouse buttons and modifiers are ignored.");
+            if (ImGui::SmallButton("Cancel toggle key binding")) menu.recording_skitch_toggle_key = false;
+        }
+    }
     ImGui::EndDisabled();
     if (menu.recording_bind) {
         warn(!menu.bind_capture.ready ? "Release controller buttons and keyboard keys first." :
              "Hold up to five keys together, then release them. A-Z, 0-9, Space, F1-F12, Ctrl, Shift and Alt work; controller combos work too.");
     } else {
         note(("Record a key, keyboard chord or controller combo, such as Ctrl + F5 or " + controller_combo_label(0x300, controller.style) +
-              ". Freecam, Freecam Controller, and Noclip toggle; boosts add velocity once per press. Off-board Up Boost also works while falling or gliding; release and press again to repeat. On-board and off-board boosts can share a combo. Give toggles different combos.").c_str());
+              ". Freecam, Freecam Controller, and Noclip toggle; boosts add velocity once per press. Off-board Up Boost also works while falling or gliding; release and press again to repeat. On-board and off-board boosts can share a combo. Skitch is held while towing; Skitch toggle latches that grab with one press and releases it with the next (it drops itself if the grab ends). Give every action a different combo.").c_str());
         note("Saved to your profile.");
         if (!model.bindings.status.empty()) note(model.bindings.status.c_str());
         if (!model.bindings.available) warn("Waiting for the local profile.");

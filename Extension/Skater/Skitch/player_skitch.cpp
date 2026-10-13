@@ -1,4 +1,5 @@
 #include "player_skitch.h"
+#include "drag_state.h"
 #include "../client_source_spawn_internal.h"
 #include "../no_bail.h"
 #include "Extension/Multiplayer/Remote/native_pose_layout.h"
@@ -10,8 +11,14 @@
 #include "Extension/Multiplayer/Hud/game_ui_state.h"
 #include "Engine/Core/Log/logging.h"
 #include <atomic>
+#include "Extension/Profile/local_profile_runtime.h"
 
-extern "C" void DingoSDKOverlayReadSkitchInput(bool*, bool*, float*);
+extern "C" void DingoSDKOverlayReadSkitchInput(bool*, bool*, float*, bool*);
+// Overlay gate bits for the skitch input (window, stop, failed, interactive
+// menu, foreground), so a press that reads nothing can still say why.
+extern "C" unsigned DingoSDKOverlaySkitchInputFlags();
+// Last input observation: bit0 pad connected, bit1 bound combo held.
+extern "C" unsigned DingoSDKOverlaySkitchComboState();
 namespace dingosdk::player_skitch {
 using namespace client_source::detail;
 namespace {
@@ -40,7 +47,17 @@ struct State {
     std::uintptr_t owner{};
     std::uint64_t next_report{};
     bool ragdoll_active{};
-    std::string detail = "Hold V or LB+RB near a player";
+    std::string detail = "Hold V or R1 near a player";
+    // Press diagnostics: one line per input-state change while a key is down,
+    // one per attempt reason, and press_serial (a rising edge of the physical
+    // input) so the session can print its candidate funnel once per press.
+    std::string last_attempt;
+    std::uint32_t press_pack{}, bound_key{~0u}, bound_combo{~0u};
+    bool press_edge_last{};
+    // Skitch toggle: the bind's last observed state, and whether the grab is
+    // latched by it (the latch stands in for holding the bind down).
+    bool toggle_prev{}, toggle_latched{};
+    std::atomic<std::uint64_t> press_serial{};
 };
 State& state() { static State s; return s; }
 bool write_rotation(std::uintptr_t at, const std::array<float,4>& q) noexcept {
@@ -184,6 +201,7 @@ void probe_tick(std::uintptr_t core, bool wipeout) {
 }
 bool enabled() noexcept { return state().on.load(); }
 void set_enabled(bool on) noexcept { state().on.store(on); if(!on) suspend(); }
+std::uint64_t press_serial() noexcept { return state().press_serial.load(std::memory_order_relaxed); }
 std::string status() { auto& s=state(); std::lock_guard lock(s.mutex); return s.detail+
     "; steering="+std::to_string(s.steering)+"; physics steps="+std::to_string(s.physics_steps.load())+"; turn steps="+std::to_string(s.turn_steps.load())+
     "; hand updates="+std::to_string(s.hand_updates.load())+"/"+std::to_string(s.hand_attempts.load())+
@@ -211,11 +229,56 @@ std::optional<Request> request() noexcept {
 void tick(std::uintptr_t base,std::uintptr_t client,const multiplayer::NativeFrame& local,
     skateskitch::WorldKey world,std::uint64_t local_id,std::uint64_t now,
     std::span<const skateskitch::TowCandidate> candidates) {
-    bool active=false, held=false; float steering=0; DingoSDKOverlayReadSkitchInput(&active,&held,&steering);
-    active = active && !multiplayer::sample_game_ui_state(base).in_menu;
+    bool active=false, held=false, toggle_down=false; float steering=0;
+    DingoSDKOverlayReadSkitchInput(&active,&held,&steering,&toggle_down);
+    const bool input_active=active;
+    const bool in_menu=multiplayer::sample_game_ui_state(base).in_menu;
+    active = active && !in_menu;
     auto& native=source_state();
     auto& s=state();
     std::lock_guard lock(s.mutex);
+    // Skitch toggle: one press of its (optional) bind latches the grab as if
+    // the hold bind were held down, the next press releases it. The latch
+    // drops itself the moment the tow lets go for a rearm reason (checked
+    // below), so a latched grab is never silently dead.
+    const bool toggle_edge=toggle_down&&!s.toggle_prev;
+    s.toggle_prev=toggle_down;
+    if(toggle_edge) {
+        s.toggle_latched=!s.toggle_latched;
+        logging::log(logging::Level::info,logging::Channel::runtime,
+            "Player skitch toggle: {}", s.toggle_latched ? "latched" : "released");
+    }
+    bool grab=held||s.toggle_latched;
+    // Input diagnostics: the bound key and controller combo are logged when
+    // they change, every press edge bumps press_serial (the session prints
+    // its candidate funnel once per press), and every input-state change
+    // while the input is down gets a line, so a press that does nothing
+    // still explains itself in the log.
+    const auto bound_key=local_profile_skitch_key_binding();
+    const auto bound_combo=local_profile_skitch_combo_binding();
+    const bool key_down=bound_key && (GetAsyncKeyState(static_cast<int>(bound_key))&0x8000)!=0;
+    const bool press_edge=key_down||held||toggle_edge;
+    if(press_edge && !s.press_edge_last) s.press_serial.fetch_add(1,std::memory_order_relaxed);
+    s.press_edge_last=press_edge;
+    if(bound_key!=s.bound_key || bound_combo!=s.bound_combo) {
+        s.bound_key=bound_key; s.bound_combo=bound_combo;
+        logging::log(logging::Level::info,logging::Channel::runtime,
+            "Player skitch input: keyboard key={} ('{}') controller_combo=0x{:x} enabled={} overlay_active={}",
+            bound_key, bound_key>=32&&bound_key<127?static_cast<char>(bound_key):'?',
+            bound_combo, s.on.load(), input_active);
+    }
+    const unsigned overlay_flags=DingoSDKOverlaySkitchInputFlags();
+    const unsigned pad_combo=DingoSDKOverlaySkitchComboState();
+    const std::uint32_t press_pack=(key_down?1u:0u)|(held?2u:0u)|(input_active?4u:0u)|(in_menu?8u:0u)|
+        ((overlay_flags&0xffu)<<4)|((pad_combo&3u)<<12);
+    if(press_edge) {
+        if(press_pack!=s.press_pack) {
+            s.press_pack=press_pack;
+            logging::log(logging::Level::info,logging::Channel::runtime,
+                "Player skitch press: down={} held={} pad={} combo_held={} active={} in_menu={} overlay=0x{:02x} [bit0 window, bit1 stop, bit2 failed, bit3 interactive, bit4 foreground]",
+                key_down, held, (pad_combo&1u)!=0, (pad_combo&2u)!=0, input_active, in_menu, overlay_flags);
+        }
+    } else s.press_pack=0;
     if(s.pending && GetTickCount64()>=s.pending->expires) s.tow.release("Input expired; release grab to rearm");
     if(s.owner && s.owner!=local.entity) s.tow.release("Local skater replaced; release grab to rearm");
     s.owner=local.entity;
@@ -225,18 +288,33 @@ void tick(std::uintptr_t base,std::uintptr_t client,const multiplayer::NativeFra
         logging::log(logging::Level::warning,logging::Channel::runtime,"Player skitch guard: {}",s.failure_reason.load());
     }
     if(!s.on.load() || !local.ready || !native.initialized.load() || !native.velocity_guard_active.load()) {
-        s.tow.release("Skitch unavailable; release grab to rearm"); s.detail=std::string(s.tow.status()); return;
+        s.tow.release("Skitch unavailable; release grab to rearm"); s.detail=std::string(s.tow.status());
+        if(grab && s.last_attempt!=s.detail) {
+            s.last_attempt=s.detail;
+            logging::log(logging::Level::info,logging::Channel::runtime,
+                "Player skitch attempt: {} [guard: enabled={} ready={} initialized={} velocity_guard={}]",
+                s.detail, s.on.load(), local.ready, native.initialized.load(), native.velocity_guard_active.load());
+        } else if(!grab) s.last_attempt.clear();
+        return;
+    }
+    // A latched grab drops itself the moment the tow re-arms (the guards
+    // above released it): the status says why, and a fresh press starts over.
+    if(s.toggle_latched && s.tow.needs_release()) {
+        s.toggle_latched=false; grab=held;
+        logging::log(logging::Level::info,logging::Channel::runtime,
+            "Player skitch toggle: unlatched ({})", s.tow.status());
     }
     // Idle ticks must not pay for the physics layout: debug_noclip_bodies is
     // ~100 native reads, and the grab, the drag and the probe are the only
     // things that need it. With no press, no grip and no probe, the tick costs
     // one input read.
-    if(!held && !s.tow.attached() && !s.ragdoll_active &&
+    if(!grab && !s.tow.attached() && !s.ragdoll_active &&
         !probe().pending.load(std::memory_order_relaxed) && !probe().active.load(std::memory_order_relaxed)) {
         // Record the release: the press edge must survive skipped ticks, or a
         // later press would never read as an edge and nothing would acquire.
         s.tow.observe(false);
         s.detail=std::string(s.tow.status());
+        s.last_attempt.clear();
         return;
     }
     if(native.busy.test_and_set(std::memory_order_acquire)) return;
@@ -251,9 +329,9 @@ void tick(std::uintptr_t base,std::uintptr_t client,const multiplayer::NativeFra
         // The selector's own state is the reliable ragdoll signal (300 is a
         // ground wipeout); the request bits cover the step before it switches.
         const bool wipeout=dingosdk::observed_physics_state()==addr::no_bail::wipeout_physics_state;
+        const auto entity7e0=reader.value<std::uint8_t>(local.entity,0x7e0);
         const bool playable=active && !bodies.offboard && !bailing && !native.trial.debug.noclip &&
-            !native.trial.debug.park_editor && !native.trial.debug.camera_owned &&
-            reader.value<std::uint8_t>(local.entity,0x7e0)==0;
+            !native.trial.debug.park_editor && !native.trial.debug.camera_owned && entity7e0==0;
         // Ragdoll: a grip is kept through a bail, and a floored skater can also
         // reach for a nearby player and grab.
         const bool ragdoll=active && (wipeout||bailing);
@@ -262,8 +340,34 @@ void tick(std::uintptr_t base,std::uintptr_t client,const multiplayer::NativeFra
             probe_tick(bodies.core,wipeout||bailing);
         const bool was_attached=s.tow.attached();
         s.steering=steering;
-        const auto plan=s.tow.update(world,local_id,now,bodies.root,playable,ragdoll,held,candidates,steering,was_attached && s.hand_side.load()==1);
+        const auto plan=s.tow.update(world,local_id,now,bodies.root,playable,ragdoll,grab,candidates,steering,was_attached && s.hand_side.load()==1);
         s.detail=std::string(s.tow.status());
+        // A latched grab drops itself the moment the tow lets go mid-attach
+        // (target teleported, world changed, separation exceeded): the status
+        // says why, and a fresh press of the toggle bind starts over.
+        if(s.toggle_latched && s.tow.needs_release()) {
+            s.toggle_latched=false; grab=held;
+            logging::log(logging::Level::info,logging::Channel::runtime,
+                "Player skitch toggle: unlatched ({})", s.detail);
+        }
+        // One line per press reason change: with the key still down the reason
+        // is readable here; observe(false) rewrites it the moment the key is
+        // released, so a log line is the only way to keep it.
+        if(grab && s.last_attempt!=s.detail) {
+            s.last_attempt=s.detail;
+            logging::log(logging::Level::info,logging::Channel::runtime,
+                "Player skitch attempt: {} [active={} in_menu={} offboard={} bailing={} noclip={} park_editor={} camera={} entity7e0={} playable={} session={} local_id={} cands={} latched={}]",
+                s.detail, active, in_menu, bodies.offboard, bailing, native.trial.debug.noclip,
+                native.trial.debug.park_editor, native.trial.debug.camera_owned, entity7e0,
+                playable, world.session!=0, local_id!=0, candidates.size(), s.toggle_latched);
+            if(s.tow.no_candidate()) {
+                const auto& d=s.tow.diag();
+                logging::log(logging::Level::info,logging::Channel::runtime,
+                    "Player skitch candidates: offered={} fresh_250ms={} future_clock={} world={} identity={} hip={} yaw={} nearest={:.2f} m age={}..{} ms",
+                    d.n, d.fresh, d.future, d.world, d.identity, d.hip, d.yaw, d.nearest,
+                    d.age_min_us/1000, d.age_max_us/1000);
+            }
+        } else if(!grab) s.last_attempt.clear();
         s.grip_active.store(plan.has_value());
         // A keyframed FBPhysics capsule is the actual, invisible contact pusher.
         // Put it behind the bailed skater and sweep it toward the tether slot;
@@ -279,7 +383,9 @@ void tick(std::uintptr_t base,std::uintptr_t client,const multiplayer::NativeFra
         }
         const bool player_collision=multiplayer::local_allows_player_collision(base,local.entity);
         const bool pusher_active=plan && plan->ragdoll && player_collision;
-        if(plan && plan->ragdoll && !player_collision) {
+        if(plan && plan->ragdoll && drag_state_probing())
+            multiplayer::probe_local_ragdoll_handles(base,local.entity);
+        if(plan && plan->ragdoll && !player_collision && drag_state_probing()) {
             static std::atomic<std::uint64_t> last_collision_warning{};
             const auto warning_now=GetTickCount64();
             auto previous=last_collision_warning.load(std::memory_order_relaxed);
@@ -289,7 +395,15 @@ void tick(std::uintptr_t base,std::uintptr_t client,const multiplayer::NativeFra
         }
         multiplayer::update_skitch_collision_pusher(base,bodies.context,pusher_root,
             plan && plan->ragdoll ? plan->root_goal : pusher_root,pusher_active,
-            s.hand_side.load(std::memory_order_relaxed),false,now);
+            s.hand_side.load(std::memory_order_relaxed),drag_state_probing(),now);
+        // The native drag state owns the bail motion when armed: publish the
+        // tether follow slot for the engine's own placement channel and let the
+        // lease lapse on release, so the native motion resumes without a snap.
+        if(plan && plan->ragdoll && drag_state_armed())
+            drag_state_goal(plan->root_goal[0],plan->root_goal[1],plan->root_goal[2],
+                plan->target_velocity[0],plan->target_velocity[1],plan->target_velocity[2]);
+        else
+            drag_state_release();
         const bool dragging=plan && plan->ragdoll;
         if(dragging!=s.ragdoll_active) {
             s.ragdoll_active=dragging;
@@ -310,6 +424,11 @@ void tick(std::uintptr_t base,std::uintptr_t client,const multiplayer::NativeFra
         }
     } catch(...) {
         s.tow.release("Local skater changed; release grab to rearm"); s.detail=std::string(s.tow.status());
+        if(held && s.last_attempt!=s.detail) {
+            s.last_attempt=s.detail;
+            logging::log(logging::Level::info,logging::Channel::runtime,
+                "Player skitch attempt: {} (exception while reading the local skater)", s.detail);
+        }
     }
 }
 // Whole-body drag placement. The wipeout solver recomputes the ragdoll from
@@ -363,8 +482,18 @@ void drag_placement(std::uintptr_t base, std::uintptr_t component, bool active,
         entity[1]+(target[1]-entity[1])*blend,
         entity[2]+(target[2]-entity[2])*blend};
     (void)write_position(entity_position,entity_eased);
+    if(active && drag_state_probing()) {
+        static std::atomic<std::uint64_t> last{};
+        auto previous=last.load(std::memory_order_relaxed);
+        if(now_ms-previous>=500 && last.compare_exchange_strong(previous,now_ms))
+            logging::log(logging::Level::info,logging::Channel::runtime,
+                "Skitch drag: entity ({:.1f},{:.1f},{:.1f}) -> ({:.1f},{:.1f},{:.1f}) goal ({:.1f},{:.1f},{:.1f})",
+                entity[0],entity[1],entity[2],entity_eased[0],entity_eased[1],entity_eased[2],
+                target[0],target[1],target[2]);
+    }
 }
 void animation_evaluated(std::uintptr_t component) noexcept {
+    drag_state_animation_probe();
     const auto r=request(); if(!r || r->component!=component) return;
     state().hand_attempts.fetch_add(1);
     try {
