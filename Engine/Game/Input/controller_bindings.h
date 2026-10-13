@@ -111,7 +111,6 @@ struct ControllerBindingsModel {
     std::uint32_t noclip_combo{};
     std::uint32_t forward_velocity_combo{};
     std::uint32_t up_velocity_combo{};
-    std::uint32_t skitch_key{'V'}; // virtual-key code; zero disables keyboard Skitch
     std::uint32_t offboard_up_velocity_combo{};
     std::uint32_t vote_yes_combo{}, vote_no_combo{}; // answering a dedicated server's vote
     std::array<std::uint32_t, action_binds.size()> action_combos{}; // by action_binds
