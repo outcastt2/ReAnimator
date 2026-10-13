@@ -40,7 +40,12 @@ function(dingosdk_configure_target target)
         target_compile_definitions(${target} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
     endif()
     if(MSVC)
-        target_compile_options(${target} PRIVATE /W4 /WX /MP4 /permissive- /EHsc)
+        target_compile_options(${target} PRIVATE /W4 /WX /permissive- /EHsc)
+        # Ninja already schedules source files concurrently. /MP conflicts with
+        # its /showIncludes dependency capture.
+        if(NOT CMAKE_GENERATOR MATCHES "Ninja")
+            target_compile_options(${target} PRIVATE /MP4)
+        endif()
     else()
         target_compile_options(${target} PRIVATE -Wall -Wextra -Wno-missing-field-initializers -Wno-unused-function -Wno-array-bounds)
     endif()

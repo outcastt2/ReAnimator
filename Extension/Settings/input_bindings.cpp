@@ -138,4 +138,49 @@ std::uint32_t skitch_key_binding(const Snapshot& s) {
     return static_cast<std::uint32_t>(key);
 }
 
+std::uint32_t skitch_combo_binding(const Snapshot& s) {
+    // R1 until a profile says otherwise; an explicit 0 clears the binding.
+    const auto bindings = s.settings.find("bindings");
+    if (bindings == s.settings.end()) return default_skitch_combo;
+    require(bindings->is_object(), "Bindings must be an object");
+    const auto value = bindings->find("skitch_combo");
+    if (value == bindings->end()) return default_skitch_combo;
+    require(value->is_number_unsigned() || (value->is_number_integer() && value->get<std::int64_t>() >= 0),
+        "Skitch binding must be a nonnegative integer");
+    const auto mask = value->get<std::uint64_t>();
+    require(mask <= UINT32_MAX && valid_action_binding(static_cast<std::uint32_t>(mask)),
+        "Unsupported controller or keyboard key in Skitch binding");
+    return static_cast<std::uint32_t>(mask);
+}
+
+std::uint32_t skitch_toggle_key_binding(const Snapshot& s) {
+    // Unbound until a profile says otherwise: the toggle is opt-in beside
+    // the hold bind, not a replacement for it.
+    const auto bindings = s.settings.find("bindings");
+    if (bindings == s.settings.end()) return 0;
+    require(bindings->is_object(), "Bindings must be an object");
+    const auto value = bindings->find("skitch_toggle_key");
+    if (value == bindings->end()) return 0;
+    require(value->is_number_unsigned() || (value->is_number_integer() && value->get<std::int64_t>() >= 0),
+        "Skitch toggle key must be a nonnegative virtual-key code");
+    const auto key = value->get<std::uint64_t>();
+    require(key <= 255, "Unsupported Skitch toggle virtual-key code");
+    return static_cast<std::uint32_t>(key);
+}
+
+std::uint32_t skitch_toggle_combo_binding(const Snapshot& s) {
+    // Unbound until a profile says otherwise (see skitch_toggle_key_binding).
+    const auto bindings = s.settings.find("bindings");
+    if (bindings == s.settings.end()) return 0;
+    require(bindings->is_object(), "Bindings must be an object");
+    const auto value = bindings->find("skitch_toggle_combo");
+    if (value == bindings->end()) return 0;
+    require(value->is_number_unsigned() || (value->is_number_integer() && value->get<std::int64_t>() >= 0),
+        "Skitch toggle binding must be a nonnegative integer");
+    const auto mask = value->get<std::uint64_t>();
+    require(mask <= UINT32_MAX && valid_action_binding(static_cast<std::uint32_t>(mask)),
+        "Unsupported controller or keyboard key in Skitch toggle binding");
+    return static_cast<std::uint32_t>(mask);
+}
+
 }

@@ -58,10 +58,10 @@ std::optional<std::array<Frame,12>> frames(std::span<const Joint> pose,bool left
 }
 void TowController::observe(bool held) noexcept {
     previous_held_=held;
-    if(!held) { attached_=false; needs_release_=false; status_="Released; normal skating"; }
+    if(!held) { attached_=false; needs_release_=false; no_candidate_=false; status_="Released; normal skating"; }
 }
 void TowController::release(std::string_view reason) noexcept {
-    attached_=false; needs_release_=true; velocity_={}; status_=reason;
+    attached_=false; needs_release_=true; no_candidate_=false; velocity_={}; status_=reason;
 }
 std::optional<TowPlan> TowController::update(WorldKey world,std::uint64_t local_id,std::uint64_t now,
     Vec3 root,bool playable,bool ragdoll,bool held,std::span<const TowCandidate> candidates,float steering,bool left_hand) {
@@ -92,12 +92,34 @@ std::optional<TowPlan> TowController::update(WorldKey world,std::uint64_t local_
         }
     } else {
         if(!pressed || needs_release_) return {};
+        // Why the press sees what it sees: one count per eligibility predicate
+        // across every offered candidate, read back by the log line a failed
+        // press prints (player_skitch).
+        diag_=TowDiag{};
+        diag_.n=static_cast<std::uint32_t>(candidates.size());
+        diag_.age_min_us=~std::uint64_t{};
+        for(const auto& c:candidates) {
+            if(c.sample.received_us>now) ++diag_.future;
+            else {
+                const auto age=now-c.sample.received_us;
+                if(age<=250000) ++diag_.fresh;
+                if(age<diag_.age_min_us) diag_.age_min_us=age;
+                if(age>diag_.age_max_us) diag_.age_max_us=age;
+            }
+            if(c.sample.world==world) ++diag_.world;
+            if(c.sample.player.epoch && c.sample.player.generation) ++diag_.identity;
+            if(valid(c.sample.hip.position)) ++diag_.hip;
+            if(yaw(c.heading).has_value()) ++diag_.yaw;
+            const float d=length(sub(c.sample.hip.position,root));
+            if(diag_.nearest<0.f || d<diag_.nearest) diag_.nearest=d;
+        }
+        if(diag_.age_min_us==~std::uint64_t{}) diag_.age_min_us=0;
         float best=2.6f;
         for(const auto& c:candidates) if(eligible(c)) {
             const float d=length(sub(c.sample.hip.position,root));
             if(d<best) { best=d; target=&c; }
         }
-        if(!target) { release("No player within 2.6 m; release grab and try again"); return {}; }
+        if(!target) { release("No player within 2.6 m; release grab and try again"); no_candidate_=true; return {}; }
         attached_=true; world_=world; target_=target->sample.player;
         // A consistent rear-left follow slot avoids riding directly into the
         // leader, including grabs acquired from the side or while overlapping.

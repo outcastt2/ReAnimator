@@ -76,16 +76,6 @@ void Store::seed_object_inventory(const std::vector<std::string>& keys) {
 }
 void Store::reconcile_inventory(const std::vector<std::string>& cosmetics, const std::vector<std::string>& objects) {
     std::lock_guard lock(mutex_);
-    // An enabled unlock option means every installed item is meant to stay owned, so the
-    // reserved items behind Skate Pass, influence, events and neighbourhood ranks are left
-    // alone instead of being forced back to unowned on every catalog refresh.
-    const auto granted = [&](std::string_view option) {
-        const auto found = value_.bool_options.find(option);
-        return found != value_.bool_options.end() && found->second;
-    };
-    const bool cosmetics_granted = granted(unlock_cosmetics_option);
-    const bool objects_granted = granted(unlock_objects_option);
-    if (cosmetics_granted && objects_granted) return;
     // Revoke every listed key, unconditionally: the catalog only lists classes
     // the unlock policy does not cover, so an item granted by an earlier build
     // cannot stay owned after the policy changes.
@@ -99,12 +89,12 @@ void Store::reconcile_inventory(const std::vector<std::string>& cosmetics, const
     Update update(*this);
     bool changed{};
     for (const auto& key : cosmetics)
-        if (!cosmetics_granted && owned(cosmetic_inventory, key)) {
+        if (owned(cosmetic_inventory, key)) {
             update.json(value_.customization, {"inventory", key}) = false;
             changed = true;
         }
     for (const auto& key : objects)
-        if (!objects_granted && owned(object_inventory, key)) {
+        if (owned(object_inventory, key)) {
             update.json(value_.extensions, {"object_dropper", "inventory", key}) = false;
             changed = true;
         }
@@ -286,6 +276,42 @@ void Store::save_skitch_key_binding(std::uint32_t key) {
     std::lock_guard lock(mutex_);
     Update update(*this);
     update.json(value_.settings, {"bindings", "skitch_key"}) = key;
+    update.commit();
+}
+
+std::uint32_t Store::skitch_combo_binding() const {
+    std::lock_guard lock(mutex_);
+    return profile::skitch_combo_binding(value_);
+}
+void Store::save_skitch_combo_binding(std::uint32_t combo) {
+    require(valid_action_binding(combo), "Unsupported controller combo or keyboard key");
+    std::lock_guard lock(mutex_);
+    Update update(*this);
+    update.json(value_.settings, {"bindings", "skitch_combo"}) = combo;
+    update.commit();
+}
+
+std::uint32_t Store::skitch_toggle_key_binding() const {
+    std::lock_guard lock(mutex_);
+    return profile::skitch_toggle_key_binding(value_);
+}
+void Store::save_skitch_toggle_key_binding(std::uint32_t key) {
+    require(key <= 255, "Unsupported Skitch toggle virtual-key code");
+    std::lock_guard lock(mutex_);
+    Update update(*this);
+    update.json(value_.settings, {"bindings", "skitch_toggle_key"}) = key;
+    update.commit();
+}
+
+std::uint32_t Store::skitch_toggle_combo_binding() const {
+    std::lock_guard lock(mutex_);
+    return profile::skitch_toggle_combo_binding(value_);
+}
+void Store::save_skitch_toggle_combo_binding(std::uint32_t combo) {
+    require(valid_action_binding(combo), "Unsupported controller combo or keyboard key");
+    std::lock_guard lock(mutex_);
+    Update update(*this);
+    update.json(value_.settings, {"bindings", "skitch_toggle_combo"}) = combo;
     update.commit();
 }
 
