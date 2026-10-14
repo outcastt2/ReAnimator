@@ -90,6 +90,25 @@ struct State {
     // The decisive clip probe: a one-shot synchronous dump, armed by name.
     bool clip_pending{};
     std::string clip_name;
+    // The codec hunt: one module scan, then a timed watch for the decoder's
+    // scratch around the clip's arenas. Armed by `prop codec`.
+    bool codec_pending{};
+    std::string codec_name;
+    unsigned codec_seconds{20};
+    // Live watch: touched only from the client tick.
+    bool codec_watching{};
+    ULONGLONG codec_watch_until{};
+    ULONGLONG codec_next_pass{};
+    struct CodecRun {
+        Ptr start{};
+        unsigned groups{};
+        unsigned last_seen{};
+        unsigned vanished_logged{};
+    };
+    std::vector<CodecRun> codec_seen;               // logged quat runs
+    std::vector<std::array<Ptr, 2>> codec_windows;  // {begin, end} scan windows
+    unsigned codec_passes{};
+    unsigned codec_new_runs{}, codec_vanished_runs{};
     bool poke_pending{};
     bool poke_stop_pending{};
     unsigned poke_seconds{12};
@@ -1275,6 +1294,247 @@ void arm_assets(Ptr base, Ptr client, const std::string &extra, unsigned seconds
 }
 
 // ---------------------------------------------------------------------------
+// The codec hunt. Probe v2 proved the clip's asset side holds no decoded
+// frames, so either the runtime decodes EDAA per sample or the decoder state
+// lives on the skater's sampler. Both routes run through the game's codec
+// registry: the EBX gives CodecType 0x45444141 ("EDAA") for animation clips.
+// Two instruments, both read-only: a module scan for that word beside function
+// pointers, and a timed watch for unit-quat runs (the decoder's scratch)
+// around the clip's known arenas while a gesture plays.
+extern "C" {
+__declspec(dllimport) BOOL WINAPI K32EnumProcessModulesEx(HANDLE, HMODULE *, DWORD, LPDWORD, DWORD);
+__declspec(dllimport) DWORD WINAPI K32GetModuleBaseNameA(HANDLE, HMODULE, LPSTR, DWORD);
+}
+#ifndef LIST_MODULES_DEFAULT
+#define LIST_MODULES_DEFAULT 0x00000003
+#endif
+
+void codec_registry_scan() {
+    HMODULE modules[256]{};
+    DWORD needed{};
+    if (!K32EnumProcessModulesEx(GetCurrentProcess(), modules, sizeof(modules), &needed, LIST_MODULES_DEFAULT)) {
+        logging::log(logging::Level::info, logging::Channel::skater, "Clip codec: K32EnumProcessModulesEx failed ({:#x}).",
+                     GetLastError());
+        return;
+    }
+    struct Image {
+        Ptr base{};
+        std::size_t size{};
+        std::string name;
+    };
+    std::vector<Image> images;
+    const DWORD count = (std::min)(static_cast<DWORD>(sizeof(modules) / sizeof(modules[0])),
+                                   static_cast<DWORD>(needed / sizeof(HMODULE)));
+    for (DWORD i = 0; i < count; ++i) {
+        const Ptr base = reinterpret_cast<Ptr>(modules[i]);
+        IMAGE_DOS_HEADER dos{};
+        if (!memory::peek_bytes(base, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE) continue;
+        IMAGE_NT_HEADERS nt{};
+        if (!memory::peek_bytes(base + dos.e_lfanew, &nt, sizeof(nt)) || nt.Signature != IMAGE_NT_SIGNATURE) continue;
+        char name[MAX_PATH]{};
+        K32GetModuleBaseNameA(GetCurrentProcess(), modules[i], name, MAX_PATH - 1);
+        images.push_back({base, nt.OptionalHeader.SizeOfImage, name});
+    }
+    // Executable ranges, for recognising function pointers beside a hit.
+    struct Range {
+        Ptr begin{};
+        Ptr end{};
+    };
+    std::vector<Range> code;
+    for (const auto &image : images) {
+        IMAGE_DOS_HEADER dos{};
+        IMAGE_NT_HEADERS nt{};
+        if (!memory::peek_bytes(image.base, &dos, sizeof(dos)) ||
+            !memory::peek_bytes(image.base + dos.e_lfanew, &nt, sizeof(nt)))
+            continue;
+        const auto *section = IMAGE_FIRST_SECTION(&nt);
+        for (unsigned i = 0; i < nt.FileHeader.NumberOfSections; ++i, ++section) {
+            if (section->Characteristics & IMAGE_SCN_MEM_EXECUTE)
+                code.push_back({image.base + section->VirtualAddress,
+                                image.base + section->VirtualAddress + section->Misc.VirtualSize});
+        }
+    }
+    const auto in_code = [&code](Ptr address) {
+        for (const auto &range : code)
+            if (address >= range.begin && address < range.end) return true;
+        return false;
+    };
+    // Scan every image for the codec word, in 64 KB peek windows.
+    std::array<std::uint8_t, 1 << 16> buffer{};
+    std::size_t scanned{};
+    unsigned hits{}, logged_hits{};
+    for (const auto &image : images) {
+        for (std::size_t offset = 0; offset + 4 <= image.size; offset += buffer.size() - 4) {
+            const std::size_t window = (std::min)(buffer.size() - 4, image.size - offset);
+            if (!memory::peek_bytes(image.base + offset, buffer.data(), window)) {
+                // An unreadable page: step past it and keep going.
+                offset += 0x1000 - (buffer.size() - 4);
+                continue;
+            }
+            scanned += window;
+            for (std::size_t i = 0; i + 4 <= window; i += 4) {
+                std::uint32_t word{};
+                std::memcpy(&word, buffer.data() + i, 4);
+                if (word != 0x45444141) continue;
+                ++hits;
+                if (logged_hits >= 24) continue;
+                ++logged_hits;
+                logging::log(logging::Level::info, logging::Channel::skater, "Clip codec: {}+{:#x}: EDAA word.",
+                             image.name, offset + i);
+                // Dump the neighbourhood compactly and flag executable pointers
+                // (a registry entry sits beside its handler functions).
+                unsigned functions{};
+                for (std::size_t n = 0; n + 8 <= 0x40 && i + n + 8 <= window; n += 8) {
+                    std::uint32_t low{}, high{};
+                    std::memcpy(&low, buffer.data() + i + n, 4);
+                    std::memcpy(&high, buffer.data() + i + n + 4, 4);
+                    if (!low || low < 0x10000 || high > 2) continue;
+                    const Ptr pointer = static_cast<Ptr>(low);
+                    if (!in_code(pointer)) continue;
+                    if (++functions > 4) continue;
+                    std::array<std::uint8_t, 16> head{};
+                    const bool ok = memory::peek_bytes(pointer, head.data(), head.size());
+                    logging::log(logging::Level::info, logging::Channel::skater,
+                                 "Clip codec:   {}+{:#x} -> fn {:#x}{}.", image.name, offset + i + n, pointer,
+                                 ok ? std::format(" [{:02x} {:02x} {:02x} {:02x} ...]", head[0], head[1], head[2], head[3])
+                                    : std::string(" (unreadable)"));
+                }
+            }
+        }
+    }
+    logging::log(logging::Level::info, logging::Channel::skater,
+                 "Clip codec: {} module(s), {} MB scanned, {} EDAA hit(s).", images.size(), scanned >> 20, hits);
+}
+
+// The scratch watch: rescan the arenas around the clip (its payload, the channel
+// tables beside it, and the rig's output pose) for runs of unit quaternions.
+// The output pose run is expected (the graph's result, 395 joints); anything
+// else that appears while the gesture plays -- or vanishes between passes --
+// is the decoder working on a scratch buffer.
+void arm_codec_watch(Ptr data, Ptr pose, Ptr channels, unsigned seconds) {
+    auto &s = state();
+    s.codec_windows.clear();
+    s.codec_seen.clear();
+    s.codec_passes = s.codec_new_runs = s.codec_vanished_runs = 0;
+    constexpr Ptr span = 16ULL << 20;
+    const auto add = [&s](Ptr center, const char *what) {
+        if (!center) return;
+        s.codec_windows.push_back({center > span ? center - span : 0, center + span});
+        logging::log(logging::Level::info, logging::Channel::skater, "Clip codec: window around {} at {:#x} (+-{} MB).",
+                     what, center, span >> 20);
+    };
+    add(data, "the clip payload");
+    add(channels, "the channel tables");
+    add(pose, "the output pose");
+    const ULONGLONG now = GetTickCount64();
+    s.codec_watching = !s.codec_windows.empty();
+    s.codec_watch_until = now + seconds * 1000ULL;
+    s.codec_next_pass = now + 100;
+    logging::log(logging::Level::info, logging::Channel::skater,
+                 "Clip codec: watching {} arena(s) for {}s; hold a gesture (the wave) the whole time.",
+                 s.codec_windows.size(), seconds);
+    set_status(s.codec_watching ? std::format("Clip codec: watching {} arena(s) for {}s; keep the gesture looping.",
+                                              s.codec_windows.size(), seconds)
+                                : std::string("Clip codec: nothing to watch (no clip loaded; run again once it is)."));
+}
+
+void service_codec_watch() {
+    auto &s = state();
+    if (!s.codec_watching) return;
+    const ULONGLONG now = GetTickCount64();
+    if (now >= s.codec_watch_until) {
+        s.codec_watching = false;
+        logging::log(logging::Level::info, logging::Channel::skater,
+                     "Clip codec: watch done: {} pass(es), {} new run(s), {} vanished.", s.codec_passes, s.codec_new_runs,
+                     s.codec_vanished_runs);
+        set_status(std::format("Clip codec: done ({} passes, {} new run(s)); see the log.", s.codec_passes,
+                               s.codec_new_runs));
+        return;
+    }
+    if (now < s.codec_next_pass) return;
+    s.codec_next_pass = now + 500;
+    ++s.codec_passes;
+    static thread_local std::array<std::uint8_t, 1 << 16> buffer{};
+    std::vector<bool> present(s.codec_seen.size(), false);
+    for (const auto &window : s.codec_windows) {
+        Ptr base = window[0] & ~Ptr{15};
+        // Run state lives outside the chunk loop: a run crossing the 64-byte
+        // seam overlap stays one run, not a fresh find per chunk.
+        std::size_t run_groups{};
+        Ptr run_begin{};
+        while (base + 16 <= window[1]) {
+            const std::size_t span = (std::min)(static_cast<std::size_t>(buffer.size()),
+                                                static_cast<std::size_t>(window[1] - base));
+            if (!memory::peek_bytes(base, buffer.data(), span)) {
+                run_groups = 0;
+                base += 0x1000;
+                continue;
+            }
+            // Runs of unit quaternions at 16-byte group starts (covers both
+            // packed channel arrays and the rig's 0x30 records: quat at +0x10).
+            for (std::size_t i = 0; i + 16 <= span; i += 16) {
+                float q[4]{};
+                std::memcpy(q, buffer.data() + i, 16);
+                const float len2 = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
+                const bool unit = std::fabs(len2 - 1.0f) < 0.02f && std::fabs(q[0]) < 2.0f && std::fabs(q[1]) < 2.0f &&
+                                  std::fabs(q[2]) < 2.0f && std::fabs(q[3]) < 2.0f;
+                if (unit) {
+                    if (!run_groups) run_begin = base + i;
+                    ++run_groups;
+                    continue;
+                }
+                if (run_groups < 4) {
+                    run_groups = 0;
+                    continue;
+                }
+                // A finished run: known (mark present) or new (log and record).
+                bool known{};
+                for (std::size_t r = 0; r < s.codec_seen.size(); ++r) {
+                    const Ptr start = s.codec_seen[r].start;
+                    if (run_begin <= start + 64 && start <= run_begin + 64) {
+                        s.codec_seen[r].last_seen = s.codec_passes;
+                        present[r] = true;
+                        known = true;
+                        break;
+                    }
+                }
+                if (!known) {
+                    ++s.codec_new_runs;
+                    // Pose-buffer-shaped runs (395 joints) are logged a few times
+                    // only; the interesting finds are the smaller scratch runs.
+                    const bool large = run_groups >= 200;
+                    unsigned large_seen{};
+                    for (const auto &run : s.codec_seen)
+                        if (run.groups >= 200) ++large_seen;
+                    if ((!large || large_seen < 8) && s.codec_seen.size() < 48) {
+                        s.codec_seen.push_back({run_begin, static_cast<unsigned>(run_groups), s.codec_passes, 0});
+                        present.push_back(true);
+                        logging::log(logging::Level::info, logging::Channel::skater,
+                                     "Clip codec: new quat run {:#x}..{:#x} ({} x 16B, pass {}).", run_begin,
+                                     run_begin + run_groups * 16, run_groups, s.codec_passes);
+                        dump_region(run_begin, 0x40, "codec run");
+                    }
+                }
+                run_groups = 0;
+            }
+            // Advance with a 64-byte overlap so runs spanning the seam are still
+            // seen as one run (the dedup above keeps the seam from double-logging).
+            base += span > 64 ? span - 64 : span;
+        }
+    }
+    // Runs that stopped appearing: the scratch being freed, or a pose buffer
+    // going away. Logged once per disappearance.
+    for (std::size_t r = 0; r < s.codec_seen.size(); ++r) {
+        auto &run = s.codec_seen[r];
+        if (run.last_seen == s.codec_passes || run.vanished_logged >= run.last_seen) continue;
+        run.vanished_logged = s.codec_passes;
+        ++s.codec_vanished_runs;
+        logging::log(logging::Level::info, logging::Channel::skater, "Clip codec: run {:#x} vanished (pass {}).",
+                     run.start, s.codec_passes);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The decisive clip probe. A custom animation only gets the game's own IK if it
 // is an *input* the animgraph samples from; if the clip's runtime data is the
 // graph's *output* pose, replacing it buys nothing (the graph already wrote its
@@ -1924,6 +2184,13 @@ void request_prop_clip(std::string name) {
     s.clip_name = std::move(name);
     s.clip_pending = true;
 }
+void request_prop_codec(std::string name, unsigned seconds) {
+    auto &s = state();
+    std::lock_guard lock(s.mutex);
+    s.codec_name = std::move(name);
+    s.codec_seconds = seconds ? seconds : 20;
+    s.codec_pending = true;
+}
 void request_prop_poke(unsigned seconds) {
     auto &s = state();
     std::lock_guard lock(s.mutex);
@@ -2050,6 +2317,9 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
         bool want_morph_find{}, want_morph_unclamp{}, want_morph_clamp{};
         bool want_clip{};
         std::string clip_name;
+        bool want_codec{};
+        std::string codec_name;
+        unsigned codec_seconds{};
         bool want_ragdoll_config{}, want_ragdoll_bools{}, want_ragdoll_watch{}, want_ragdoll_set{},
             want_ragdoll_stop{}, want_ragdoll_refs{}, want_ragdoll_data{};
         unsigned ragdoll_watch_seconds{30};
@@ -2078,6 +2348,9 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
             want_assets = s.assets_pending;
             want_clip = s.clip_pending;
             clip_name = s.clip_name;
+            want_codec = s.codec_pending;
+            codec_name = s.codec_name;
+            codec_seconds = s.codec_seconds;
             want_poke = s.poke_pending;
             want_poke_stop = s.poke_stop_pending;
             want_trace = s.trace_pending;
@@ -2115,6 +2388,7 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
             morph_max = s.morph_unclamp_max;
             s.report_pending = s.watch_pending = s.weight_pending = s.pose_pending = s.assets_pending = false;
             s.clip_pending = false;
+            s.codec_pending = false;
             s.poke_pending = s.poke_stop_pending = false;
             s.trace_pending = s.trace_off_pending = s.derive_pending = false;
             s.hand_attach_pending = s.hand_detach_pending = false;
@@ -2204,6 +2478,32 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
             if (GetTickCount64() >= s.ragdoll_until) ragdoll_stop(true);
         }
         if (want_clip) clip_data_dump(base, client, clip_name);
+        if (want_codec) {
+            codec_registry_scan();
+            // Anchor the watch on the clip's arenas; the payload and channel
+            // tables resolve lazily if the gesture is not loaded yet.
+            Local local;
+            Ptr data{}, channels{}, pose{};
+            if (resolve_local(base, client, local)) {
+                const auto reader = [](Ptr address, void *out, std::size_t size) {
+                    return memory::read_bytes(address, out, size);
+                };
+                pose = multiplayer::read_native_pose_layout(reader, base, local.holder, 512).buffer;
+            }
+            const std::string clip = codec_name.empty() ? "c_proto_ofbnb_gesture_wave_loop_lfoot_01" : codec_name;
+            bool faulted{};
+            const Ptr asset = find_named_asset(base, ("animation/dingo/" + clip).c_str(), faulted);
+            if (asset) {
+                std::uint32_t word{};
+                if (memory::read_bytes(asset + 0x28, &word, 4) && word)
+                    data = static_cast<Ptr>(word) & ~Ptr{7};
+                if (memory::read_bytes(asset + 0x08, &word, 4) && word) channels = static_cast<Ptr>(word);
+            } else {
+                set_status("Clip codec: " + clip + " is not loaded yet; trigger it during the watch window.");
+            }
+            arm_codec_watch(data, pose, channels, codec_seconds);
+        }
+        service_codec_watch();
         if (want_report) report(base, filter);
         if (want_assets) arm_assets(base, client, assets_extra, assets_seconds);
         else if (want_pose) arm_pose(base, client, pose_seconds);

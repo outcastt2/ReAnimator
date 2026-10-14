@@ -51,6 +51,16 @@ void request_prop_assets(std::string extra, unsigned seconds);
 // the rig's output pose buffer. Read-only; decides whether the clip's live data
 // is an animgraph *input* (swappable for native IK) or its *output* (not).
 void request_prop_clip(std::string name);
+// The codec hunt. Scan every loaded module for the EDAA codec word (the EBX
+// gives CodecType 0x45444141 for animation clips) and report hits with their
+// neighbours -- registry entries carry function pointers, so a hit beside
+// pointers into executable sections is the codec's handler table. Then watch
+// the arenas around the clip's payload, its channel tables and the rig's output
+// pose for `seconds`, logging every run of unit quaternions that appears or
+// vanishes: that is the decoder's scratch buffer if the runtime keeps one.
+// Read-only. `name` picks the clip to anchor the arenas (empty = the wave test
+// clip); run the command first, then hold the gesture for the whole window.
+void request_prop_codec(std::string name, unsigned seconds);
 // Write test: hold the three layer weights that go to 1.0 during a prop gesture
 // at 1.0 for `seconds`, then restore the original values. The stop call restores
 // immediately.

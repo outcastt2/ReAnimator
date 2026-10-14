@@ -354,7 +354,7 @@ void register_movement_commands(Commands &registry) {
     // Hand props: the game's own gesture props follow a custom animation, so the
     // trigger is what has to be found before anything is written.
     auto prop = action("prop",
-        "Hand props: prop | prop list [name] | prop watch [name] [seconds] | prop clip <name> | prop trace [seconds] - gesture props, creation, and the clip probe",
+        "Hand props: prop | prop list [name] | prop watch [name] [seconds] | prop clip <name> | prop codec [name] [seconds] | prop trace [seconds] - gesture props, creation, and the clip probes",
         Group::movement, {argument("mode", Type::text, true), argument("name", Type::text, true),
                           argument("seconds|side", Type::text, true)});
     prop.execution = Execution::local;
@@ -422,6 +422,20 @@ void register_movement_commands(Commands &registry) {
             skater::request_prop_clip(name);
             out("Clip probe: resolving \"" + name + "\", following its +0x28 data and comparing against the rig's "
                 "output pose (see the log). Trigger that gesture first so it is loaded.");
+            return;
+        }
+        if (mode == "codec") {
+            // Lanes: `prop codec`, `prop codec <seconds>`, `prop codec <clip> <seconds>`.
+            auto seconds = number_at(2, 0u);
+            auto clip = name;
+            if (!seconds) {
+                seconds = number_at(1, 20u);
+                if (clip == std::to_string(seconds)) clip.clear();
+            }
+            skater::request_prop_codec(clip, seconds);
+            out("Clip codec: scanning the game modules for the EDAA codec word, then watching the clip's arenas for " +
+                std::to_string(seconds) + "s (see the log). Run it FIRST, then trigger the gesture and keep it looping "
+                "until the watch ends.");
             return;
         }
         if (mode == "poke") {
