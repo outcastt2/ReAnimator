@@ -1088,6 +1088,75 @@ void dump_region(Ptr address, std::size_t bytes, const std::string &label) {
     }
 }
 
+// Reads a window of memory and reports the structure the anim machinery would
+// leave in it: the EDAA codec magic, runs of unit quaternions (decoded rotation
+// channels), and runs of the rig's 0x30 transform records (unit quat at +0x10,
+// finite position at +0x20 -- the output pose's own layout). A region holding
+// decoded clip frames will light up; a compressed resource stream will not.
+void scan_region(Ptr address, std::size_t bytes, const std::string &label) {
+    std::vector<std::uint8_t> buffer(bytes);
+    if (!memory::read_bytes(address, buffer.data(), buffer.size())) {
+        logging::log(logging::Level::info, logging::Channel::skater, "Clip: {} scan: window at {:#x} unreadable.",
+                     label, address);
+        return;
+    }
+    const auto word = [&buffer](std::size_t off) {
+        std::uint32_t v{};
+        std::memcpy(&v, buffer.data() + off, 4);
+        return v;
+    };
+    const auto flt = [&buffer](std::size_t off) {
+        float f{};
+        std::memcpy(&f, buffer.data() + off, 4);
+        return f;
+    };
+    for (std::size_t off = 0; off + 4 <= bytes; off += 4) {
+        if (word(off) == 0x45444141) logging::log(logging::Level::info, logging::Channel::skater,
+                                                  "Clip: {} scan +{:#x}: EDAA codec magic.", label, off);
+    }
+    const auto is_unit = [](float x, float y, float z, float w) {
+        return std::fabs(x * x + y * y + z * z + w * w - 1.0f) < 0.02f && std::fabs(x) < 2.0f && std::fabs(y) < 2.0f &&
+               std::fabs(z) < 2.0f && std::fabs(w) < 2.0f;
+    };
+    // Runs of 4-float unit groups (a decoded quaternion channel array).
+    std::size_t run_start = 0, run_len = 0;
+    for (std::size_t off = 0; off + 16 <= bytes; off += 16) {
+        if (is_unit(flt(off), flt(off + 4), flt(off + 8), flt(off + 12))) {
+            if (!run_len) run_start = off;
+            ++run_len;
+        } else {
+            if (run_len >= 4)
+                logging::log(logging::Level::info, logging::Channel::skater,
+                             "Clip: {} scan: quat run +{:#x}..+{:#x} ({} x 4 floats).", label, run_start, off, run_len);
+            run_len = 0;
+        }
+    }
+    if (run_len >= 4)
+        logging::log(logging::Level::info, logging::Channel::skater, "Clip: {} scan: quat run +{:#x}..+{:#x} ({} x 4 floats).",
+                     label, run_start, bytes, run_len);
+    // Runs of the rig's 0x30 transform records (a decoded pose cache).
+    run_start = 0;
+    run_len = 0;
+    for (std::size_t off = 0; off + 0x30 <= bytes; off += 0x30) {
+        const bool ok = is_unit(flt(off + 0x10), flt(off + 0x14), flt(off + 0x18), flt(off + 0x1c)) &&
+                        std::isfinite(flt(off + 0x20)) && std::fabs(flt(off + 0x20)) < 1e6f &&
+                        std::isfinite(flt(off + 0x24)) && std::fabs(flt(off + 0x24)) < 1e6f &&
+                        std::isfinite(flt(off + 0x28)) && std::fabs(flt(off + 0x28)) < 1e6f;
+        if (ok) {
+            if (!run_len) run_start = off;
+            ++run_len;
+        } else {
+            if (run_len >= 3)
+                logging::log(logging::Level::info, logging::Channel::skater,
+                             "Clip: {} scan: 0x30-record run +{:#x}..+{:#x} ({} records).", label, run_start, off, run_len);
+            run_len = 0;
+        }
+    }
+    if (run_len >= 3)
+        logging::log(logging::Level::info, logging::Channel::skater, "Clip: {} scan: 0x30-record run +{:#x}..+{:#x} ({} records).",
+                     label, run_start, bytes, run_len);
+}
+
 void arm_assets(Ptr base, Ptr client, const std::string &extra, unsigned seconds) {
     auto &s = state();
     Local local;
@@ -1239,7 +1308,6 @@ void clip_data_dump(Ptr base, Ptr client, const std::string &name) {
         return;
     }
     logging::log(logging::Level::info, logging::Channel::skater, "Clip: {} asset={:#x}", name, asset);
-    dump_region(asset, 0x40, name + " asset");
     std::uint32_t data32{};
     if (!memory::read_bytes(asset + 0x28, &data32, sizeof(data32)) || !data32) {
         set_status("Clip: " + name + " has no +0x28 data pointer.");
@@ -1250,29 +1318,49 @@ void clip_data_dump(Ptr base, Ptr client, const std::string &name) {
                  "Clip: {} +0x28 -> {:#x} {}", name, data,
                  data == pose.buffer ? "(== OUTPUT POSE: graph output, not an input)"
                                      : "(distinct from the output pose)");
-    dump_region(data, 0x200, name + " data");
+    dump_region(asset, 0x100, name + " asset");
+    dump_region(data, 0x400, name + " data");
+    // Structure findings over larger windows: codec magic, decoded quat runs,
+    // and 0x30-record runs (the rig layout a decoded frame cache would use).
+    scan_region(asset, 0x1000, name + " asset");
+    scan_region(data, 0x1000, name + " data");
     // The asset lays pointers out as {ptr32 at an 8-aligned offset, tag 0..2 at
-    // +4}. Follow the same shape inside the data object: any 8-aligned word that
-    // reads as a plausible heap pointer with a small tag beside it. Report which
-    // (if any) land on the output pose buffer -- that is the swap question.
+    // +4}. Follow that shape in both the asset and the data object, then scan
+    // every reachable region -- the decoded channel cache (if the runtime keeps
+    // one) is what a runtime swap would need to overwrite. Bounded: 32 follows.
+    struct Candidate {
+        Ptr address{};
+        std::string label;
+    };
+    std::vector<Candidate> candidates;
+    const auto collect = [&](Ptr region, std::size_t span, const char *what) {
+        for (std::size_t off = 0; off + 8 <= span; off += 8) {
+            std::uint32_t word{}, tag{};
+            if (!memory::read_bytes(region + off, &word, 4) || !memory::read_bytes(region + off + 4, &tag, 4)) break;
+            if (!word || word < 0x10000 || tag > 2) continue;
+            const Ptr candidate = static_cast<Ptr>(word);
+            std::uint32_t probe{};
+            if (!memory::read_bytes(candidate, &probe, sizeof(probe))) continue;
+            if (candidate == region || candidate == data || candidate == asset) continue;
+            bool seen{};
+            for (const auto &existing : candidates) seen = seen || existing.address == candidate;
+            if (seen) continue;
+            candidates.push_back({candidate, std::format("{} {}+{:#x}", name, what, off)});
+            if (candidates.size() >= 32) return;
+        }
+    };
+    collect(asset, 0x100, "asset");
+    collect(data, 0x400, "data");
     unsigned followed{};
-    for (std::size_t off = 0; off + 8 <= 0x200; off += 8) {
-        std::uint32_t word{}, tag{};
-        if (!memory::read_bytes(data + off, &word, 4) || !memory::read_bytes(data + off + 4, &tag, 4)) break;
-        if (!word || word < 0x10000 || tag > 2) continue;
-        const Ptr candidate = static_cast<Ptr>(word);
-        // Readable and not the object itself.
-        std::uint32_t probe{};
-        if (!memory::read_bytes(candidate, &probe, sizeof(probe))) continue;
+    for (const auto &candidate : candidates) {
         ++followed;
-        const char *verdict = candidate == pose.buffer ? "  <== OUTPUT POSE"
-                              : candidate == asset      ? "  <== the asset itself"
-                                                        : "";
-        logging::log(logging::Level::info, logging::Channel::skater,
-                     "Clip: {} data+{:#x} -> {:#x} (tag {}){}", name, off, candidate, tag, verdict);
-        dump_region(candidate, 0x40, std::format("{} data+{:#x}", name, off));
+        const char *verdict = candidate.address == pose.buffer ? "  <== OUTPUT POSE" : "";
+        logging::log(logging::Level::info, logging::Channel::skater, "Clip: follow {} -> {:#x}{}",
+                     candidate.label, candidate.address, verdict);
+        dump_region(candidate.address, 0x40, candidate.label);
+        scan_region(candidate.address, 0x1000, candidate.label);
     }
-    set_status(std::format("Clip: {} asset={:#x} data={:#x} output={:#x}; {} internal pointer(s) dumped. {}",
+    set_status(std::format("Clip: {} asset={:#x} data={:#x} output={:#x}; {} region(s) walked and scanned. {}",
                            name, asset, data, pose.buffer, followed,
                            data == pose.buffer ? "The data IS the output pose." : "The data is NOT the output pose."));
 }
