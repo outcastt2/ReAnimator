@@ -17,7 +17,9 @@
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <format>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -1174,6 +1176,41 @@ void scan_region(Ptr address, std::size_t bytes, const std::string &label) {
     if (run_len >= 3)
         logging::log(logging::Level::info, logging::Channel::skater, "Clip: {} scan: 0x30-record run +{:#x}..+{:#x} ({} records).",
                      label, run_start, bytes, run_len);
+    // Decoded clip data is normally CHANNEL-major: one channel's time samples
+    // stored contiguously, so four adjacent floats are time samples of a single
+    // component, never one quaternion. The frame-major tests above are blind to
+    // that, which makes silence here prove far less than it looks like it does.
+    // A long stretch of finite floats in [-1,1] that are not all hugging zero is
+    // the signature: quaternion components live in that range and spread across
+    // it, while an integer read as a float lands near 1e-43 and a pointer lands
+    // well outside it -- so the "live" ratio separates keys from counters.
+    std::size_t float_start = 0, float_len = 0, float_live = 0;
+    std::size_t best_start = 0, best_len = 0, best_live = 0;
+    const auto close_float_run = [&] {
+        if (float_len >= 64 && float_live * 2 >= float_len && float_len > best_len) {
+            best_start = float_start;
+            best_len = float_len;
+            best_live = float_live;
+        }
+        float_len = 0;
+        float_live = 0;
+    };
+    for (std::size_t off = 0; off + 4 <= bytes; off += 4) {
+        const float value = flt(off);
+        if (std::isfinite(value) && std::fabs(value) <= 1.0f) {
+            if (!float_len) float_start = off;
+            ++float_len;
+            if (std::fabs(value) >= 1e-4f) ++float_live;
+        } else {
+            close_float_run();
+        }
+    }
+    close_float_run();
+    if (best_len)
+        logging::log(logging::Level::info, logging::Channel::skater,
+                     "Clip: {} scan: bounded-float run +{:#x}..+{:#x} ({} floats, {} off zero) -- what "
+                     "channel-major decoded quaternion keys look like.",
+                     label, best_start, best_start + best_len * 4, best_len, best_live);
 }
 
 void arm_assets(Ptr base, Ptr client, const std::string &extra, unsigned seconds) {
@@ -1620,6 +1657,117 @@ void clip_data_dump(Ptr base, Ptr client, const std::string &name) {
         dump_region(candidate.address, 0x40, candidate.label);
         scan_region(candidate.address, 0x1000, candidate.label);
     }
+    // The asset also carries a resource descriptor at +0xa0: a 0x30-stride array
+    // of {pointer @+0x00, words @+0x04/+0x08, size @+0x10, align @+0x24}. Its size
+    // of 24528 sat at 94% of 87 channels x 75 frames x 4 B, which suggested the
+    // blob was the DECODED payload -- the bytes say otherwise. It opens with an
+    // EBX-family tag and the path "Common/Shaderpents/Parameters/
+    // Region0__Color_0", a material-instance parameter, not pose keys. The fields
+    // are kept because what this blob really is gets settled offline from the
+    // bytes instead of by further inference from a hexdump.
+    std::uint32_t desc32{};
+    Ptr descriptor{};
+    Ptr blob{};
+    std::uint32_t blob_size{};
+    if (!memory::read_bytes(asset + 0xa0, &desc32, sizeof(desc32)) || !desc32) {
+        logging::log(logging::Level::info, logging::Channel::skater,
+                     "Clip: {} has no resource descriptor at asset+0xa0.", name);
+    } else {
+        descriptor = static_cast<Ptr>(desc32) & ~Ptr{7};
+        logging::log(logging::Level::info, logging::Channel::skater,
+                     "Clip: {} resource descriptor asset+0xa0 -> {:#x}", name, descriptor);
+        dump_region(descriptor, 0x60, name + " resource");
+        Ptr previous_blob{};
+        for (unsigned entry = 0; entry < 2; ++entry) {
+            const Ptr row = descriptor + static_cast<Ptr>(entry) * 0x30;
+            std::uint32_t blob32{}, word4{}, word8{}, size{}, align{};
+            if (!memory::read_bytes(row, &blob32, sizeof(blob32)) || !blob32) continue;
+            (void)memory::read_bytes(row + 4, &word4, sizeof(word4));
+            (void)memory::read_bytes(row + 8, &word8, sizeof(word8));
+            (void)memory::read_bytes(row + 0x10, &size, sizeof(size));
+            (void)memory::read_bytes(row + 0x24, &align, sizeof(align));
+            const Ptr current = static_cast<Ptr>(blob32);
+            logging::log(logging::Level::info, logging::Channel::skater,
+                         "Clip: {} resource[{}] ptr={:#x} +0x04={} +0x08={} size={} ({:#x}) +0x24={}",
+                         name, entry, current, word4, word8, size, size, align);
+            if (current == previous_blob) {
+                logging::log(logging::Level::info, logging::Channel::skater,
+                             "Clip: {} resource[{}] repeats resource[{}]; not re-scanned.", name, entry, entry - 1);
+                continue;
+            }
+            previous_blob = current;
+            if (!size || size > 4 * 1024 * 1024) {
+                logging::log(logging::Level::info, logging::Channel::skater,
+                             "Clip: {} resource[{}] size {} is out of the sane range; not scanned.", name, entry, size);
+                continue;
+            }
+            if (!blob) {
+                blob = current;
+                blob_size = size;
+            }
+            // Header only as a hexdump -- the decisive signal is the scan, which
+            // reports decoded float structure if the blob holds any.
+            const std::size_t header = size < 0x60 ? size : 0x60;
+            dump_region(current, header, name + " resource blob");
+            scan_region(current, size, name + " resource blob");
+            // One decoded record at the 0x30 stride, if the scan's own shape
+            // holds: scale.xyz @+0x00, quat.xyzw @+0x10, pos.xyz @+0x20.
+            float rec[12]{};
+            if (memory::read_bytes(current, rec, sizeof(rec))) {
+                logging::log(logging::Level::info, logging::Channel::skater,
+                             "Clip: {} resource blob [0] scale=({:.4g},{:.4g},{:.4g}) quat=({:.4g},{:.4g},{:.4g},{:.4g}) "
+                             "pos=({:.4g},{:.4g},{:.4g})",
+                             name, rec[0], rec[1], rec[2], rec[4], rec[5], rec[6], rec[7], rec[8], rec[9], rec[10]);
+            }
+        }
+    }
+    // Byte-exact capture. The log only ever carries a header hexdump, and three
+    // questions cannot be settled from that: which codec tag the runtime asset
+    // carries (a flipable CodecType would let a swap write raw keys rather than
+    // reverse the compressor), whether +0x28 holds channel-major keys or an
+    // encoded stream, and what the descriptor's array really is. Files land next
+    // to ReSkate.log and nothing in the game is modified.
+    std::array<wchar_t, 32768> module_path{};
+    const bool have_module =
+        GetModuleFileNameW(nullptr, module_path.data(), static_cast<DWORD>(module_path.size())) != 0;
+    const std::filesystem::path directory =
+        have_module ? logging::log_directory(std::filesystem::path(module_path.data()).parent_path())
+                    : std::filesystem::path{};
+    const auto capture = [&](const char *tag, Ptr address, std::size_t max_bytes) {
+        if (!address || !max_bytes) return;
+        if (directory.empty()) {
+            logging::log(logging::Level::info, logging::Channel::skater, "Clip: {} capture {}: no log directory.", name, tag);
+            return;
+        }
+        std::wstring wide;
+        for (const char *c = tag; *c; ++c) wide += (*c >= '0' && *c <= 'z') ? static_cast<wchar_t>(*c) : L'-';
+        const auto path = directory / (L"clip-dump-" + wide + L".bin");
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            logging::log(logging::Level::info, logging::Channel::skater, "Clip: {} capture {}: cannot open {}.", name, tag,
+                         path.string());
+            return;
+        }
+        // Chunked, so a range that runs off the end keeps everything read so far
+        // instead of losing the whole capture to one bad page.
+        std::vector<std::uint8_t> chunk(0x1000);
+        std::size_t written{};
+        while (written < max_bytes) {
+            const std::size_t want = (max_bytes - written) < chunk.size() ? (max_bytes - written) : chunk.size();
+            if (!memory::read_bytes(address + written, chunk.data(), want)) break;
+            out.write(reinterpret_cast<const char *>(chunk.data()), static_cast<std::streamsize>(want));
+            if (!out) break;
+            written += want;
+        }
+        out.close();
+        logging::log(logging::Level::info, logging::Channel::skater, "Clip: {} capture {}: {} bytes at {:#x} -> {}.", name,
+                     tag, written, address, path.string());
+    };
+    capture("asset", asset, 0x200);
+    capture("data", data, 0x20000);
+    capture("pose", pose.buffer, static_cast<std::size_t>(pose.count) * 0x30);
+    capture("descriptor", descriptor, 0x400);
+    capture("blob", blob, blob_size);
     set_status(std::format("Clip: {} asset={:#x} data={:#x} output={:#x}; {} region(s) walked and scanned. {}",
                            name, asset, data, pose.buffer, followed,
                            data == pose.buffer ? "The data IS the output pose." : "The data is NOT the output pose."));
