@@ -8,45 +8,43 @@ void require(bool ok) { if(!ok) throw std::runtime_error("Cosmetic unlock regres
 int main() {
     const auto folder=std::filesystem::current_path()/"skitch-test-saves";
     std::filesystem::create_directories(folder);
-    const auto save=folder/("inventory-"+std::to_string(GetCurrentProcessId())+"-"+std::to_string(GetTickCount64())+".sqlite3");
+    const auto save=folder/("policy-"+std::to_string(GetCurrentProcessId())+"-"+std::to_string(GetTickCount64())+".sqlite3");
     try {
+        // The unlocker is a policy over classes now, not a list of items seeded
+        // into the profile: whichever class an item is in decides it, and every
+        // other kind of cosmetic is handed back to upstream's rule.
         {
             profile::Store store(save);
             store.set_bool_option(profile::unlock_cosmetics_option,true);
             store.set_bool_option(profile::unlock_objects_option,true);
-            // The catalog's decision is simulated here: gestures and build items
-            // go to the seed lists, a reserved item to the revoke list.
-            store.seed_cosmetic_inventory({"Own_TestGesture"});
-            store.seed_object_inventory({"Own_TestObject"});
-            store.seed_cosmetic_inventory({"Own_TestClothing"}); // an earlier build granted it
-            store.reconcile_inventory({"Own_TestClothing"},{});
-            auto at=store.snapshot();
-            require(at.customization.at("inventory").at("Own_TestGesture").get<bool>());
-            require(at.extensions.at("object_dropper").at("inventory").at("Own_TestObject").get<bool>());
-            require(!at.customization.at("inventory").at("Own_TestClothing").get<bool>());
+            const auto at=store.snapshot();
+            // Both switches on: the two classes the unlocker owns are granted.
+            // A reserved gesture is granted too, which is the point of the class
+            // switch -- tier rewards are what a reservation mostly is.
+            require(profile::unlocker_decision(at,false,true,false)==profile::Unlock::grant);
+            require(profile::unlocker_decision(at,false,true,true)==profile::Unlock::grant);
+            require(profile::unlocker_decision(at,true,false,true)==profile::Unlock::grant);
+            // A reserved garment is denied: the reserved switch stays off, and
+            // it is reached before the open-catalogue switch is even asked.
+            require(profile::unlocker_decision(at,false,false,true)==profile::Unlock::deny);
+            // An open garment defers to upstream, which grants it on the switch.
+            require(profile::unlocker_decision(at,false,false,false)==profile::Unlock::defer);
         }
         {
             profile::Store store(save);
-            auto at=store.snapshot();
-            // The policy survives a restart for everything that was not revoked.
-            require(at.customization.at("inventory").at("Own_TestGesture").get<bool>());
-            require(at.extensions.at("object_dropper").at("inventory").at("Own_TestObject").get<bool>());
-            require(!at.customization.at("inventory").at("Own_TestClothing").get<bool>());
-            // A revoke list is unconditional, and an option-off seed stays off.
             store.set_bool_option(profile::unlock_cosmetics_option,false);
-            store.seed_cosmetic_inventory({"Own_TestGestureOff"});
-            {
-                const auto inventory=store.snapshot().customization.at("inventory");
-                const bool off_owned=inventory.contains("Own_TestGestureOff") &&
-                    inventory.at("Own_TestGestureOff").is_boolean() &&
-                    inventory.at("Own_TestGestureOff").get<bool>();
-                require(!off_owned);
-            }
-            store.reconcile_inventory({"Own_TestGesture"},{});
-            require(!store.snapshot().customization.at("inventory").at("Own_TestGesture").get<bool>());
+            store.set_bool_option(profile::unlock_objects_option,false);
+            const auto at=store.snapshot();
+            // With both switches off the classes do not open, but a garment is
+            // still deferred rather than denied, so a profile that saved its own
+            // rows keeps what it saved.
+            require(profile::unlocker_decision(at,false,true,false)==profile::Unlock::deny);
+            require(profile::unlocker_decision(at,true,false,false)==profile::Unlock::deny);
+            require(profile::unlocker_decision(at,false,false,false)==profile::Unlock::defer);
+            require(profile::unlocker_decision(at,false,false,true)==profile::Unlock::deny);
         }
         for(const auto suffix : {"","-wal","-shm"}) std::filesystem::remove(std::filesystem::path(save.string()+suffix));
-        std::cout<<"Class-policy inventory: gestures/objects stay owned, revoked classes never do.\n";
+        std::cout<<"Class-policy unlocker: gestures/objects granted, reserved denied, the rest deferred to upstream.\n";
         return 0;
     } catch(const std::exception& e) { std::cerr<<e.what()<<'\n'; return 1; }
 }

@@ -81,6 +81,25 @@ struct Snapshot {
     dingosdk::Json extensions = dingosdk::Json::object();
     bool operator==(const Snapshot&) const = default;
 };
+// What the unlocker says about one item, given which class it sits in and
+// whether its source is reserved. `grant` and `deny` end the question; `defer`
+// hands it back to upstream's rule -- the open-catalogue switch, then the rows
+// a profile saved before the rows were given up -- which is what every other
+// kind of cosmetic gets. Gestures and build items never defer: they are open in
+// full whatever their source says, since most of them are tier rewards, so a
+// reserved row is what their own switch is for, and the section switch beside
+// it still gates them as it always did.
+enum class Unlock { grant, deny, defer };
+inline Unlock unlocker_decision(const Snapshot& snapshot, bool build_kit, bool gesture, bool held) {
+    const auto option = [&](std::string_view name) {
+        const auto found = snapshot.bool_options.find(name);
+        return found != snapshot.bool_options.end() && found->second;
+    };
+    if (build_kit) return unlock_build_items && option(unlock_objects_option) ? Unlock::grant : Unlock::deny;
+    if (gesture) return unlock_gesture_items && option(unlock_cosmetics_option) ? Unlock::grant : Unlock::deny;
+    if (held && !unlock_reserved_cosmetics) return Unlock::deny;
+    return Unlock::defer;
+}
 // Detached, narrow read models: UI polling never needs to copy inventories,
 // settings, or the complete extensions document to inspect saved progress.
 struct MissionState {
@@ -201,9 +220,11 @@ public:
     void save_cosmetic_loadout(std::string_view, const CosmeticLoadout&);
     std::optional<CosmeticLoadout> player_card() const;
     void save_player_card(const CosmeticLoadout&);
-    void seed_cosmetic_inventory(const std::vector<std::string>&);
-    void seed_object_inventory(const std::vector<std::string>&);
-    void reconcile_inventory(const std::vector<std::string>& cosmetics, const std::vector<std::string>& objects);
+    // With a kind's unlock option on, what the player owns is a rule, not a list
+    // (profile_runtime::installed_item_owned): every installed item but a paid store copy. The
+    // ownership rows earlier versions saved for every item they saw (every mod's, removed mods'
+    // too) are dropped here, once, for each kind whose option is on.
+    void forget_unlocked_inventory();
     std::uint32_t selected_cosmetic_preset() const;
     void set_selected_cosmetic_preset(std::uint32_t);
     void save_park_choice(unsigned lot, std::string_view id);
