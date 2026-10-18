@@ -28,21 +28,6 @@ inline constexpr std::string_view unlock_bus_stops_option = "ReSkate.UnlockBusSt
 inline constexpr std::string_view unlock_cosmetics_option = "ReSkate.UnlockCosmetics";
 inline constexpr std::string_view unlock_objects_option = "ReSkate.UnlockObjects";
 inline constexpr std::string_view hide_challenges_option = "ReSkate.HideChallenges";
-// The SkateSkitch unlocker extends the upstream open-catalogue unlock to two
-// classes in full: gestures and build items are seeded owned whether or not
-// their source is currently open (most are tier rewards). Every other kind of
-// cosmetic keeps the upstream ReSkate behaviour -- the open catalogue, base
-// game and mods alike, is unlocked when UnlockCosmetics is on, and reserved
-// items (past seasons, Skate Pass) stay locked. Note that unowned items are
-// absent from the game's wardrobe, not shown locked, so "reserved stays
-// locked" really means "reserved is not there".
-inline constexpr bool unlock_gesture_items = true;
-inline constexpr bool unlock_build_items = true;
-// Reserved cosmetics other than gestures. Off is the upstream behaviour and
-// also hides the entitlement-granted collab packs ("Own_Own_..."), which the
-// open content cache cannot describe; on unlocks everything, which is what
-// SkateSkitch did before this was split.
-inline constexpr bool unlock_reserved_cosmetics = false;
 // Cosmetic slots the character wears nothing in, whatever preset is saved. One
 // boolean per slot name, so a slot is hidden by policy rather than by editing the
 // presets themselves and losing the ability to put the item back.
@@ -81,25 +66,6 @@ struct Snapshot {
     dingosdk::Json extensions = dingosdk::Json::object();
     bool operator==(const Snapshot&) const = default;
 };
-// What the unlocker says about one item, given which class it sits in and
-// whether its source is reserved. `grant` and `deny` end the question; `defer`
-// hands it back to upstream's rule -- the open-catalogue switch, then the rows
-// a profile saved before the rows were given up -- which is what every other
-// kind of cosmetic gets. Gestures and build items never defer: they are open in
-// full whatever their source says, since most of them are tier rewards, so a
-// reserved row is what their own switch is for, and the section switch beside
-// it still gates them as it always did.
-enum class Unlock { grant, deny, defer };
-inline Unlock unlocker_decision(const Snapshot& snapshot, bool build_kit, bool gesture, bool held) {
-    const auto option = [&](std::string_view name) {
-        const auto found = snapshot.bool_options.find(name);
-        return found != snapshot.bool_options.end() && found->second;
-    };
-    if (build_kit) return unlock_build_items && option(unlock_objects_option) ? Unlock::grant : Unlock::deny;
-    if (gesture) return unlock_gesture_items && option(unlock_cosmetics_option) ? Unlock::grant : Unlock::deny;
-    if (held && !unlock_reserved_cosmetics) return Unlock::deny;
-    return Unlock::defer;
-}
 // Detached, narrow read models: UI polling never needs to copy inventories,
 // settings, or the complete extensions document to inspect saved progress.
 struct MissionState {

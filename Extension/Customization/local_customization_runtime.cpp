@@ -89,31 +89,22 @@ bool reserved_cosmetic_hash(std::uint32_t hash) {
     return hash && reserved_hashes.contains(hash);
 }
 bool installed_item_owned(const profile::Snapshot& snapshot, std::string_view key, std::uint32_t hash, bool build_kit) {
-    if (cosmetic_runtime().ownership_unavailable) return false;
-    // Gestures are named by their own key prefix or by the category the catalog
-    // filed them under.
-    const auto& catalog = cosmetic_runtime().items;
-    const auto found_gesture = catalog.find(key);
-    const bool gesture = key.starts_with("own_rctn_gesture") ||
-        (found_gesture != catalog.end() && found_gesture->second.category.starts_with("gestures"));
-    // Reserved: past seasons and Skate Pass from the content cache, plus the
-    // entitlement-granted collab packs ("Own_Own_..."), which that cache cannot
-    // describe because it ships only content ReSkate can distribute. An owned
-    // paid item whose backing data the cache does not describe has crashed the
-    // item previews, a shared-pointer copy of an object that is not there, so
-    // the prefix stands in for reserved where the cache cannot see it.
+    if (cosmetic_runtime().ownership_unavailable || reserved_cosmetic_hash(hash)) return false;
+    // Collab packs ("Own_Own_...") have no backing data the content cache can
+    // describe; treating one as owned has crashed the item previews.
     std::string folded(key);
     for (auto& letter : folded) if (letter >= 'A' && letter <= 'Z') letter = static_cast<char>(letter + ('a' - 'A'));
-    const bool held = reserved_cosmetic_hash(hash) || folded.starts_with("own_own_");
-    switch (profile::unlocker_decision(snapshot, build_kit, gesture, held)) {
-    case profile::Unlock::grant: return true;
-    case profile::Unlock::deny: return false;
-    case profile::Unlock::defer: break;
-    }
-    const auto option = snapshot.bool_options.find(profile::unlock_cosmetics_option);
+    if (folded.starts_with("own_own_")) return false;
+    const auto option = snapshot.bool_options.find(build_kit ? profile::unlock_objects_option : profile::unlock_cosmetics_option);
     if (option != snapshot.bool_options.end() && option->second) return true;
-    const auto inventory = snapshot.customization.find("inventory");
-    if (inventory == snapshot.customization.end() || !inventory->is_object()) return false;
+    const dingosdk::Json* section = &snapshot.customization;
+    if (build_kit) {
+        const auto objects = snapshot.extensions.find("object_dropper");
+        if (objects == snapshot.extensions.end() || !objects->is_object()) return false;
+        section = &*objects;
+    }
+    const auto inventory = section->find("inventory");
+    if (inventory == section->end() || !inventory->is_object()) return false;
     const auto saved = inventory->find(key);
     return saved != inventory->end() && saved->is_boolean() && saved->get<bool>();
 }
