@@ -57,10 +57,12 @@ struct HookState {
     RenderPose original_render_pose{};
     std::atomic<EntityDestroyed> destroyed_listener{};
     std::atomic<AnimationEvaluated> evaluated_listener{};
-    // A second slot for pose playback (custom animations): the local skater's
-    // pose is overwritten after the native evaluation, without displacing the
-    // first-person listener above.
-    std::atomic<AnimationEvaluated> pose_listener{};
+    std::atomic<LocalPoseFilter> pose_filter{};
+    std::atomic<LocalSentPoseFilter> sent_pose_filter{};
+    // A pose override of the local skater (Extension/Skater/skater_animation.cpp), after the one above.
+    std::atomic<AnimationEvaluated> override_listener{};
+    std::atomic<RenderPosePublished> override_render_listener{};
+    std::atomic<BoardPosePublished> override_board_listener{};
     std::atomic<RenderPosePublished> render_listener{};
 };
 // Keys the per-entity hooks match, one contiguous array per kind in slot order.

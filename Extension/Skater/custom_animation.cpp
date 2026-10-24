@@ -582,11 +582,14 @@ void on_skeleton_responded(std::uintptr_t rig) noexcept {
 }
 
 void request_pose_playback(std::string clip) {
-    std::lock_guard lock(playback().mutex);
-    playback().pending = true;
-    playback().stop = false;
-    playback().pending_test = clip == "test";
-    playback().pending_clip = std::move(clip);
+    // ReSkate 2.1.2 replaced the pose-override listener with one slot owned by
+    // Extension/Skater/skater_animation.cpp, so this build cannot register one.
+    // The playback core is being ported onto that system; until it lands, say so
+    // rather than loading a clip that would never be drawn.
+    (void)clip;
+    logging::log(logging::Level::warning, logging::Channel::skater,
+                 "Custom animation: playback is being ported to ReSkate 2.1.2's animation system; unavailable on this build.");
+    set_status("Custom animation: unavailable on this build - playback is being ported to ReSkate 2.1.2's animation system.");
 }
 void request_pose_playback_stop() {
     std::lock_guard lock(playback().mutex);
@@ -850,7 +853,7 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
                 set_status("Custom animation: the animation hook is unavailable: " + detail);
                 return;
             }
-            multiplayer::set_pose_playback_listener(&on_pose_evaluated);
+            // multiplayer::set_pose_playback_listener(&on_pose_evaluated);  // ReSkate 2.1.2: skater_animation owns the single pose-override listener now; playback is stubbed until the port
             p.base = base;
             p.component.store(component, std::memory_order_release);
             p.playing.store(false, std::memory_order_release);
@@ -884,7 +887,7 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
                 set_status("Custom animation: the animation hook is unavailable: " + detail);
                 return;
             }
-            multiplayer::set_pose_playback_listener(&on_pose_evaluated);
+            // multiplayer::set_pose_playback_listener(&on_pose_evaluated);  // ReSkate 2.1.2: skater_animation owns the single pose-override listener now; playback is stubbed until the port
             p.base = base;
             p.component.store(component, std::memory_order_release);
             p.recording.store(false, std::memory_order_release);
@@ -946,7 +949,7 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
             set_status("Custom animation: the animation hook is unavailable: " + detail);
             return;
         }
-        multiplayer::set_pose_playback_listener(&on_pose_evaluated);
+        // multiplayer::set_pose_playback_listener(&on_pose_evaluated);  // ReSkate 2.1.2: skater_animation owns the single pose-override listener now; playback is stubbed until the port
         p.base = base;
         // Capture the current pose so stop can put it back.
         p.saved_pose.clear();

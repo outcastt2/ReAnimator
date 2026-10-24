@@ -137,8 +137,14 @@ int main() try {
             check(!decode(std::span(encoded).first(i)), "Truncated voice policy accepted");
         auto invalid = encoded; invalid[end - 8] = 2;
         check(!decode(invalid), "Invalid host voice toggle accepted");
+        // Bit 7 is the guest ollies lock now (Server: lock ollies for a player, 67e8e43),
+        // so every value of this byte is meaningful and none is invalid. Check that the
+        // bits map to their fields instead of that the byte is rejected.
         invalid = encoded; invalid[end - 1] = 128;
-        check(!decode(invalid), "Invalid guest noclip / No Bail byte accepted");
+        const auto ollies_only = decode(invalid);
+        check(ollies_only && ollies_only->guest_ollies && !ollies_only->guest_noclip && !ollies_only->guest_no_bail &&
+                  !ollies_only->guest_boosts && !ollies_only->enforce_tuning,
+              "The guest tool bits are not read from the roster byte");
         invalid = encoded;
         for (std::size_t i = end - 7; i < end - 3; ++i) invalid[i] = 0;
         check(!decode(invalid), "Zero host voice revision accepted");
