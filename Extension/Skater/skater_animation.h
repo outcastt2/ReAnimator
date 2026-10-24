@@ -46,6 +46,12 @@ struct Replacement {
 // Client thread throughout.
 void play(std::optional<Play> clip);
 bool playing() noexcept; // a clip of play() has not finished
+// Which joints a clip leaves to the game, per joint, 0..1 (1: that joint keeps the game's own pose,
+// 0: the clip's). A clip replaces the body; this keeps the pelvis and legs (or any joint) while it
+// drives the rest, so a clip can layer on the board stance the way the game's own moving gestures
+// do. Empty (the default) is every body joint. It applies to the clip of play(), not to a
+// replacement, and does not restart or move the clip. Client thread.
+void set_mask(std::shared_ptr<const std::vector<float>> keep);
 // The clip of play(), moved to `seconds` (clamped to it), held there or playing on from it.
 void seek(float seconds);
 void pause(bool paused);

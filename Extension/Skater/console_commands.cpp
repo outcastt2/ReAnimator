@@ -712,8 +712,8 @@ void register_movement_commands(Commands &registry) {
 
     // Route B: overwrite the local skater's pose with a baked custom animation.
     auto poseanim = action("poseanim",
-        "Custom animation: poseanim test | record | off | play | save <path> | mask auto|full|legs | ik <0..1> | "
-        "trace 0|1 | <file>.rska [ik|noik]",
+        "Custom animation: poseanim test | record [seconds] | off | play [<file>] | save <path> | "
+        "mask auto|full|legs | ik <0..1> | trace 0|1 | <file>.rska [ik|noik]",
         Group::movement, {argument("clip", Type::text, true), argument("path", Type::text, true),
                           argument("flag", Type::text, true)});
     poseanim.execution = Execution::local;
@@ -734,6 +734,21 @@ void register_movement_commands(Commands &registry) {
         }
         const auto clip = std::get<std::string>(args[0]);
         if (lower(clip) == "off") { skater::request_pose_playback_stop(); out("Stopping custom animation..."); return; }
+        if (lower(clip) == "record") {
+            // The live pose for a few seconds; then `poseanim play` replays it and `poseanim save`
+            // writes it to an .rska.
+            float seconds = 5.0f;
+            if (args.size() > 1) {
+                const auto mode = lower(std::get<std::string>(args[1]));
+                char *end = nullptr;
+                const float value = std::strtof(mode.c_str(), &end);
+                if (end == mode.c_str() || !(value > 0.0f)) { out("usage: poseanim record [seconds]"); return; }
+                seconds = std::min(value, 10.0f);
+            }
+            skater::request_pose_record(seconds);
+            out("Recording for " + std::to_string(seconds).substr(0, 4) + " s...");
+            return;
+        }
         if (lower(clip) == "ik") {
             // How hard a clip that sinks below the game's planted feet is
             // lifted back. 0 leaves the clip exactly as authored.
@@ -746,16 +761,16 @@ void register_movement_commands(Commands &registry) {
             }
             skater::set_pose_ik(strength);
             out(strength > 0.0f
-                    ? "Floor correction: " + std::to_string(strength).substr(0, 4) +
-                          " (the clip's feet and hands are lifted above the game's floor)."
-                    : "Floor correction off: the clip's limbs are written as authored.");
+                    ? "Floor correction allowed: a clip that opted in (poseanim <file> ik) is placed on the "
+                      "game's floor before its takeoff and after its landing."
+                    : "Floor correction off for every clip: they are written as authored.");
             return;
         }
         if (lower(clip) == "trace") {
             const auto mode = args.size() > 1 ? std::get<std::string>(args[1]) : std::string{};
             const bool enabled = mode == "1" || lower(mode) == "on";
             skater::set_pose_trace(enabled);
-            out(enabled ? "Layer trace on: one geometry line every two seconds."
+            out(enabled ? "Layer trace on: one status line every two seconds in the log."
                         : "Layer trace off.");
             return;
         }

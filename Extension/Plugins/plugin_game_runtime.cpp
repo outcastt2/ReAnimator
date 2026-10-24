@@ -1843,7 +1843,14 @@ void tick_plugin_sounds(std::uintptr_t image_base, std::uintptr_t client, bool r
 }
 void tick_plugin_animation(std::uintptr_t image_base, std::uintptr_t client) noexcept {
     try {
-        if (the_game) the_game->tick_animation(image_base, client);
+        if (the_game) {
+            the_game->tick_animation(image_base, client);
+        } else {
+            // No plugin asked for the game object, so the animation layer has no other tick and a
+            // clip from the console (poseanim) would never be drawn. Run it here.
+            skater_animation::tick(image_base, local_skater_component(image_base, client),
+                                   !multiplayer::local_throwdown_active());
+        }
     } catch (...) {}
 }
 }

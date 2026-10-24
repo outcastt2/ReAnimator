@@ -1,181 +1,78 @@
 #include "custom_animation.h"
+
 #include "pose_layers.h"
+#include "Extension/AnimationStudio/anim_core.h"
 #include "Extension/Multiplayer/Remote/native_skater_internal.h"
-#include "Extension/Multiplayer/Remote/native_pose_layout.h"
-#include "Extension/Multiplayer/Remote/native_skater.h"
+#include "Extension/Skater/client_source_spawn.h"
 #include "Extension/Skater/no_bail.h"
-#include "Engine/Core/Platform/memory.h"
+#include "Extension/Skater/skater_animation.h"
 #include "Engine/Core/Log/logging.h"
 #include "Engine/Game/Build/addresses.h"
 #include "Engine/Game/Build/20260929/no_bail.h"
 #include "Engine/Game/Build/20260929/offboard_flight.h"
 #include <Windows.h>
+#include <algorithm>
 #include <array>
 #include <atomic>
-#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <format>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-// Route B: overwrite the local skater's output pose with a baked clip.
+// Custom animation playback, on the game's own animation system (skater_animation): this unit owns
+// the .rska file, the per-clip floor opt-in and the mask, and the game does the blending, the floor
+// and the drawing. Before ReSkate 2.1.2 this wrote the output pose itself; that pose override is
+// Animation Studio's now, and skater_animation owns the one listener it installs.
 namespace dingosdk::skater {
 namespace {
 namespace nsd = multiplayer::native_skater_detail;
 using nsd::ptr;
-using nsd::read;
 using nsd::readable;
 
-constexpr std::size_t skater_joint_bound = 512;
-constexpr std::uint16_t test_joint = 103; // head
-constexpr std::uint16_t test_spine_joint = 7; // a body joint in the head chain's ancestry
-constexpr std::size_t floats_per_joint = 10; // scale.xyz, quat.xyzw, pos.xyz
-constexpr std::uint32_t expected_skater_joints = 395;
-constexpr std::uint32_t max_record_frames = 1800; // 30 s at 60 Hz
+using anim_studio::Clip;
+using anim_studio::Joint;
 
-// ---------------------------------------------------------------------------
-// Masking: which joints the game keeps when a custom animation layers on top of
-// locomotion. The ranges and the write itself live in pose_layers.cpp, which is
-// checked on the host by Extension/Skater/Test/pose_layer_tests.cpp.
-//
-// A layer switch is ramped rather than cut, so starting to walk mid-gesture does
-// not snap the legs.
-constexpr ULONGLONG mask_ramp_ms = 200;
-// Above this the automatic mask decides the skater is walking or riding.
-constexpr float walking_speed = 0.6f;
+constexpr std::size_t floats_per_joint = 10;      // scale.xyz, quat.xyzw, pos.xyz
+constexpr std::uint32_t max_clip_frames = 100000;
+constexpr float clip_blend = 0.15f;               // in and out of a clip, seconds
+constexpr std::uint64_t mask_ramp_ms = 180;       // the automatic mask's ramp
+constexpr float test_seconds = 1.5f;              // the built-in test recording's length
+// The joints a clip leaves to the game under the mask. The spine at joint 42 owns 42..340: torso,
+// neck, head and both arms. Everything outside that -- the world placement at 1, the helper
+// clusters the engine hangs off it (2..6 and 375..394), the pelvis and both legs -- belongs to the
+// game (the ranges pose_layers documents and its test guards).
+constexpr std::uint32_t mask_first_joint = 42, mask_last_joint = 340;
 
-// How far below the game's own foot height a clip's foot may sit before the
-// floor correction lifts it. A hair above zero: the game plants its feet on
-// the surface, so anything under that is the clip sinking through it.
-constexpr float floor_margin = 0.01f;
-
-// The skater is on foot exactly when their motion state (core+0x3b0) is the
-// offboard flight state, which owns walking, sliding and falling. While riding,
-// that slot holds a different object with a different vtable -- the same check
-// the noclip code makes. A read that fails counts as "on the board": riding is
-// the common case, and masking is the safe way to be wrong there.
-bool skater_off_board(std::uintptr_t base, std::uintptr_t component) noexcept {
-    if (!base || !component) return false;
-    try {
-        const auto core = ptr(component, 0x70);
-        if (!core) return false;
-        const auto motion = ptr(core, 0x3b0);
-        return motion != 0 && ptr(motion) == base + addr::offboard_flight::offboard_flight_vtable;
-    } catch (...) {
-        return false;
-    }
-}
-
-// A clip is frames * joints * 10 floats.
-struct Clip {
-    std::uint32_t joints{}, frames{};
-    float fps{30.0f};
-    std::vector<float> data;
-};
-struct Playback {
-    std::mutex mutex;
-    Clip clip;
-    std::string clip_name, status;
-    std::atomic<bool> playing{};
-    std::atomic<bool> test{};
-    std::atomic<std::uintptr_t> component{};
-    std::atomic<std::uint64_t> writes{};
-    std::uintptr_t base{};
-    ULONGLONG started{};
-    bool pending{}, stop{}, pending_test{};
-    std::string pending_clip;
-    // The pose as it was when playback began, written back on stop so a write
-    // into an idle graph's output buffer does not outlive the animation.
-    std::vector<std::byte> saved_pose;
-    std::uint32_t saved_joints{};
-    // Recording: the live pose is captured as it is evaluated.
-    std::atomic<bool> recording{};
-    std::vector<float> record_data;
-    std::atomic<std::uint32_t> record_frames{};
-    std::uint32_t record_capacity{};
-    std::uint32_t record_joints{};
-    ULONGLONG record_started{};
-    float record_fps{60.0f};
-    bool dump_request{};
-    // Masking. `mask` is set from the console; the rest is only touched by the
-    // write path, which runs on the animation thread.
-    std::atomic<int> mask{static_cast<int>(PoseMask::automatic)};
-    float mask_weight{};
-    ULONGLONG mask_updated{};
-    std::array<float, 3> world_sample{};
-    ULONGLONG world_sampled{};
-    bool world_valid{};
-    float speed{};
-    bool moving{};
-    bool on_board{};
-    bool mask_engaged{};
-    std::uint32_t physics_state{UINT32_MAX};
-    bool offboard_motion{};
-    ULONGLONG summary_at{};
-    // Diagnostics. The geometry summary is off unless `poseanim trace 1` asks for
-    // it, and the handler cost is always measured: this tool runs inside the
-    // engine's frame, so it should be able to say what it costs.
+// poseanim's own state. What is drawn is the game's now; this says what to play.
+struct State {
+    std::mutex mutex;                 // name, recorded, floor_by_clip
+    std::string name;                 // what was asked for, for status
+    std::shared_ptr<const Clip> recorded;                 // the last recording, for "play"
+    std::unordered_map<std::string, bool> floor_by_clip;  // per clip: off unless asked for
+    bool test_pending{};              // "test": play the recording when it lands
     std::atomic<bool> trace{};
-    // Floor correction strength, 0..1. The game plants its own feet before the
-    // clip write; this is how hard a clip that sinks below them is lifted back.
-    std::atomic<float> ik{1.0f};
-    // Per-clip floor-correction opt-in ("poseanim dance ik"), remembered by
-    // clip name so a quickswap re-export played again keeps it. Correction is
-    // off by default per clip -- the analytic leg solve was janky in game on
-    // clips it wasn't tuned for, so a clip gets it only when asked for. Guarded
-    // by mutex; `active_ik` is the resolved value for the clip now playing.
-    std::unordered_map<std::string, bool> clip_ik;
-    std::atomic<bool> active_ik{};
-    // Floor-correction smoothing. The sampled ground (per-foot height, knee
-    // hint, sole pitch) is read from the game's live pose every frame and
-    // jitters; near a straight leg that jitter becomes several degrees of knee
-    // swing -- the jank seen in game. This is the running low-pass of that
-    // sample, carried across frames and reset when a clip starts. Only touched
-    // by the write path on the animation thread.
-    layers::FloorSample smoothed_floor{};
-    std::uint64_t floor_smoothed_at{};
-    std::atomic<std::uint64_t> handler_ticks{};
-    std::atomic<std::uint64_t> handler_peak{};
-    std::atomic<std::uint32_t> handler_frames{};
+    std::atomic<float> ik{1.0f};      // 0 turns the game's floor solve off, even for a clip that opted in
+    std::atomic<int> mask{static_cast<int>(PoseMask::automatic)};
+    // The automatic mask's ramp. The client thread's only (tick_pose_playback).
+    float mask_weight{};
+    std::uint64_t mask_at{};
+    float mask_applied{-1.0f};
+    int mask_applied_mode{-1};
+    std::atomic<bool> dump_request{};
 };
-Playback &playback() { static Playback p; return p; }
-std::mutex &status_mutex() { static std::mutex m; return m; }
+State& state() { static State s; return s; }
 
-// The performance counter's frequency, read once. Every frame this tool spends
-// inside the engine is measured against it.
-std::uint64_t performance_frequency() noexcept {
-    static const std::uint64_t value = [] {
-        LARGE_INTEGER frequency{};
-        return static_cast<std::uint64_t>(QueryPerformanceFrequency(&frequency) && frequency.QuadPart > 0
-                                              ? frequency.QuadPart
-                                              : 1);
-    }();
-    return value;
-}
-// Times the per-frame handler and folds the result into the playback record.
-struct HandlerTimer {
-    Playback &owner;
-    LARGE_INTEGER begin{};
-    explicit HandlerTimer(Playback &value) noexcept : owner(value) { QueryPerformanceCounter(&begin); }
-    ~HandlerTimer() noexcept {
-        LARGE_INTEGER end{};
-        QueryPerformanceCounter(&end);
-        const auto elapsed = static_cast<std::uint64_t>(end.QuadPart - begin.QuadPart);
-        owner.handler_ticks.fetch_add(elapsed, std::memory_order_relaxed);
-        owner.handler_frames.fetch_add(1, std::memory_order_relaxed);
-        auto peak = owner.handler_peak.load(std::memory_order_relaxed);
-        while (elapsed > peak &&
-               !owner.handler_peak.compare_exchange_weak(peak, elapsed, std::memory_order_relaxed)) {
-        }
-    }
-};
-void set_status(const std::string &text) {
+std::mutex& status_mutex() { static std::mutex m; return m; }
+std::string& status_text() { static std::string s; return s; }
+void set_status(std::string text) {
     std::lock_guard lock(status_mutex());
-    playback().status = text;
+    status_text() = std::move(text);
 }
 
 // The game directory, from this process's own module path.
@@ -185,14 +82,14 @@ std::filesystem::path game_directory() {
     if (!count || count >= buffer.size()) return {};
     return std::filesystem::path(buffer.data()).parent_path();
 }
-// Clips live in <game>/CustomAnimations, so a bare name is enough. The console
-// treats a backslash as an escape, so forward slashes are accepted and a name
-// with no directory is looked up in that folder. `.rska` is assumed when the
-// name has no extension.
+
+// Clips live in <game>/CustomAnimations, so a bare name is enough. The console treats a backslash
+// as an escape, so forward slashes are accepted and a name with no directory is looked up there.
+// `.rska` is assumed when the name has no extension.
 std::filesystem::path resolve_clip_path(std::string_view name, bool for_write) {
     std::wstring text;
     for (const char c : name) text.push_back(static_cast<unsigned char>(c) < 128 ? wchar_t(c) : L'?');
-    for (auto &c : text) if (c == L'/') c = L'\\';
+    for (auto& c : text) if (c == L'/') c = L'\\';
     std::filesystem::path path(text);
     if (!path.has_parent_path()) {
         const auto directory = game_directory() / L"CustomAnimations";
@@ -206,440 +103,122 @@ std::filesystem::path resolve_clip_path(std::string_view name, bool for_write) {
     return path;
 }
 
-bool load_clip(const std::filesystem::path &path, Clip &clip, std::string &error) {
+// An .rska clip: 20-byte header ("RSKA", version 1, joints, frames, fps) then frames * joints * 10
+// floats, scale.xyz quat.xyzw pos.xyz, parent-local. It is anim_studio::Clip's shape already, so the
+// read is a repack: seconds from the frame rate, one Joint per joint per frame.
+bool load_rska(const std::filesystem::path& path, Clip& clip, std::string& error) {
     std::ifstream in(path, std::ios::binary);
     if (!in) { error = "cannot open " + path.string(); return false; }
     std::array<char, 20> header{};
     in.read(header.data(), header.size());
     if (in.gcount() != static_cast<std::streamsize>(header.size()) || std::memcmp(header.data(), "RSKA", 4) != 0) {
-        error = "not an .rska clip";
+        error = "not an .rska clip: " + path.string();
         return false;
     }
-    std::uint32_t version{}, joints{}, frames{};
+    std::uint32_t version{}, joints{}, frame_count{};
     float fps{};
     std::memcpy(&version, header.data() + 4, 4);
     std::memcpy(&joints, header.data() + 8, 4);
-    std::memcpy(&frames, header.data() + 12, 4);
+    std::memcpy(&frame_count, header.data() + 12, 4);
     std::memcpy(&fps, header.data() + 16, 4);
-    if (version != 1 || joints == 0 || joints > skater_joint_bound || frames == 0 || frames > 100000 ||
-        !(fps > 0.0f && fps <= 240.0f)) {
-        error = "unsupported clip header";
+    if (version != 1 || frame_count == 0 || frame_count > max_clip_frames || !(fps > 0.0f && fps <= 240.0f)) {
+        error = "unsupported clip header in " + path.string();
         return false;
     }
+    if (joints != anim_studio::skeleton_joints) {
+        error = "the clip has " + std::to_string(joints) + " joints; the skater's animation output has " +
+                std::to_string(anim_studio::skeleton_joints);
+        return false;
+    }
+    std::vector<float> data(static_cast<std::size_t>(frame_count) * joints * floats_per_joint);
+    in.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size() * sizeof(float)));
+    if (in.gcount() != static_cast<std::streamsize>(data.size() * sizeof(float))) {
+        error = "clip data is truncated in " + path.string();
+        return false;
+    }
+    clip = {};
     clip.joints = joints;
-    clip.frames = frames;
-    clip.fps = fps;
-    clip.data.resize(static_cast<std::size_t>(frames) * joints * floats_per_joint);
-    in.read(reinterpret_cast<char *>(clip.data.data()), static_cast<std::streamsize>(clip.data.size() * sizeof(float)));
-    if (in.gcount() != static_cast<std::streamsize>(clip.data.size() * sizeof(float))) {
-        error = "clip data is truncated";
+    clip.times.resize(frame_count);
+    clip.frames.resize(static_cast<std::size_t>(frame_count) * joints);
+    for (std::uint32_t f = 0; f < frame_count; ++f) {
+        clip.times[f] = static_cast<float>(f) / fps;
+        const float* src = data.data() + static_cast<std::size_t>(f) * joints * floats_per_joint;
+        Joint* dst = clip.frames.data() + static_cast<std::size_t>(f) * joints;
+        for (std::uint32_t j = 0; j < joints; ++j, src += floats_per_joint) {
+            Joint joint;
+            joint.scale = {src[0], src[1], src[2]};
+            joint.rotation = {src[3], src[4], src[5], src[6]};
+            joint.position = {src[7], src[8], src[9]};
+            if (!anim_studio::finite(joint)) {
+                error = "the clip has a non-finite joint at frame " + std::to_string(f) + ", joint " + std::to_string(j);
+                return false;
+            }
+            dst[j] = joint;
+        }
+    }
+    return true;
+}
+
+// Is the local skater off the board? The selector's own motion object carries the off-board vtable
+// while he walks, and the board's while he rides.
+bool skater_off_board(std::uintptr_t base, std::uintptr_t component) noexcept {
+    if (!base || !component) return false;
+    try {
+        const auto core = ptr(component, 0x70);
+        if (!core) return false;
+        const auto motion = ptr(core, 0x3b0);
+        return motion != 0 && ptr(motion) == base + addr::offboard_flight::offboard_flight_vtable;
+    } catch (...) {
         return false;
     }
-    return true;
 }
 
-// The output pose buffer for a component, or {0, 0}.
-struct PoseLocation {
-    std::uintptr_t buffer{};
-    std::uint32_t joints{};
-};
-PoseLocation pose_location(std::uintptr_t base, std::uintptr_t component) {
-    std::uintptr_t holder{};
-    if (!readable(component + 0xa0, &holder, 8) || !holder) return {};
-    const auto reader = [](std::uintptr_t address, void *out, std::size_t size) {
-        return readable(address, out, size);
-    };
-    const auto pose = multiplayer::read_native_pose_layout(reader, base, holder, skater_joint_bound);
-    return {pose.buffer, pose.count};
+// ---- the mask -------------------------------------------------------------------------------------
+// Per joint, how much of the game's own pose to keep: 1 is the game's, 0 is the clip's.
+std::shared_ptr<const std::vector<float>> build_mask(float keep) {
+    if (!(keep > 0.0f)) return {};
+    std::vector<float> joints(anim_studio::skeleton_joints, 0.0f);
+    for (std::uint16_t j = 0; j < anim_studio::skeleton_joints; ++j)
+        if (j < mask_first_joint || j > mask_last_joint) joints[j] = keep;
+    return std::make_shared<const std::vector<float>>(std::move(joints));
 }
 
-// The rig handed to the post-physics response is the physics rig, not the
-// animation rig: no_bail's own resolution reads core = *(component + 0x70),
-// rig = *(core + 0x438), and verifies *(rig + 0x4630) == core.
-bool rig_is_local(std::uintptr_t rig, std::uintptr_t component) {
-    if (!rig || !component) return false;
-    const auto core = ptr(component, 0x70);
-    return core && ptr(rig, 0x4630) == core;
+// Push the mask the mode and the ramp call for, when it changed. The client thread's.
+void apply_mask() {
+    auto& s = state();
+    const auto mode = static_cast<PoseMask>(s.mask.load(std::memory_order_relaxed));
+    const float keep = mode == PoseMask::legs ? 1.0f : mode == PoseMask::automatic ? s.mask_weight : 0.0f;
+    if (static_cast<int>(mode) == s.mask_applied_mode && std::fabs(keep - s.mask_applied) < 0.01f) return;
+    s.mask_applied_mode = static_cast<int>(mode);
+    s.mask_applied = keep;
+    skater_animation::set_mask(build_mask(keep));
 }
 
-// The local skater's animation component, or 0.
-std::uintptr_t local_component(std::uintptr_t base, std::uintptr_t client) {
-    try {
-        nsd::require(ptr(client) == base + addr::engine::client_vtable, "Local client is unavailable.");
-        const auto context = ptr(client, 8);
-        const auto offset = read<std::uint32_t>(base, addr::engine::context_player_manager_offset);
-        nsd::require(offset <= 0x1000000, "Player manager offset changed.");
-        const auto manager = ptr(context, offset);
-        const auto begin = ptr(manager, 0x4c8);
-        const auto player = ptr(begin);
-        const auto entity = ptr(player, 0xb8);
-        return ptr(entity, 0x628);
-    } catch (...) {
-        return 0;
-    }
+// ---- playback -------------------------------------------------------------------------------------
+bool floor_enabled(const std::string& name) {
+    auto& s = state();
+    if (!(s.ik.load(std::memory_order_relaxed) > 0.0f)) return false;
+    std::lock_guard lock(s.mutex);
+    const auto it = s.floor_by_clip.find(name);
+    return it != s.floor_by_clip.end() && it->second;
 }
 
-// The silent side of local_component: which link in the chain broke, each step
-// checked against its expected vtable. Silence here was the one failure the
-// logs could not name, and it is the first suspect when playback stops
-// responding to the console.
-std::string local_component_debug(std::uintptr_t base, std::uintptr_t client) noexcept {
-    const auto mark = [](bool match) { return match ? "ok" : "MISMATCH"; };
-    try {
-        const auto client_vtable = ptr(client);
-        const auto context = ptr(client, 8);
-        const auto offset = read<std::uint32_t>(base, addr::engine::context_player_manager_offset);
-        const auto manager = context && offset <= 0x1000000 ? ptr(context, offset) : 0;
-        const auto manager_vtable = manager ? ptr(manager) : 0;
-        const auto begin = manager ? ptr(manager, 0x4c8) : 0;
-        const auto end = manager ? ptr(manager, 0x4d0) : 0;
-        const auto player = begin ? ptr(begin) : 0;
-        const auto player_vtable = player ? ptr(player) : 0;
-        const auto entity = player ? ptr(player, 0xb8) : 0;
-        const auto entity_vtable = entity ? ptr(entity) : 0;
-        const auto component = entity ? ptr(entity, 0x628) : 0;
-        const auto component_vtable = component ? ptr(component) : 0;
-        return std::format(
-            "client={:#x} vtable={} context={:#x} manager={:#x} vtable={} begin={:#x} end={:#x} span={} "
-            "player={:#x} vtable={} entity={:#x} vtable={} component={:#x} vtable={}",
-            client, mark(client_vtable == base + addr::engine::client_vtable), context, manager,
-            mark(manager_vtable == base + addr::engine::local_player_manager_vtable), begin, end,
-            mark(end >= begin && end - begin == 8), player,
-            mark(player_vtable == base + addr::engine::local_player_vtable), entity,
-            mark(entity_vtable == base + addr::engine::skater_entity_vtable), component,
-            mark(component_vtable == base + addr::engine::skater_component_vtable));
-    } catch (const std::exception &e) {
-        return std::string("chain read failed: ") + e.what();
-    } catch (...) {
-        return "chain read failed";
-    }
+void play_clip(std::shared_ptr<const Clip> clip, const std::string& name, float at, bool loop) {
+    skater_animation::Play play;
+    play.clip = std::move(clip);
+    play.speed = 1.0f;
+    play.blend = clip_blend;
+    play.loop = loop;
+    play.at = at;
+    play.paused = false;
+    play.floor = floor_enabled(name);
+    skater_animation::play(std::move(play));
 }
 
-// How much of the game's own pose to keep for the masked joints, ramped so a
-// layer switch is a blend rather than a cut.
-float mask_weight(Playback &p, ULONGLONG now) noexcept {
-    const auto mode = static_cast<PoseMask>(p.mask.load(std::memory_order_relaxed));
-    bool engaged = false;
-    if (mode == PoseMask::legs) engaged = true;
-    else if (mode == PoseMask::automatic) engaged = p.on_board || p.moving;
-    if (engaged != p.mask_engaged) {
-        p.mask_engaged = engaged;
-        logging::log(logging::Level::info, logging::Channel::skater,
-                     "Custom animation: mask {} (on board {}, state {}, moving {}, {:.2f} m/s).",
-                     engaged ? "engaged" : "released", p.on_board, p.physics_state, p.moving, p.speed);
-    }
-    const auto elapsed = now > p.mask_updated ? now - p.mask_updated : 0;
-    p.mask_updated = now;
-    p.mask_weight = layers::ramp_weight(p.mask_weight, engaged ? 1.0f : 0.0f, elapsed, mask_ramp_ms);
-    return p.mask_weight;
-}
-} // namespace
-
-// Packs one evaluated pose into the clip format: scale.xyz, quat.xyzw, pos.xyz.
-namespace {
-void pack_frame(std::uintptr_t buffer, std::uint32_t joints, float *out) noexcept {
-    std::array<std::byte, expected_skater_joints * 0x30> raw{};
-    const auto bytes = static_cast<std::size_t>(joints) * 0x30;
-    if (bytes > raw.size() || !readable(buffer, raw.data(), bytes)) return;
-    for (std::uint32_t j = 0; j < joints; ++j) {
-        const auto *bone = reinterpret_cast<const float *>(raw.data() + static_cast<std::size_t>(j) * 0x30);
-        float *dst = out + static_cast<std::size_t>(j) * floats_per_joint;
-        dst[0] = bone[0]; dst[1] = bone[1]; dst[2] = bone[2];
-        dst[3] = bone[4]; dst[4] = bone[5]; dst[5] = bone[6]; dst[6] = bone[7];
-        dst[7] = bone[8]; dst[8] = bone[9]; dst[9] = bone[10];
-    }
-}
-} // namespace
-
-// Writes the current frame of whatever is playing. Shared by the animation
-// callback (which the engine's own constraints later rewrite) and the
-// post-physics skeleton response, after which the write survives.
-namespace {
-// A joint's world position relative to joint 1, composed the way the engine
-// composes a pose. A normal ride holds the ankles about 0.86 m below joint 1, so
-// one log line says whether the pose being kept is a real stance.
-bool pose_offset(std::uintptr_t buffer, const std::uint32_t *chain, std::size_t count, float out[3]) noexcept {
-    float origin[3]{}, world[3]{};
-    const std::uint32_t root[] = {1};
-    if (!layers::world_position(buffer, root, 1, origin)) return false;
-    if (!layers::world_position(buffer, chain, count, world)) return false;
-    for (int c = 0; c < 3; ++c) out[c] = world[c] - origin[c];
-    return true;
-}
-
-// How the game is moving the skater, sampled once per frame from the pose the
-// engine just produced. Joint 1 carries world placement and the game writes it
-// every frame, so its speed is the skater's speed; the motion state says
-// whether they are on foot.
-void sample_motion(Playback &p, const PoseLocation &pose, std::uintptr_t component) noexcept {
-    const auto now = GetTickCount64();
-    if (pose.buffer && pose.joints > 1) {
-        std::array<float, 3> world{};
-        if (readable(pose.buffer + 0x30ULL + 0x20ULL, world.data(), sizeof(world))) {
-            if (p.world_valid && now > p.world_sampled) {
-                const float dt = static_cast<float>(now - p.world_sampled) / 1000.0f;
-                if (dt > 1e-3f) {
-                    const float dx = world[0] - p.world_sample[0];
-                    const float dy = world[1] - p.world_sample[1];
-                    const float dz = world[2] - p.world_sample[2];
-                    const float instant = std::sqrt(dx * dx + dy * dy + dz * dz) / dt;
-                    p.speed = 0.7f * p.speed + 0.3f * std::min(instant, 50.0f);
-                }
-            }
-            p.world_sample = world;
-            p.world_sampled = now;
-            p.world_valid = true;
-        }
-    }
-    // Hysteresis: once walking, keep believing it until the speed really drops,
-    // so a skater hovering around the threshold does not flicker between layers.
-    p.moving = p.speed > (p.moving ? walking_speed * 0.5f : walking_speed);
-    // The physics state machine is the truth for "on foot": 504 is walking and
-    // 300 is a ground wipeout (the engine remaps between them), so anything else
-    // means riding. The motion object is sampled too -- it is the other way to
-    // ask the same question, and the log says when the two disagree.
-    const auto state = observed_physics_state();
-    p.physics_state = state;
-    p.offboard_motion = skater_off_board(p.base, component);
-    // Until the selector has chosen once, fall back to the motion object.
-    p.on_board = state == UINT32_MAX
-        ? !p.offboard_motion
-        : !(state == addr::no_bail::offboard_physics_state || state == addr::no_bail::wipeout_physics_state);
-    // A geometry summary, only when tracing: one line says what the layer
-    // decided and where the legs it kept actually are. Off by default, because
-    // a clip that plays for minutes does not need to narrate itself.
-    if (p.trace.load(std::memory_order_relaxed) && now >= p.summary_at + 2000 && pose.buffer) {
-        p.summary_at = now;
-        const std::uint32_t pelvis_chain[] = {1, 7};
-        const std::uint32_t left_chain[] = {1, 7, 8, 9, 10};
-        const std::uint32_t right_chain[] = {1, 7, 341, 342, 343};
-        float pelvis[3]{}, left[3]{}, right[3]{};
-        const bool has_pelvis = pose_offset(pose.buffer, pelvis_chain, 2, pelvis);
-        const bool has_left = pose_offset(pose.buffer, left_chain, 5, left);
-        const bool has_right = pose_offset(pose.buffer, right_chain, 5, right);
-        logging::log(logging::Level::info, logging::Channel::skater,
-                     "Custom animation: layer: state={} on_board={} moving={} speed={:.2f} m/s mask={:.2f} "
-                     "pelvis=({:.3f},{:.3f},{:.3f}) L_ankle=({:.3f},{:.3f},{:.3f}) R_ankle=({:.3f},{:.3f},{:.3f})",
-                     p.physics_state, p.on_board, p.moving, p.speed, p.mask_weight,
-                     has_pelvis ? pelvis[0] : 0.0f, has_pelvis ? pelvis[1] : 0.0f, has_pelvis ? pelvis[2] : 0.0f,
-                     has_left ? left[0] : 0.0f, has_left ? left[1] : 0.0f, has_left ? left[2] : 0.0f,
-                     has_right ? right[0] : 0.0f, has_right ? right[1] : 0.0f, has_right ? right[2] : 0.0f);
-    }
-}
-
-void write_current(Playback &p, std::uintptr_t buffer, std::uint32_t available_joints) noexcept {
-    if (!p.playing.load(std::memory_order_acquire) || !buffer) return;
-    const auto note_write = [&p] {
-        const auto count = p.writes.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (count == 1 || count == 10 || count == 100 || count == 1000 || count == 10000)
-            logging::log(logging::Level::info, logging::Channel::skater,
-                         "Custom animation: pose written ({} times).", count);
-    };
-    const auto elapsed_ms = GetTickCount64() - p.started;
-    if (p.test.load(std::memory_order_relaxed)) {
-        const float phase = static_cast<float>(elapsed_ms) * 0.003f;
-        // Head scale: the operation first person uses to hide the head.
-        std::array<float, 12> head{};
-        if (readable(buffer + test_joint * 0x30ULL, head.data(), sizeof(head))) {
-            const float scale = 0.5f + 0.45f * std::sin(phase);
-            head[0] = head[1] = head[2] = scale;
-            (void)nsd::write(buffer + test_joint * 0x30ULL, head.data(), sizeof(head));
-        }
-        // A rotation on a body joint, to show whether rotations survive.
-        std::array<float, 12> spine{};
-        if (readable(buffer + test_spine_joint * 0x30ULL, spine.data(), sizeof(spine))) {
-            const float angle = 1.0f * std::sin(phase);
-            const float half = angle * 0.5f, s = std::sin(half), c = std::cos(half);
-            const float qx = spine[4], qy = spine[5], qz = spine[6], qw = spine[7];
-            spine[4] = qw * s + qx * c;
-            spine[5] = qy * c + qz * s;
-            spine[6] = qz * c - qy * s;
-            spine[7] = qw * c - qx * s;
-            (void)nsd::write(buffer + test_spine_joint * 0x30ULL, spine.data(), sizeof(spine));
-        }
-        note_write();
-        return;
-    }
-    std::lock_guard lock(p.mutex);
-    if (p.clip.frames == 0 || p.clip.data.empty() || p.clip.joints <= 2) return;
-    // Never write past the pose the engine handed us: a joint body is 0x30 bytes
-    // and the buffer holds `available_joints` of them. A clip authored against a
-    // longer skeleton must not run off the end of a shorter one.
-    auto clip_joints = p.clip.joints;
-    if (available_joints && clip_joints > available_joints) clip_joints = available_joints;
-    if (clip_joints <= 2) return;
-    // Where the clip is now, as a fraction of a frame. A clip is authored at its
-    // own rate (24 fps is normal for these) and the game runs at 60 Hz, so the
-    // two frames around this point are interpolated rather than snapped to --
-    // and when the point is the last frame of the clip, the pair wraps to the
-    // first, which closes the loop without a jump.
-    const double position = static_cast<double>(elapsed_ms) * p.clip.fps / 1000.0;
-    const auto frame = static_cast<std::uint32_t>(std::fmod(position, static_cast<double>(p.clip.frames)));
-    const auto next = (frame + 1) % p.clip.frames;
-    const auto alpha = static_cast<float>(position - std::floor(position));
-    // Joints 0 and 1 are not pose: joint 1 carries the skater's world
-    // placement, and the game drives it from the board and physics. Leaving it
-    // alone is what keeps the skater on the board, the way a gesture animates
-    // in place while the player keeps moving.
-    //
-    // The legs and pelvis are the same story whenever the mask is engaged: the
-    // engine's own pose for them stays, so the feet keep the board and the walk
-    // keeps walking.
-    const auto keep = mask_weight(p, GetTickCount64());
-    // The game's feet are the floor: sample them before the clip overwrites
-    // the legs. The engine's gesture IK has already planted them on the board
-    // or the ground, so per foot they carry the surface that foot stands on
-    // -- plus the way each knee bends and each sole pitches, which is what a
-    // straight-legged or mirrored clip cannot answer for itself.
-    layers::FloorSample floor{};
-    // Per clip, correction is opt-in: only a clip flagged with "poseanim
-    // <file> ik" gets any. The global strength still scales it.
-    const auto ik = p.active_ik.load(std::memory_order_relaxed)
-                        ? p.ik.load(std::memory_order_relaxed)
-                        : 0.0f;
-    const bool have_floor = ik > 0.0f && layers::sample_floors(buffer, floor);
-    // Low-pass the sampled ground across frames. The game's pose jitters a
-    // little every frame; near a straight leg that jitter amplifies into knee
-    // swing. A ~90 ms time constant (60 Hz, alpha 0.25) hides the noise while
-    // still tracking a real surface change (stepping onto a ledge) within a
-    // few frames. Reset when the sample was invalid or playback just started.
-    if (have_floor) {
-        const auto now = GetTickCount64();
-        const auto elapsed = p.floor_smoothed_at ? static_cast<unsigned>(now - p.floor_smoothed_at) : 1000u;
-        p.floor_smoothed_at = now;
-        // blend = 1 - exp(-dt/tau); approximated for small dt/tau, clamped.
-        const float tau = 90.0f;
-        const float blend_alpha = elapsed >= 1000u ? 1.0f : static_cast<float>(1.0 - std::exp(-static_cast<double>(elapsed) / tau));
-        floor = layers::smooth_floor(p.smoothed_floor, floor, blend_alpha);
-        p.smoothed_floor = floor;
-    } else {
-        p.smoothed_floor = {};
-        p.floor_smoothed_at = 0;
-    }
-    const auto *frames = p.clip.data.data();
-    layers::write_pose_interpolated(buffer + 2 * layers::pose_stride,
-                                    frames + static_cast<std::size_t>(frame) * p.clip.joints * floats_per_joint +
-                                        2 * floats_per_joint,
-                                    frames + static_cast<std::size_t>(next) * p.clip.joints * floats_per_joint +
-                                        2 * floats_per_joint,
-                                    alpha, 2, clip_joints - 2, keep);
-    // Then correct whatever the clip drove against the sampled ground: each
-    // foot against its own floor (so a stance straddling a ledge comes out
-    // right), the spine and head clear of the floor plane, and the hands.
-    if (have_floor) layers::apply_floor(buffer, floor, floor_margin, ik, keep);
-    note_write();
-}
-} // namespace
-
-// Deliberately does nothing.
-//
-// This runs after the animation graph and *before* the engine's physics
-// response, and on this game that response is the ragdoll: it re-solves the
-// rendered pose from the physics, driven by the pose that is in the buffer.
-// Writing the clip here -- which the playback used to do -- feeds the clip's
-// upper body into that solve, and the solve answers with a different lower
-// body: a crouch with the feet off the board, which is exactly what survived
-// when the mask was keeping the game's legs.
-//
-// The write that matters is the one after the response, so the physics only
-// ever sees the game's own animation and the clip is applied on top of a body
-// the engine is happy with.
-void on_pose_evaluated(std::uintptr_t component) noexcept {
-    (void)component;
-}
-
-// Runs after the engine's own post-physics constraints, on the same update
-// order. This is the write that survives to the renderer.
-void on_skeleton_responded(std::uintptr_t rig) noexcept {
-    HandlerTimer measured(playback());
-    try {
-        auto &p = playback();
-        if (!rig) return;
-        const auto component = p.component.load(std::memory_order_acquire);
-        if (!rig_is_local(rig, component)) return;
-        const auto pose = pose_location(p.base, component);
-        if (!pose.buffer) return;
-        sample_motion(p, pose, component);
-        if (p.recording.load(std::memory_order_acquire)) {
-            // Record AFTER the engine's constraints, so a replay reproduces the
-            // pose that was actually rendered (feet on the board and all).
-            const auto frame = p.record_frames.load(std::memory_order_relaxed);
-            if (frame < p.record_capacity && pose.joints) {
-                auto *dst = p.record_data.data() + static_cast<std::size_t>(frame) * pose.joints * floats_per_joint;
-                pack_frame(pose.buffer, pose.joints, dst);
-                p.record_frames.store(frame + 1, std::memory_order_release);
-                if (frame == 0) {
-                    p.record_joints = pose.joints;
-                    logging::log(logging::Level::info, logging::Channel::skater,
-                                 "Custom animation: recording {} joints.", pose.joints);
-                }
-            }
-            return;
-        }
-        write_current(p, pose.buffer, pose.joints);
-    } catch (...) {
-    }
-}
-
-void request_pose_playback(std::string clip) {
-    // ReSkate 2.1.2 replaced the pose-override listener with one slot owned by
-    // Extension/Skater/skater_animation.cpp, so this build cannot register one.
-    // The playback core is being ported onto that system; until it lands, say so
-    // rather than loading a clip that would never be drawn.
-    (void)clip;
-    logging::log(logging::Level::warning, logging::Channel::skater,
-                 "Custom animation: playback is being ported to ReSkate 2.1.2's animation system; unavailable on this build.");
-    set_status("Custom animation: unavailable on this build - playback is being ported to ReSkate 2.1.2's animation system.");
-}
-void request_pose_playback_stop() {
-    std::lock_guard lock(playback().mutex);
-    playback().stop = true;
-    playback().pending = false;
-}
-void request_pose_record() { request_pose_playback("record"); }
-void request_pose_record_playback() { request_pose_playback("play"); }
-
-std::string save_recorded_clip(std::string_view path) {
-    try {
-        auto &p = playback();
-        const auto frames = p.record_frames.load(std::memory_order_acquire);
-        const auto joints = p.record_joints;
-        if (frames < 2 || joints <= 2) return "nothing has been recorded yet";
-        const auto resolved = resolve_clip_path(path, true);
-        std::ofstream out(resolved, std::ios::binary | std::ios::trunc);
-        if (!out) return "cannot write " + resolved.string();
-        std::array<char, 20> header{};
-        const std::uint32_t version = 1;
-        const float fps = p.record_fps;
-        std::memcpy(header.data(), "RSKA", 4);
-        std::memcpy(header.data() + 4, &version, 4);
-        std::memcpy(header.data() + 8, &joints, 4);
-        std::memcpy(header.data() + 12, &frames, 4);
-        std::memcpy(header.data() + 16, &fps, 4);
-        out.write(header.data(), header.size());
-        out.write(reinterpret_cast<const char *>(p.record_data.data()),
-                  static_cast<std::streamsize>(static_cast<std::size_t>(frames) * joints * floats_per_joint *
-                                               sizeof(float)));
-        out.close();
-        logging::log(logging::Level::info, logging::Channel::skater,
-                     "Custom animation: saved {} frames x {} joints to {}.", frames, joints, resolved.string());
-        return {};
-    } catch (const std::exception &e) {
-        return std::string("save failed: ") + e.what();
-    }
-}
-
-void request_skeleton_dump() {
-    std::lock_guard lock(playback().mutex);
-    playback().dump_request = true;
-}
-
-namespace {
-// The live skeleton resource, beside the log. Read-only: this is the only place
-// the joint hierarchy and the bind pose can come from, and neither is in the
-// pose buffer.
+// The skeleton resource beside the log (read-only): the joint names and parents a clip is written
+// against, for when a clip lands on the wrong joints.
 std::string write_skeleton_dump(std::uintptr_t base, std::uintptr_t client) {
-    const auto component = local_component(base, client);
+    const auto component = local_skater_component(base, client);
     if (!component) return "the local skater's animation component is unavailable.";
     std::uintptr_t holder{};
     if (!readable(component + 0xa0, &holder, 8) || !holder) return "the animation holder is unavailable.";
@@ -657,329 +236,248 @@ std::string write_skeleton_dump(std::uintptr_t base, std::uintptr_t client) {
     const auto path = logging::status().directory / L"skeleton_dump.bin";
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     if (!out) return "cannot write the skeleton dump.";
-    out.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     out.close();
     logging::log(logging::Level::info, logging::Channel::skater,
                  "Skeleton dump: component={:#x} holder={:#x} rig={:#x} definition={:#x} resource={:#x} joints={}.",
                  component, holder, rig, definition, resource, count);
-    return "Skeleton dumped: " + std::to_string(count) + " joints at resource 0x" + std::to_string(resource) +
-           " -> skeleton_dump.bin";
+    return "Skeleton dumped: " + std::to_string(count) + " joints -> skeleton_dump.bin";
 }
+
 } // namespace
-std::string pose_playback_status() {
-    std::lock_guard lock(status_mutex());
-    return playback().status;
+
+// ---- the console surface --------------------------------------------------------------------------
+void request_pose_playback(std::string name) {
+    auto& s = state();
+    if (name == "test") {
+        // No file: record a moment of the live pose and loop it. It exercises the whole path
+        // (record -> clip -> play -> draw) on the machine it runs on.
+        if (!skater_animation::record(test_seconds)) {
+            set_status("Custom animation: a recording is already running.");
+            return;
+        }
+        {
+            std::lock_guard lock(s.mutex);
+            s.test_pending = true;
+            s.name = "test";
+        }
+        set_status("Custom animation: recording the test clip...");
+        return;
+    }
+    Clip loaded;
+    std::string error;
+    const auto path = resolve_clip_path(name, false);
+    if (!load_rska(path, loaded, error)) {
+        set_status("Custom animation: " + error);
+        logging::log(logging::Level::warning, logging::Channel::skater, "Custom animation: cannot play \"{}\": {}.",
+                     name, error);
+        return;
+    }
+    auto clip = std::make_shared<const Clip>(std::move(loaded));
+    {
+        std::lock_guard lock(s.mutex);
+        s.name = name;
+        s.test_pending = false;
+    }
+    const bool floor = floor_enabled(name);
+    play_clip(clip, name, 0.0f, true);
+    set_status(std::format("Custom animation: playing \"{}\" ({} frames, {:.2f} s{}{}).", name, clip->times.size(),
+                           clip->duration(), floor ? ", on the floor" : "",
+                           static_cast<PoseMask>(s.mask.load(std::memory_order_relaxed)) == PoseMask::full ? "" :
+                               ", legs masked"));
 }
 
-std::string pose_playback_cost() {
-    auto &p = playback();
-    const auto frames = p.handler_frames.load(std::memory_order_relaxed);
-    if (!frames) return "Animation handler: not measured yet.";
-    const auto frequency = static_cast<double>(performance_frequency());
-    const auto average_us = 1e6 * static_cast<double>(p.handler_ticks.load(std::memory_order_relaxed)) / frequency /
-                            static_cast<double>(frames);
-    const auto peak_us = 1e6 * static_cast<double>(p.handler_peak.load(std::memory_order_relaxed)) / frequency;
-    // A 60 Hz frame is 16.67 ms; the share of one is the number that matters.
-    const auto share = average_us / 16666.7 * 100.0;
-    return std::format(
-        "Animation handler: {:.1f} us average, {:.1f} us worst, over {} frames ({:.3f}% of a 60 Hz frame).",
-        average_us, peak_us, frames, share);
+void request_pose_playback_stop() {
+    auto& s = state();
+    skater_animation::play(std::nullopt);
+    {
+        std::lock_guard lock(s.mutex);
+        s.name.clear();
+        s.test_pending = false;
+    }
+    set_status("Custom animation: stopped.");
 }
-
-void set_pose_trace(bool enabled) noexcept { playback().trace.store(enabled, std::memory_order_relaxed); }
-bool pose_trace() { return playback().trace.load(std::memory_order_relaxed); }
-void set_pose_ik(float strength) noexcept {
-    const float clamped = strength < 0.0f ? 0.0f : (strength > 1.0f ? 1.0f : strength);
-    playback().ik.store(clamped, std::memory_order_relaxed);
-}
-float pose_ik() noexcept { return playback().ik.load(std::memory_order_relaxed); }
-
-namespace {
-// The key a per-clip override is remembered by: the name as typed, folded to
-// one case, so "poseanim Sit ik" and "poseanim sit" agree.
-std::string clip_key(std::string_view clip) {
-    std::string key(clip);
-    for (char &c : key) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return key;
-}
-} // namespace
 
 void set_pose_clip_ik(std::string_view clip, bool ik) noexcept {
-    auto &p = playback();
-    std::lock_guard lock(p.mutex);
-    p.clip_ik[clip_key(clip)] = ik;
+    try {
+        auto& s = state();
+        std::lock_guard lock(s.mutex);
+        s.floor_by_clip[std::string(clip)] = ik;
+    } catch (...) {}
 }
+
 bool pose_clip_ik(std::string_view clip) noexcept {
-    auto &p = playback();
-    std::lock_guard lock(p.mutex);
-    const auto found = p.clip_ik.find(clip_key(clip));
-    return found != p.clip_ik.end() && found->second;
+    try {
+        auto& s = state();
+        std::lock_guard lock(s.mutex);
+        const auto it = s.floor_by_clip.find(std::string(clip));
+        return it != s.floor_by_clip.end() && it->second;
+    } catch (...) {
+        return false;
+    }
 }
 
 void set_pose_mask(PoseMask mask) noexcept {
-    auto &p = playback();
-    p.mask.store(static_cast<int>(mask), std::memory_order_relaxed);
-    // Ramp on from wherever the last layer left the weight, so changing modes
-    // while a clip plays blends instead of jumping.
-    p.mask_updated = GetTickCount64();
-    logging::log(logging::Level::info, logging::Channel::skater, "Custom animation: masking set to {}.",
-                 pose_mask_name());
+    state().mask.store(static_cast<int>(mask), std::memory_order_relaxed);
 }
 
 std::string pose_mask_name() {
-    switch (static_cast<PoseMask>(playback().mask.load(std::memory_order_relaxed))) {
+    switch (static_cast<PoseMask>(state().mask.load(std::memory_order_relaxed))) {
     case PoseMask::full: return "full";
     case PoseMask::legs: return "legs";
     default: return "auto";
     }
 }
 
-void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
-    try {
-        auto &p = playback();
-        // The post-physics skeleton response is where a pose write survives;
-        // No Bail installs that hook at startup on the supported build.
-        static std::atomic<bool> armed{};
-        if (!armed.exchange(true, std::memory_order_acq_rel))
-            dingosdk::set_skeleton_responded_listener(&on_skeleton_responded);
-        std::string pending_clip;
-        bool pending{}, stop{}, pending_test{}, pending_ik{};
-        {
-            std::lock_guard lock(p.mutex);
-            pending = p.pending;
-            stop = p.stop;
-            pending_test = p.pending_test;
-            pending_clip = p.pending_clip;
-            // The per-clip floor-correction opt-in travels with the request:
-            // looked up by the name as typed, so a quickswap re-export played
-            // again under the same name keeps its flag. A clip never flagged
-            // plays exactly as authored.
-            const auto found = p.clip_ik.find(clip_key(pending_clip));
-            pending_ik = found != p.clip_ik.end() && found->second;
-            p.pending = p.stop = false;
+void request_pose_record(float seconds) {
+    if (!skater_animation::record(seconds)) {
+        set_status("Custom animation: a recording is already running.");
+        return;
+    }
+    set_status(std::format("Custom animation: recording for {:.1f} s...", seconds));
+}
+
+void request_pose_record_playback() {
+    auto& s = state();
+    std::shared_ptr<const Clip> clip;
+    {
+        std::lock_guard lock(s.mutex);
+        clip = s.recorded;
+        if (clip) s.name = "recording";
+    }
+    if (!clip) {
+        set_status("Custom animation: nothing has been recorded yet (poseanim record).");
+        return;
+    }
+    play_clip(clip, "recording", 0.0f, true);
+    set_status(std::format("Custom animation: playing the recording ({} frames, {:.2f} s).", clip->times.size(),
+                           clip->duration()));
+}
+
+std::string save_recorded_clip(std::string_view path) {
+    std::shared_ptr<const Clip> clip;
+    {
+        auto& s = state();
+        std::lock_guard lock(s.mutex);
+        clip = s.recorded;
+    }
+    if (!clip || clip->times.size() < 2 || clip->joints == 0) return "nothing has been recorded yet";
+    const auto resolved = resolve_clip_path(path, true);
+    std::ofstream out(resolved, std::ios::binary | std::ios::trunc);
+    if (!out) return "cannot write " + resolved.string();
+    const std::uint32_t version = 1;
+    const std::uint32_t joints = clip->joints;
+    const std::uint32_t frame_count = static_cast<std::uint32_t>(clip->times.size());
+    float fps = 60.0f;
+    if (clip->duration() > 0.0f) fps = static_cast<float>(frame_count - 1) / clip->duration();
+    if (!(fps >= 1.0f && fps <= 240.0f)) fps = 60.0f;
+    std::array<char, 20> header{};
+    std::memcpy(header.data(), "RSKA", 4);
+    std::memcpy(header.data() + 4, &version, 4);
+    std::memcpy(header.data() + 8, &joints, 4);
+    std::memcpy(header.data() + 12, &frame_count, 4);
+    std::memcpy(header.data() + 16, &fps, 4);
+    out.write(header.data(), header.size());
+    std::vector<float> row(static_cast<std::size_t>(joints) * floats_per_joint);
+    for (std::uint32_t f = 0; f < frame_count; ++f) {
+        const Joint* frame = clip->frames.data() + static_cast<std::size_t>(f) * joints;
+        for (std::uint32_t j = 0; j < joints; ++j) {
+            float* dst = row.data() + static_cast<std::size_t>(j) * floats_per_joint;
+            std::memcpy(dst, frame[j].scale.data(), 12);
+            std::memcpy(dst + 3, frame[j].rotation.data(), 16);
+            std::memcpy(dst + 7, frame[j].position.data(), 12);
         }
-        if (pending)
-            logging::log(logging::Level::info, logging::Channel::skater, "Custom animation: request \"{}\".",
-                         pending_clip);
-        if (stop) {
-            if (p.recording.load(std::memory_order_acquire)) {
-                const auto frames = p.record_frames.load(std::memory_order_acquire);
-                const auto elapsed = GetTickCount64() - p.record_started;
-                p.record_fps = elapsed > 0
-                    ? static_cast<float>(static_cast<double>(frames) * 1000.0 / static_cast<double>(elapsed)) : 60.0f;
-                if (p.record_fps < 1.0f || p.record_fps > 240.0f) p.record_fps = 60.0f;
-                p.recording.store(false, std::memory_order_release);
-                p.component.store(0, std::memory_order_release);
-                set_status("Recording stopped (" + std::to_string(frames) + " frames). Run poseanim play.");
-                logging::log(logging::Level::info, logging::Channel::skater,
-                             "Custom animation: recording stopped after {} frames over {} ms ({:.1f} fps).",
-                             frames, elapsed, p.record_fps);
-                return;
-            }
-            p.playing.store(false, std::memory_order_release);
-            // Put the pose captured at start back over the output buffer. Joint
-            // 1 carries world placement, so it is left alone: restoring it would
-            // teleport the skater back to where they stood when playback began.
-            const auto component = p.component.load(std::memory_order_acquire);
-            if (component && p.saved_joints > 2 && !p.saved_pose.empty()) {
-                const auto pose = pose_location(base, component);
-                if (pose.buffer && pose.joints > 2) {
-                    const auto joints = p.saved_joints < pose.joints ? p.saved_joints : pose.joints;
-                    (void)nsd::write(pose.buffer + 2 * 0x30ULL, p.saved_pose.data() + 2 * 0x30ULL,
-                                     static_cast<std::size_t>(joints - 2) * 0x30);
+        out.write(reinterpret_cast<const char*>(row.data()), static_cast<std::streamsize>(row.size() * sizeof(float)));
+    }
+    if (!out) return "cannot write " + resolved.string();
+    logging::log(logging::Level::info, logging::Channel::skater, "Custom animation: saved {} frames to {}.",
+                 frame_count, resolved.string());
+    return {};
+}
+
+void request_skeleton_dump() { state().dump_request.store(true, std::memory_order_release); }
+
+std::string pose_playback_status() {
+    std::string name;
+    {
+        auto& s = state();
+        std::lock_guard lock(s.mutex);
+        name = s.name;
+    }
+    std::string text = name.empty() ? "Custom animation: idle" : "Custom animation: " + name;
+    if (const auto at = skater_animation::play_time()) text += std::format(" at {:.2f} s", *at);
+    text += name.empty() ? "" : skater_animation::playing() ? ", playing" : ", stopped";
+    return text + ". " + skater_animation::status();
+}
+
+std::string pose_playback_cost() {
+    return "Per-frame work: the game's own animation update - poseanim adds no pass of its own.";
+}
+
+void set_pose_trace(bool enabled) noexcept { state().trace.store(enabled, std::memory_order_relaxed); }
+bool pose_trace() { return state().trace.load(std::memory_order_relaxed); }
+
+void set_pose_ik(float strength) noexcept {
+    state().ik.store(std::clamp(strength, 0.0f, 1.0f), std::memory_order_relaxed);
+}
+float pose_ik() noexcept { return state().ik.load(std::memory_order_relaxed); }
+
+void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
+    auto& s = state();
+    try {
+        if (s.dump_request.exchange(false, std::memory_order_acq_rel)) {
+            const auto text = write_skeleton_dump(base, client);
+            set_status(text);
+            logging::log(logging::Level::info, logging::Channel::skater, "{}", text);
+        }
+        // A finished recording is ours to keep: take_recording hands it over once.
+        if (!skater_animation::recording()) {
+            if (auto done = skater_animation::take_recording()) {
+                bool test = false;
+                {
+                    std::lock_guard lock(s.mutex);
+                    s.recorded = done;
+                    test = s.test_pending;
+                    if (test) {
+                        s.test_pending = false;
+                        s.name = "test";
+                    }
+                }
+                if (test) {
+                    play_clip(done, "test", 0.0f, true);
+                    set_status(std::format("Custom animation: test clip recorded ({} frames, {:.2f} s); playing.",
+                                           done->times.size(), done->duration()));
+                } else {
+                    set_status(std::format("Custom animation: recorded {} frames, {:.2f} s (poseanim play / save).",
+                                           done->times.size(), done->duration()));
                 }
             }
-            p.saved_pose.clear();
-            p.saved_joints = 0;
-            p.component.store(0, std::memory_order_release);
-            set_status("Custom animation stopped.");
-            logging::log(logging::Level::info, logging::Channel::skater,
-                         "Custom animation: stopped after {} pose writes.", p.writes.load());
-            return;
         }
-        if (p.dump_request) {
-            p.dump_request = false;
-            set_status(write_skeleton_dump(base, client));
+        // The automatic mask: the game keeps the legs while the skater rides. The physics state
+        // machine is the truth for "on foot" (504 walking, 300 a ground wipeout, anything else
+        // riding); until the selector has chosen once, the motion object answers instead.
+        const auto component = local_skater_component(base, client);
+        const auto physics = observed_physics_state();
+        const bool riding = component && (physics == UINT32_MAX
+            ? !skater_off_board(base, component)
+            : !(physics == addr::no_bail::offboard_physics_state || physics == addr::no_bail::wipeout_physics_state));
+        const auto now = GetTickCount64();
+        const auto elapsed = now > s.mask_at ? now - s.mask_at : 0;
+        s.mask_at = now;
+        const auto mode = static_cast<PoseMask>(s.mask.load(std::memory_order_relaxed));
+        const bool engaged = mode == PoseMask::legs || (mode == PoseMask::automatic && riding);
+        s.mask_weight = layers::ramp_weight(s.mask_weight, engaged ? 1.0f : 0.0f, elapsed, mask_ramp_ms);
+        apply_mask();
+        // Trace: one status line every two seconds while a clip plays.
+        if (s.trace.load(std::memory_order_relaxed) && skater_animation::playing()) {
+            static std::uint64_t next_trace = 0;
+            if (now >= next_trace) {
+                next_trace = now + 2000;
+                logging::log(logging::Level::info, logging::Channel::skater, "Custom animation: {}.",
+                             pose_playback_status());
+            }
         }
-        if (!pending) {
-            // A level change or respawn frees the pose buffer: stop rather than
-            // keep writing to a component that is no longer the local skater.
-            // A zero here is a transient read failure, not a different skater.
-            // Only worth looking while something is actually playing.
-            if (!p.playing.load(std::memory_order_acquire)) return;
-            if (const auto current = local_component(base, client);
-                current && p.component.load(std::memory_order_acquire) != current) {
-                p.playing.store(false, std::memory_order_release);
-                p.saved_pose.clear();
-                p.saved_joints = 0;
-                p.component.store(0, std::memory_order_release);
-                set_status("Custom animation stopped (the skater changed).");
-            }
-            return;
-        }
-        const auto component = local_component(base, client);
-        if (!component) {
-            logging::log(logging::Level::warning, logging::Channel::skater,
-                         "Custom animation: the local skater's animation component is unavailable ({}).",
-                         local_component_debug(base, client));
-            set_status("Custom animation: the local skater's animation component is unavailable.");
-            return;
-        }
-        // A new layer starts from a clean motion sample, so the automatic mask
-        // decides on this skater's current state rather than the last clip's.
-        p.world_valid = false;
-        p.moving = false;
-        p.speed = 0.0f;
-        p.on_board = false;
-        p.mask_engaged = false;
-        p.physics_state = UINT32_MAX;
-        p.mask_updated = GetTickCount64();
-        p.summary_at = p.mask_updated;
-        p.handler_ticks.store(0, std::memory_order_relaxed);
-        p.handler_peak.store(0, std::memory_order_relaxed);
-        p.handler_frames.store(0, std::memory_order_relaxed);
-        // The write that survives is the one after the engine's post-physics
-        // response. That hook belongs to No Bail, which installs it at startup;
-        // if it is missing, say so rather than playing invisibly.
-        if (!dingosdk::no_bail_available())
-            logging::log(logging::Level::warning, logging::Channel::skater,
-                         "Custom animation: the post-physics skeleton hook is not installed, so the engine "
-                         "will overwrite the pose. The clipped animation will not be visible.");
-        if (pending_clip == "record") {
-            std::string detail;
-            if (!multiplayer::install_entity_hooks(base, detail)) {
-                logging::log(logging::Level::warning, logging::Channel::skater,
-                             "Custom animation: the animation hook is unavailable: {}.", detail);
-                set_status("Custom animation: the animation hook is unavailable: " + detail);
-                return;
-            }
-            // multiplayer::set_pose_playback_listener(&on_pose_evaluated);  // ReSkate 2.1.2: skater_animation owns the single pose-override listener now; playback is stubbed until the port
-            p.base = base;
-            p.component.store(component, std::memory_order_release);
-            p.playing.store(false, std::memory_order_release);
-            p.recording.store(false, std::memory_order_release);
-            {
-                std::lock_guard lock(p.mutex);
-                p.clip = {};
-            }
-            p.record_data.assign(
-                static_cast<std::size_t>(max_record_frames) * expected_skater_joints * floats_per_joint, 0.0f);
-            p.record_capacity = max_record_frames;
-            p.record_frames.store(0, std::memory_order_release);
-            p.record_started = GetTickCount64();
-            p.saved_pose.clear();
-            p.saved_joints = 0;
-            p.recording.store(true, std::memory_order_release);
-            set_status("Recording the pose; run poseanim off to stop.");
-            logging::log(logging::Level::info, logging::Channel::skater, "Custom animation: recording started.");
-            return;
-        }
-        if (pending_clip == "play") {
-            const auto frames = p.record_frames.load(std::memory_order_acquire);
-            if (frames < 2) {
-                set_status("Custom animation: nothing has been recorded yet.");
-                return;
-            }
-            std::string detail;
-            if (!multiplayer::install_entity_hooks(base, detail)) {
-                logging::log(logging::Level::warning, logging::Channel::skater,
-                             "Custom animation: the animation hook is unavailable: {}.", detail);
-                set_status("Custom animation: the animation hook is unavailable: " + detail);
-                return;
-            }
-            // multiplayer::set_pose_playback_listener(&on_pose_evaluated);  // ReSkate 2.1.2: skater_animation owns the single pose-override listener now; playback is stubbed until the port
-            p.base = base;
-            p.component.store(component, std::memory_order_release);
-            p.recording.store(false, std::memory_order_release);
-            Clip clip;
-            clip.joints = expected_skater_joints;
-            clip.frames = frames;
-            clip.fps = p.record_fps;
-            clip.data.assign(p.record_data.begin(),
-                             p.record_data.begin() + static_cast<std::size_t>(frames) * clip.joints * floats_per_joint);
-            const auto fps = clip.fps;
-            {
-                std::lock_guard lock(p.mutex);
-                p.clip = std::move(clip);
-            }
-            p.test.store(false, std::memory_order_relaxed);
-            p.clip_name = "recorded";
-            p.saved_pose.clear();
-            p.saved_joints = 0;
-            if (const auto pose = pose_location(base, component); pose.buffer && pose.joints > 2) {
-                p.saved_pose.resize(static_cast<std::size_t>(pose.joints) * 0x30);
-                if (readable(pose.buffer, p.saved_pose.data(), p.saved_pose.size())) p.saved_joints = pose.joints;
-                else p.saved_pose.clear();
-            }
-            p.writes.store(0, std::memory_order_release);
-            p.started = GetTickCount64();
-            p.active_ik.store(pending_ik, std::memory_order_relaxed);
-            p.smoothed_floor = {};
-            p.floor_smoothed_at = 0;
-            p.playing.store(true, std::memory_order_release);
-            set_status("Playing the recorded pose (" + std::to_string(frames) + " frames).");
-            logging::log(logging::Level::info, logging::Channel::skater,
-                         "Custom animation: playing the recorded pose ({} frames, {:.1f} fps).", frames, fps);
-            return;
-        }
-        if (pending_test) {
-            p.clip = {};
-            p.test.store(true, std::memory_order_relaxed);
-            p.clip_name = "test";
-        } else {
-            Clip clip;
-            std::string error;
-            const auto path = resolve_clip_path(pending_clip, false);
-            if (!load_clip(path, clip, error)) {
-                set_status("Custom animation: " + error + ".");
-                logging::log(logging::Level::warning, logging::Channel::skater, "Custom animation: {}", error);
-                return;
-            }
-            {
-                std::lock_guard lock(p.mutex);
-                p.clip = std::move(clip);
-            }
-            p.test.store(false, std::memory_order_relaxed);
-            p.clip_name = path.string();
-        }
-        std::string detail;
-        if (!multiplayer::install_entity_hooks(base, detail)) {
-            logging::log(logging::Level::warning, logging::Channel::skater,
-                         "Custom animation: the animation hook is unavailable: {}.", detail);
-            set_status("Custom animation: the animation hook is unavailable: " + detail);
-            return;
-        }
-        // multiplayer::set_pose_playback_listener(&on_pose_evaluated);  // ReSkate 2.1.2: skater_animation owns the single pose-override listener now; playback is stubbed until the port
-        p.base = base;
-        // Capture the current pose so stop can put it back.
-        p.saved_pose.clear();
-        p.saved_joints = 0;
-        if (const auto pose = pose_location(base, component); pose.buffer && pose.joints > 2) {
-            p.saved_pose.resize(static_cast<std::size_t>(pose.joints) * 0x30);
-            if (readable(pose.buffer, p.saved_pose.data(), p.saved_pose.size())) p.saved_joints = pose.joints;
-            else p.saved_pose.clear();
-        }
-        p.component.store(component, std::memory_order_release);
-        p.writes.store(0, std::memory_order_release);
-        p.started = GetTickCount64();
-        p.active_ik.store(pending_ik, std::memory_order_relaxed);
-        p.smoothed_floor = {};
-        p.floor_smoothed_at = 0;
-        p.playing.store(true, std::memory_order_release);
-        set_status("Custom animation playing: " + p.clip_name +
-                   (pending_ik ? " (floor correction on for this clip)." : "."));
-        logging::log(logging::Level::info, logging::Channel::skater,
-                     "Custom animation: playing {} on component {:#x} (mask {}, floor correction {}).",
-                     p.clip_name, component, pose_mask_name(),
-                     pending_ik ? "on for this clip" : "off");
-    } catch (const std::exception &e) {
-        logging::log(logging::Level::warning, logging::Channel::skater, "Custom animation: {}.", e.what());
-        set_status(std::string("Custom animation: ") + e.what());
-    } catch (...) {
-        logging::log(logging::Level::warning, logging::Channel::skater,
-                     "Custom animation: unknown failure in the playback tick.");
-        set_status("Custom animation: unknown failure.");
-    }
+    } catch (...) {}
 }
 
 } // namespace dingosdk::skater

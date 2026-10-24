@@ -278,6 +278,8 @@ struct Plan {
     float offsets_weight{1};
     double offsets_until{};
     Shown offsets_shown{};
+    // set_mask(): per joint, 1 = the game keeps that joint's pose. Empty: the clip has them all.
+    std::shared_ptr<const std::vector<float>> mask;
 };
 // The game menu's character room (PR 297's studio room): the spot of the menu's skater, how far from
 // it a rig counts as in the room, and the room's floor (measured 2026-10-10 on Stadium 1 and San
@@ -745,13 +747,19 @@ void on_animation(std::uintptr_t component) noexcept {
                 board_weight = weight;
             }
             const auto& body = body_joints();
-            for (std::size_t i = 0; i < std::min<std::size_t>(layout.count, clip->joints); ++i) {
+            // set_mask: joints the caller keeps for the game (1 = the game's pose exactly).
+            const auto* keep = snap->play && snap->play->clip.get() == clip ? snap->mask.get() : nullptr;
+            const std::size_t clip_joints = std::min<std::size_t>(layout.count, clip->joints);
+            for (std::size_t i = 0; i < clip_joints; ++i) {
                 if (!body[i]) continue;
+                const float game_share = keep && i < keep->size() ? std::clamp((*keep)[i], 0.0f, 1.0f) : 0.0f;
+                if (game_share >= 1.0f) continue;
+                const float w = weight * (1.0f - game_share);
                 auto& j = l.pose[i];
                 const auto& c = l.custom[i];
-                j.rotation = slerp(j.rotation, c.rotation, weight);
+                j.rotation = slerp(j.rotation, c.rotation, w);
                 if (clip->keeps_position(i)) continue; // the skater's own build
-                for (std::size_t k = 0; k < 3; ++k) j.position[k] += (c.position[k] - j.position[k]) * weight;
+                for (std::size_t k = 0; k < 3; ++k) j.position[k] += (c.position[k] - j.position[k]) * w;
             }
             first = 2;
             last = layout.count;
@@ -1114,6 +1122,11 @@ void play(std::optional<Play> clip) {
     plan_draft.from = plan_draft.play ? plan_draft.play->at : 0;
     plan_draft.held = plan_draft.play && plan_draft.play->paused ? std::optional(plan_draft.from) : std::nullopt;
     plan_draft.serial = ++serial;
+    publish();
+}
+void set_mask(std::shared_ptr<const std::vector<float>> keep) {
+    if (plan_draft.mask == keep) return;
+    plan_draft.mask = std::move(keep);
     publish();
 }
 std::optional<float> play_time() {
