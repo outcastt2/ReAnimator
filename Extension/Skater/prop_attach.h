@@ -66,6 +66,15 @@ void request_prop_codec(std::string name, unsigned seconds);
 // immediately.
 void request_prop_poke(unsigned seconds);
 void request_prop_poke_stop();
+// The trigger hunt, stage two. `state` dumps the definition cluster a gesture
+// press writes (rig+0x18, +0x1c0..+0x1cc) and classifies its pointer; `trigger`
+// snapshots that cluster while idle, captures it when the gesture is pressed,
+// then holds it while idle. Read-only apart from the hold, which saves and
+// restores the idle baseline. Run `state` idle and again with the gesture held,
+// and compare the two.
+void request_prop_state();
+void request_prop_trigger(unsigned seconds);
+void request_prop_trigger_stop();
 // Passive creation trace: hook create_entity for `seconds` and record every
 // creation (blueprint, entity, thread, module-relative caller stack) in the log.
 // Nothing is created, modified or called by the trace. The off call disarms.

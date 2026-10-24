@@ -121,6 +121,22 @@ struct State {
     std::array<std::uint32_t, 3> poke_old{};
     unsigned poke_overwrites{}, poke_rewrites{};
     Ptr poke_rig{};
+    // The trigger hunt, stage two. Stage one (prop watch) found that a gesture
+    // press writes one 16-byte cluster on the rig's definition object (rig+0x18)
+    // at +0x1c0..+0x1cc, and that those four words are stable while idle.
+    // `prop state` dumps the cluster and classifies its pointer; `prop trigger`
+    // captures the cluster while the gesture plays, then holds it while idle: if
+    // the animation starts with no gesture pressed, the cluster is the request
+    // rather than a record of the gesture already running.
+    bool state_pending{};
+    bool trigger_pending{}, trigger_stop_pending{};
+    unsigned trigger_seconds{45};
+    bool triggering{}, trigger_captured{};
+    ULONGLONG trigger_until{};
+    Ptr trigger_definition{};
+    std::array<Ptr, 4> trigger_address{};
+    std::array<std::uint32_t, 4> trigger_value{}, trigger_old{}, trigger_idle{};
+    unsigned trigger_overwrites{}, trigger_rewrites{};
     // The passive creation trace: hook the entity factory for a short window and
     // keep blueprint, entity, thread and caller stack for every creation.
     bool trace_pending{}, trace_off_pending{};
@@ -900,6 +916,180 @@ void stop_poke(bool restore) {
     set_status(std::format("Hand props: poke {}.", restore ? "restored" : "released"));
     s.poking = false;
     s.poke_overwrites = s.poke_rewrites = 0;
+}
+
+// ---------------------------------------------------------------------------
+// The trigger hunt, stage two.
+//
+// Stage one (`prop watch`) found that a gesture press writes exactly one 16-byte
+// cluster on the rig's definition object (rig+0x18), at +0x1c0..+0x1cc, and that
+// those four words are stable while idle -- every other address it saw was pose
+// churn, present in both phases. The gesture item's own data never changed, which
+// is what the item fields being permission state rather than a request predicts.
+//
+// So this is the cluster. `prop state` dumps it and classifies its pointer;
+// `prop trigger` snapshots it while idle, captures it when the gesture is
+// pressed, then holds the captured words while idle. If the animation starts with
+// no gesture pressed, the cluster is the request and the command can write it. If
+// the game resets it every frame, it is a record of the gesture already running
+// and the hunt continues.
+constexpr Ptr definition_cluster = 0x1c0;
+constexpr std::size_t definition_words = 4;
+
+void stop_trigger(bool restore);
+
+// What the pointer at +0x1c8 is: its vtable against the build's known asset
+// types, and the name the engine keeps at +0x18 when the object has one.
+void classify_definition_pointer(Ptr base, Ptr value, const char *label) {
+    if (!value) {
+        logging::log(logging::Level::info, logging::Channel::skater, "Hand props: {} is null.", label);
+        return;
+    }
+    std::uint32_t vtable{};
+    if (!memory::peek_bytes(value, &vtable, sizeof(vtable))) {
+        logging::log(logging::Level::info, logging::Channel::skater, "Hand props: {} {:#x} is unreadable.", label, value);
+        return;
+    }
+    struct Known {
+        Ptr vtable;
+        const char *name;
+    };
+    const Known known[] = {
+        {base + board_gesture::layout::sequence_vtable, "SequenceContainerAsset"},
+        {base + board_gesture::layout::actor_vtable, "ActorControllerAsset"},
+        {base + board_gesture::layout::cdb_asset_vtable, "CDB asset"},
+        {base + board_gesture::layout::cdb_vtable, "CDB"},
+        {base + board_gesture::layout::expression_vtable, "expression graph"},
+        {base + board_gesture::layout::item_vtable, "item"},
+        {base + board_gesture::layout::item_type, "item type"},
+    };
+    const char *type = "not one of the known asset types";
+    for (const auto &entry : known)
+        if (vtable == entry.vtable) type = entry.name;
+    std::array<char, 200> name{};
+    Ptr name_pointer{};
+    if (memory::peek_bytes(value + 0x18, &name_pointer, sizeof(name_pointer)) && name_pointer &&
+        memory::peek_cstring(name_pointer, name.data(), name.size()) >= 0)
+        logging::log(logging::Level::info, logging::Channel::skater,
+                     "Hand props: {} {:#x} vtable={:#x} ({}) name=\"{}\"", label, value, vtable, type, name.data());
+    else
+        logging::log(logging::Level::info, logging::Channel::skater, "Hand props: {} {:#x} vtable={:#x} ({})", label,
+                     value, vtable, type);
+}
+
+// `prop state`: the cluster, its neighbours and what the pointer is. Read-only,
+// and meant to be run twice -- once idle and once with the gesture held -- so the
+// two can be compared.
+void dump_definition(Ptr base, Ptr client) {
+    Local local;
+    if (!resolve_local(base, client, local) || !local.definition) {
+        set_status("Hand props: the definition object is not ready.");
+        return;
+    }
+    const auto definition = local.definition;
+    logging::log(logging::Level::info, logging::Channel::skater,
+                 "Hand props: definition={:#x} (rig+0x18, rig={:#x}, holder={:#x}).", definition, local.rig, local.holder);
+    for (Ptr offset = definition_cluster - 0x20; offset <= definition_cluster + 0x0c; offset += 4) {
+        std::uint32_t value{};
+        if (!memory::peek_bytes(definition + offset, &value, sizeof(value))) break;
+        float as_float{};
+        std::memcpy(&as_float, &value, sizeof(as_float));
+        logging::log(logging::Level::info, logging::Channel::skater,
+                     "Hand props: definition +{:#x} = {:#010x} (float {:.6g})", offset, value, as_float);
+    }
+    std::uint32_t pointer{};
+    if (memory::peek_bytes(definition + definition_cluster + 8, &pointer, sizeof(pointer)))
+        classify_definition_pointer(base, static_cast<Ptr>(pointer), "definition +0x1c8");
+    set_status("Hand props: the definition cluster is in the log.");
+}
+
+// `prop trigger`: snapshot the cluster while idle, capture it when the gesture is
+// pressed, then hold the captured words while idle.
+void arm_trigger(Ptr base, Ptr client, unsigned seconds) {
+    auto &s = state();
+    Local local;
+    if (!resolve_local(base, client, local) || !local.definition) {
+        set_status("Hand props: the definition object is not ready.");
+        return;
+    }
+    s.trigger_definition = local.definition;
+    s.trigger_captured = false;
+    s.trigger_overwrites = s.trigger_rewrites = 0;
+    for (std::size_t i = 0; i < definition_words; ++i) {
+        s.trigger_address[i] = local.definition + definition_cluster + i * 4;
+        s.trigger_value[i] = 0;
+        if (!memory::peek_bytes(s.trigger_address[i], &s.trigger_idle[i], sizeof(std::uint32_t))) {
+            set_status("Hand props: the definition cluster is unreadable; nothing armed.");
+            return;
+        }
+    }
+    s.triggering = true;
+    s.trigger_until = GetTickCount64() + (seconds ? seconds : s.trigger_seconds) * 1000ULL;
+    logging::log(logging::Level::info, logging::Channel::skater,
+                 "Hand props: trigger armed: definition={:#x}, cluster +{:#x}..+{:#x}; idle baseline "
+                 "+0x1c0={:#010x} +0x1c4={:#010x} +0x1c8={:#010x} +0x1cc={:#010x}. Press the gesture now.",
+                 local.definition, definition_cluster, definition_cluster + (definition_words - 1) * 4, s.trigger_idle[0],
+                 s.trigger_idle[1], s.trigger_idle[2], s.trigger_idle[3]);
+    set_status(std::format("Hand props: trigger armed for {}s; press the gesture, then stay still.",
+                           seconds ? seconds : s.trigger_seconds));
+}
+
+void service_trigger(Ptr base, Ptr client) {
+    auto &s = state();
+    if (!s.triggering) return;
+    Local local;
+    if (!resolve_local(base, client, local) || !local.definition || local.definition != s.trigger_definition) {
+        // A different definition means the saved addresses belong to a dead
+        // instance; restoring is pointless, so release without writing.
+        stop_trigger(false);
+        return;
+    }
+    if (!s.trigger_captured) {
+        // The press signal stage one found: the pointer word goes from nothing to
+        // a live address.
+        std::uint32_t pointer{};
+        if (!memory::peek_bytes(s.trigger_address[2], &pointer, sizeof(pointer)) || !pointer) return;
+        for (std::size_t i = 0; i < definition_words; ++i)
+            if (!memory::peek_bytes(s.trigger_address[i], &s.trigger_value[i], sizeof(std::uint32_t))) return;
+        s.trigger_captured = true;
+        logging::log(logging::Level::info, logging::Channel::skater,
+                     "Hand props: trigger captured: +0x1c0={:#010x} +0x1c4={:#010x} +0x1c8={:#010x} +0x1cc={:#010x}",
+                     s.trigger_value[0], s.trigger_value[1], s.trigger_value[2], s.trigger_value[3]);
+        classify_definition_pointer(base, s.trigger_value[2], "captured +0x1c8");
+        set_status("Hand props: trigger captured; holding the cluster. Watch the skater; 'prop trigger off' releases.");
+        return;
+    }
+    // Hold: put the captured words back every frame and count how often the game
+    // replaces them. A value the game resets at once is not the request.
+    for (std::size_t i = 0; i < definition_words; ++i) {
+        std::uint32_t value{};
+        if (!memory::peek_bytes(s.trigger_address[i], &value, sizeof(value))) continue;
+        if (value == s.trigger_value[i]) continue;
+        ++s.trigger_overwrites;
+        if (s.trigger_rewrites < 10)
+            logging::log(logging::Level::info, logging::Channel::skater,
+                         "Hand props: trigger: the game reset +{:#x} to {:#010x}; rewriting {:#010x}.",
+                         definition_cluster + i * 4, value, s.trigger_value[i]);
+        if (write_u32(s.trigger_address[i], s.trigger_value[i])) ++s.trigger_rewrites;
+    }
+    if (GetTickCount64() >= s.trigger_until) stop_trigger(true);
+}
+
+void stop_trigger(bool restore) {
+    auto &s = state();
+    if (!s.triggering) return;
+    // Restore the idle baseline, not the captured press values: those are the
+    // gesture's own state and putting them back would leave it set.
+    if (restore)
+        for (std::size_t i = 0; i < definition_words; ++i)
+            if (s.trigger_address[i]) (void)write_u32(s.trigger_address[i], s.trigger_idle[i]);
+    logging::log(logging::Level::info, logging::Channel::skater,
+                 "Hand props: trigger {}: {} game overwrite(s), {} rewrite(s).", restore ? "restored" : "released",
+                 s.trigger_overwrites, s.trigger_rewrites);
+    set_status(std::format("Hand props: trigger {}.", restore ? "restored" : "released"));
+    s.triggering = false;
+    s.trigger_captured = false;
+    s.trigger_overwrites = s.trigger_rewrites = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -2352,6 +2542,24 @@ void request_prop_poke_stop() {
     s.poke_stop_pending = true;
     s.poke_pending = false;
 }
+void request_prop_state() {
+    auto &s = state();
+    std::lock_guard lock(s.mutex);
+    s.state_pending = true;
+}
+void request_prop_trigger(unsigned seconds) {
+    auto &s = state();
+    std::lock_guard lock(s.mutex);
+    s.trigger_seconds = seconds ? seconds : 45;
+    s.trigger_pending = true;
+    s.trigger_stop_pending = false;
+}
+void request_prop_trigger_stop() {
+    auto &s = state();
+    std::lock_guard lock(s.mutex);
+    s.trigger_stop_pending = true;
+    s.trigger_pending = false;
+}
 void request_prop_trace(unsigned seconds) {
     auto &s = state();
     std::lock_guard lock(s.mutex);
@@ -2461,6 +2669,7 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
         auto &s = state();
         std::string filter;
         bool want_report{}, want_watch{}, want_weight{}, want_pose{}, want_assets{}, want_poke{}, want_poke_stop{};
+        bool want_state{}, want_trigger{}, want_trigger_stop{};
         bool want_trace{}, want_trace_off{}, want_derive{}, want_hand_attach{}, want_hand_detach{};
         bool want_morph_find{}, want_morph_unclamp{}, want_morph_clamp{};
         bool want_clip{};
@@ -2481,6 +2690,7 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
         unsigned pose_seconds{};
         unsigned assets_seconds{};
         unsigned poke_seconds{};
+        unsigned trigger_seconds{};
         unsigned trace_seconds{};
         unsigned derive_seconds{};
         std::string assets_extra;
@@ -2501,6 +2711,9 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
             codec_seconds = s.codec_seconds;
             want_poke = s.poke_pending;
             want_poke_stop = s.poke_stop_pending;
+            want_state = s.state_pending;
+            want_trigger = s.trigger_pending;
+            want_trigger_stop = s.trigger_stop_pending;
             want_trace = s.trace_pending;
             want_trace_off = s.trace_off_pending;
             want_derive = s.derive_pending;
@@ -2528,6 +2741,7 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
             pose_seconds = s.pose_seconds;
             assets_seconds = s.assets_seconds;
             poke_seconds = s.poke_seconds;
+            trigger_seconds = s.trigger_seconds;
             trace_seconds = s.trace_seconds;
             derive_seconds = s.derive_seconds;
             assets_extra = s.assets_extra;
@@ -2538,6 +2752,7 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
             s.clip_pending = false;
             s.codec_pending = false;
             s.poke_pending = s.poke_stop_pending = false;
+            s.state_pending = s.trigger_pending = s.trigger_stop_pending = false;
             s.trace_pending = s.trace_off_pending = s.derive_pending = false;
             s.hand_attach_pending = s.hand_detach_pending = false;
             s.morph_find_pending = s.morph_unclamp_pending = s.morph_clamp_pending = false;
@@ -2548,6 +2763,10 @@ void tick_prop_attach(std::uintptr_t base, std::uintptr_t client) noexcept {
         }
         if (want_poke_stop) stop_poke(true);
         else if (want_poke) arm_poke(base, client, poke_seconds);
+        if (want_state) dump_definition(base, client);
+        if (want_trigger_stop) stop_trigger(true);
+        else if (want_trigger) arm_trigger(base, client, trigger_seconds);
+        if (s.triggering) service_trigger(base, client);
         if (s.poking) {
             // Hold the weights and count how often the graph puts them back.
             Local local;

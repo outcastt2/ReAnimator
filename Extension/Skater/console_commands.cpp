@@ -601,7 +601,7 @@ void register_movement_commands(Commands &registry) {
     // Hand props: the game's own gesture props follow a custom animation, so the
     // trigger is what has to be found before anything is written.
     auto prop = action("prop",
-        "Hand props: prop | prop list [name] | prop watch [name] [seconds] | prop clip <name> | prop codec [name] [seconds] | prop trace [seconds] - gesture props, creation, and the clip probes",
+        "Hand props: prop | prop list [name] | prop watch [name] [seconds] | prop clip <name> | prop codec [name] [seconds] | prop state | prop trigger [seconds] | prop trace [seconds] - gesture props, the definition cluster, and the clip probes",
         Group::movement, {argument("mode", Type::text, true), argument("name", Type::text, true),
                           argument("seconds|side", Type::text, true)});
     prop.execution = Execution::local;
@@ -695,6 +695,25 @@ void register_movement_commands(Commands &registry) {
             skater::request_prop_poke(seconds);
             out("Hand props: writing 1.0 into the three layer weights for " + std::to_string(seconds) +
                 "s, then restoring. Watch your skater; 'prop poke off' restores now.");
+            return;
+        }
+        if (mode == "state") {
+            skater::request_prop_state();
+            out("Hand props: dumping the definition cluster (rig+0x18, +0x1c0..+0x1cc) and what its pointer is. "
+                "Run it once idle and once with the gesture held, then compare the two.");
+            return;
+        }
+        if (mode == "trigger") {
+            if (text_at(1) == "off") {
+                skater::request_prop_trigger_stop();
+                out("Hand props: releasing the trigger hold and restoring the idle cluster.");
+                return;
+            }
+            const auto seconds = number_at(1, 45u);
+            skater::request_prop_trigger(seconds);
+            out("Hand props: armed for " + std::to_string(seconds) +
+                "s. Press the gesture once (that is the capture), then stand still and watch your skater; "
+                "'prop trigger off' releases.");
             return;
         }
         if (mode == "trace") {
