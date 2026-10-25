@@ -105,10 +105,8 @@ reskate.menu.page("Animations", function(ui)
     ui:heading("Custom animations")
     local names = reskate.animation.rska_list()
     ui:info("Clips", tostring(#names))
-    if ui:button("open", "OPEN THE GRID", true) then
-        reskate.ui.open(screen_title)
-        screen_open = true
-    end
+    ui:note("Press Ctrl+K for the grid: tiles with a stick figure of each pose.")
+    ui:note("A screen draws under this menu, so it cannot be opened from here.")
 
     if pinned then
         local s = settings_of(pinned)
@@ -142,6 +140,21 @@ reskate.menu.page("Animations", function(ui)
 end)
 
 reskate.ui.screen(screen_title, function() end, { panel = false })
+
+-- The grid is opened with a key, not from the page: a plugin's screen draws under the game's menu, so
+-- opening it from there leaves it behind the menu with no way to close the menu from a plugin.
+reskate.input.bind("grid", "Ctrl+K")
+reskate.on("action", function(name)
+    if name ~= "grid" then return end
+    if screen_open then
+        reskate.ui.close()
+        screen_open = false
+        hovered, previewing, hover_frames = nil, nil, 0
+    else
+        reskate.ui.open(screen_title)
+        screen_open = true
+    end
+end)
 
 reskate.on("screen_closed", function(title)
     if title ~= screen_title then return end
