@@ -892,6 +892,13 @@ void on_animation(std::uintptr_t component) noexcept {
                 l.room_written = joint_of(l.bones[placement_joint]);
                 l.room_written_valid = true;
             }
+            // Written here, at animation time, the way this mod's player always did. The game's own
+            // foot placement and body physics run between this point and the renderer, and that is what
+            // adapts a clip to the skater's build. skater_animation writes at render time instead,
+            // which lands after that step: the raw clip then goes to the renderer and only sits right on
+            // the build it was authored on -- the height-dependent jitter.
+            (void)poke(layout.buffer + first * sizeof(NativeBone), l.bones.data() + first,
+                       (last - first) * sizeof(NativeBone));
             // Written when the pose goes to the renderer (on_render): the body physics rebuild this
             // buffer after the animation update.
             {
@@ -1103,40 +1110,16 @@ void on_render(std::uintptr_t animation_interface) noexcept {
             return;
         }
         count(&Probe::drawn);
-        thread_local std::vector<NativeBone> current;
-        current.resize(p.last - p.first);
-        if (!peek(layout.buffer + p.first * sizeof(NativeBone), current.data(), current.size() * sizeof(NativeBone))) {
-            SetLastError(error);
-            return;
-        }
-        // The game's own pose here is the planted one: sample its floor before replacing it.
+        // The clip is written at animation time (on_animation), so the game's own foot placement and
+        // body physics retarget it to the skater's build before the renderer sees it. Writing it here
+        // instead, after that step, replaced the retargeted pose with the raw clip. Only the opt-in
+        // floor correction still runs here, on the pose the game produced.
         skater::layers::FloorSample floor{};
         const bool have_floor = p.floor_strength > 0.0f && skater::layers::sample_floors(layout.buffer, floor);
         const auto* keep = p.mask.get();
         const auto keep_of = [keep](std::size_t joint) {
             return keep && joint < keep->size() ? std::clamp((*keep)[joint], 0.0f, 1.0f) : 0.0f;
         };
-        for (std::size_t i = 0; i < current.size(); ++i) {
-            const auto joint = static_cast<std::size_t>(p.first) + i;
-            if (!clip_writes(joint)) continue; // the engine's own helper cluster
-            const float game = keep_of(joint);
-            if (game >= 1.0f) continue; // the game keeps this joint: leave the planted one
-            auto& c = current[i];
-            const auto& b = p.bones[i];
-            const float w = 1.0f - game;
-            if (w >= 1.0f) {
-                std::memcpy(c.scale.data(), b.scale.data(), 12);
-                c.rotation = b.rotation;
-                std::memcpy(c.position.data(), b.position.data(), 12);
-                continue;
-            }
-            c.rotation = anim_studio::slerp(c.rotation, b.rotation, w);
-            for (std::size_t k = 0; k < 3; ++k) {
-                c.scale[k] += (b.scale[k] - c.scale[k]) * w;
-                c.position[k] += (b.position[k] - c.position[k]) * w;
-            }
-        }
-        (void)poke(layout.buffer + p.first * sizeof(NativeBone), current.data(), current.size() * sizeof(NativeBone));
         // poseanim's ik: lift what the clip drove clear of the floor the game planted it on. The legs
         // scale by the mask (a leg the game keeps is already planted).
         if (have_floor) {
