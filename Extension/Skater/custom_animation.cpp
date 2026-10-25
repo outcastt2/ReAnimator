@@ -442,6 +442,13 @@ void set_pose_ik(float strength) noexcept {
 }
 float pose_ik() noexcept { return state().ik.load(std::memory_order_relaxed); }
 
+void set_pose_floor_correction(float strength) noexcept {
+    const float value = std::clamp(strength, 0.0f, 1.0f);
+    state().ik.store(value, std::memory_order_relaxed);
+    skater_animation::set_floor_correction(value);
+}
+float pose_floor_correction() noexcept { return skater_animation::floor_correction(); }
+
 void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
     auto& s = state();
     try {

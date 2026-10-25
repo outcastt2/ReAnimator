@@ -951,6 +951,29 @@ struct WorldApi {
         }
         return 1;
     }
+    // mask(mode): the joints a clip drives -- "auto" (the game keeps the legs while riding), "full",
+    // "legs" -- and the mask in force. Without one it only reports.
+    static int animation_mask(lua_State* L) {
+        auto& plugin = animating(L, "reskate.animation.mask");
+        const auto mode = lua_isnoneornil(L, 1) ? std::string{} : checked_text(L, 1, 8, "a mask");
+        if (!mode.empty() && mode != "auto" && mode != "full" && mode != "legs")
+            luaL_argerror(L, 1, "a mask is auto, full or legs");
+        const auto now = game(plugin).animation_mask(mode);
+        lua_pushlstring(L, now.data(), now.size());
+        return 1;
+    }
+    // floor(strength): the floor correction, 0 off to 1; without one it reports the strength in force.
+    static int animation_floor(lua_State* L) {
+        auto& plugin = animating(L, "reskate.animation.floor");
+        std::optional<float> strength;
+        if (!lua_isnoneornil(L, 1)) {
+            const double value = luaL_checknumber(L, 1);
+            if (!(value >= 0.0 && value <= 1.0)) luaL_argerror(L, 1, "a floor correction is 0 to 1");
+            strength = static_cast<float>(value);
+        }
+        lua_pushnumber(L, game(plugin).animation_floor(strength));
+        return 1;
+    }
     static int animation_stop(lua_State* L) {
         auto& plugin = animating(L, "reskate.animation.stop");
         game(plugin).stop_clip(plugin.id());
@@ -2949,6 +2972,7 @@ void WorldApi::install(Plugin& plugin, lua_State* L) {
                                    {"sample", animation_sample}, {"joints", animation_joints}, {"trim", animation_trim}, {"edit", animation_edit},
                                    {"save", animation_save}, {"game_clips", animation_game_clips},
                                    {"rska_list", animation_rska_list},
+                                   {"mask", animation_mask}, {"floor", animation_floor},
                                    {"mirror", animation_mirror}});
     add_functions(L, "outfit", {{"set", outfit_set}, {"clear", outfit_clear}, {"find", outfit_find}, {"slots", outfit_slots}, {"status", outfit_status}});
     add_functions(L, "audio", {{"play", audio_play}, {"set", audio_set}, {"stop", audio_stop}, {"playing", audio_playing}});

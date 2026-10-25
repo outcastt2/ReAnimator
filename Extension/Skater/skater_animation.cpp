@@ -1289,6 +1289,7 @@ void set_floor_correction(float strength) {
     plan_draft.floor_correction = value;
     publish();
 }
+float floor_correction() noexcept { return plan_draft.floor_correction; }
 std::optional<float> play_time() {
     if (!plan_draft.play || !plan_draft.play->clip) return std::nullopt;
     if (plan_draft.held) return plan_draft.held;

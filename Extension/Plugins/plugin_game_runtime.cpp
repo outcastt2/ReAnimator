@@ -961,6 +961,17 @@ public:
     }
     std::vector<std::string> rska_clip_names() override { return skater::rska_clips(); }
     ClipRef rska_clip(std::string_view name, std::string& why) override { return skater::load_rska_clip(name, why); }
+    std::string animation_mask(std::string_view mode) override {
+        if (!mode.empty())
+            skater::set_pose_mask(mode == "full" ? skater::PoseMask::full
+                                   : mode == "legs" ? skater::PoseMask::legs
+                                                    : skater::PoseMask::automatic);
+        return skater::pose_mask_name();
+    }
+    float animation_floor(std::optional<float> strength) override {
+        if (strength) skater::set_pose_floor_correction(*strength);
+        return skater::pose_floor_correction();
+    }
     std::string play_clip(std::string_view plugin, ClipRef clip, float speed, float blend, bool loop, float at, bool paused, bool floor) override {
         if (multiplayer::local_throwdown_active()) return "not while a throwdown runs";
         if (!player_.empty() && player_ != plugin && skater_animation::playing()) return player_ + " is playing a clip";

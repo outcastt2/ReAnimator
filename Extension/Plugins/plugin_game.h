@@ -683,6 +683,11 @@ public:
         why = unavailable;
         return nullptr;
     }
+    // The joints a clip drives ("auto" keeps the game's legs while riding, "full", "legs"), and the
+    // floor correction 0..1. A value sets it and returns what is in force; empty / negative reports.
+    // Empty and -1 where there is no skater.
+    virtual std::string animation_mask(std::string_view /*mode*/) { return {}; }
+    virtual float animation_floor(std::optional<float> /*strength*/) { return -1.0f; }
     // The stance a clip of the skater stands in at its first frame (true: goofy), from the skeleton the
     // game's clips are read with; empty when it cannot be told, or before the game's animations are read.
     virtual std::optional<bool> clip_goofy(const ClipRef&) { return std::nullopt; }

@@ -58,6 +58,10 @@ bool pose_trace();
 // surface: the solve is the game's now, so this is an on/off gate for it.
 void set_pose_ik(float strength) noexcept;
 float pose_ik() noexcept;
+// The floor correction in force right now, whoever is playing: the plugin menu sets it per clip
+// instead of inheriting whatever poseanim last left behind.
+void set_pose_floor_correction(float strength) noexcept;
+float pose_floor_correction() noexcept;
 // Per-frame housekeeping on the client thread (the automatic mask, recordings).
 void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept;
 

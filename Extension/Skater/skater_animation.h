@@ -57,6 +57,8 @@ void set_mask(std::shared_ptr<const std::vector<float>> keep);
 // the renderer, against the game's own planted pose, and the legs scale by set_mask's value (a leg
 // the game keeps is already planted). Client thread.
 void set_floor_correction(float strength);
+// The strength in force (0 off).
+float floor_correction() noexcept;
 // The clip of play(), moved to `seconds` (clamped to it), held there or playing on from it.
 void seek(float seconds);
 void pause(bool paused);
