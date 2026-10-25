@@ -211,8 +211,11 @@ void play_clip(std::shared_ptr<const Clip> clip, const std::string& name, float 
     play.loop = loop;
     play.at = at;
     play.paused = false;
-    play.floor = floor_enabled(name);
+    // Not Play::floor: that places a recorded trick's board on the ground, and an imported clip has
+    // no board. poseanim's ik is our own foot lift (skater_animation::set_floor_correction).
+    play.floor = false;
     skater_animation::play(std::move(play));
+    skater_animation::set_floor_correction(floor_enabled(name) ? state().ik.load(std::memory_order_relaxed) : 0.0f);
 }
 
 // The skeleton resource beside the log (read-only): the joint names and parents a clip is written
@@ -282,7 +285,7 @@ void request_pose_playback(std::string name) {
     const bool floor = floor_enabled(name);
     play_clip(clip, name, 0.0f, true);
     set_status(std::format("Custom animation: playing \"{}\" ({} frames, {:.2f} s{}{}).", name, clip->times.size(),
-                           clip->duration(), floor ? ", on the floor" : "",
+                           clip->duration(), floor ? ", floor correction on" : "",
                            static_cast<PoseMask>(s.mask.load(std::memory_order_relaxed)) == PoseMask::full ? "" :
                                ", legs masked"));
 }
@@ -418,7 +421,18 @@ void set_pose_trace(bool enabled) noexcept { state().trace.store(enabled, std::m
 bool pose_trace() { return state().trace.load(std::memory_order_relaxed); }
 
 void set_pose_ik(float strength) noexcept {
-    state().ik.store(std::clamp(strength, 0.0f, 1.0f), std::memory_order_relaxed);
+    auto& s = state();
+    const float value = std::clamp(strength, 0.0f, 1.0f);
+    s.ik.store(value, std::memory_order_relaxed);
+    try {
+        std::string name;
+        {
+            std::lock_guard lock(s.mutex);
+            name = s.name;
+        }
+        if (!name.empty() && skater_animation::playing())
+            skater_animation::set_floor_correction(floor_enabled(name) ? value : 0.0f);
+    } catch (...) {}
 }
 float pose_ik() noexcept { return state().ik.load(std::memory_order_relaxed); }
 

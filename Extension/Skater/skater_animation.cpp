@@ -1,4 +1,5 @@
-#include "skater_animation.h"
+﻿#include "skater_animation.h"
+#include "pose_layers.h"
 #include "Engine/Core/Log/logging.h"
 #include "Engine/Game/Build/20260929/no_bail.h"
 #include "Engine/Game/Build/20260929/skater_state.h"
@@ -280,6 +281,8 @@ struct Plan {
     Shown offsets_shown{};
     // set_mask(): per joint, 1 = the game keeps that joint's pose. Empty: the clip has them all.
     std::shared_ptr<const std::vector<float>> mask;
+    // set_floor_correction(): how hard to lift the clip's limbs off the game's planted floor, 0 off.
+    float floor_correction{};
 };
 // The game menu's character room (PR 297's studio room): the spot of the menu's skater, how far from
 // it a rig counts as in the room, and the room's floor (measured 2026-10-10 on Stadium 1 and San
@@ -352,6 +355,11 @@ struct Live {
     Clip taking;
     bool taking_board{true}, was_air{};
     std::uint64_t failures{};
+    // Our floor correction (set_floor_correction), on the render thread: the sampled floor,
+    // low-passed across frames (the game's planted pose jitters, and near a straight leg that
+    // jitter becomes knee swing).
+    skater::layers::FloorSample floor_smoothed;
+    std::uint64_t floor_smoothed_at{};
 };
 Live& live() {
     static auto* l = new Live;
@@ -364,6 +372,11 @@ struct Pending {
     std::uint32_t first{}, last{};
     std::vector<NativeBone> bones; // [first, last)
     double at{};
+    // The mask and floor correction in force for this pose (set_mask / set_floor_correction). The
+    // renderer writes after the game planted the feet, so a joint the mask keeps must not be
+    // written back there, and the correction runs against that planted pose.
+    std::shared_ptr<const std::vector<float>> mask;
+    float floor_strength{};
 };
 Pending& pending() {
     static auto* p = new Pending;
@@ -875,6 +888,9 @@ void on_animation(std::uintptr_t component) noexcept {
                 p.last = static_cast<std::uint32_t>(last);
                 p.bones.assign(l.bones.begin() + static_cast<std::ptrdiff_t>(first), l.bones.begin() + static_cast<std::ptrdiff_t>(last));
                 p.at = at;
+                // The mask applies to the clip of play(); the correction to whatever is drawn.
+                p.mask = clip && snap->play && clip == snap->play->clip.get() ? snap->mask : nullptr;
+                p.floor_strength = clip ? snap->floor_correction : 0.0f;
             }
             if (clip) {
                 auto& pr = probe();
@@ -1033,12 +1049,44 @@ void on_render(std::uintptr_t animation_interface) noexcept {
             SetLastError(error);
             return;
         }
+        // The game's own pose here is the planted one: sample its floor before replacing it.
+        skater::layers::FloorSample floor{};
+        const bool have_floor = p.floor_strength > 0.0f && skater::layers::sample_floors(layout.buffer, floor);
+        const auto* keep = p.mask.get();
+        const auto keep_of = [keep](std::size_t joint) {
+            return keep && joint < keep->size() ? std::clamp((*keep)[joint], 0.0f, 1.0f) : 0.0f;
+        };
         for (std::size_t i = 0; i < current.size(); ++i) {
-            std::memcpy(current[i].scale.data(), p.bones[i].scale.data(), 12);
-            current[i].rotation = p.bones[i].rotation;
-            std::memcpy(current[i].position.data(), p.bones[i].position.data(), 12);
+            const float game = keep_of(static_cast<std::size_t>(p.first) + i);
+            if (game >= 1.0f) continue; // the game keeps this joint: leave the planted one
+            auto& c = current[i];
+            const auto& b = p.bones[i];
+            const float w = 1.0f - game;
+            if (w >= 1.0f) {
+                std::memcpy(c.scale.data(), b.scale.data(), 12);
+                c.rotation = b.rotation;
+                std::memcpy(c.position.data(), b.position.data(), 12);
+                continue;
+            }
+            c.rotation = anim_studio::slerp(c.rotation, b.rotation, w);
+            for (std::size_t k = 0; k < 3; ++k) {
+                c.scale[k] += (b.scale[k] - c.scale[k]) * w;
+                c.position[k] += (b.position[k] - c.position[k]) * w;
+            }
         }
         (void)poke(layout.buffer + p.first * sizeof(NativeBone), current.data(), current.size() * sizeof(NativeBone));
+        // poseanim's ik: lift what the clip drove clear of the floor the game planted it on. The legs
+        // scale by the mask (a leg the game keeps is already planted).
+        if (have_floor) {
+            const auto now = GetTickCount64();
+            const auto elapsed = l.floor_smoothed_at ? static_cast<std::uint64_t>(now - l.floor_smoothed_at) : 1000;
+            l.floor_smoothed_at = now;
+            const float tau = 90.0f;
+            const float alpha = elapsed >= 1000 ? 1.0f
+                                                : static_cast<float>(1.0 - std::exp(-static_cast<double>(elapsed) / tau));
+            l.floor_smoothed = skater::layers::smooth_floor(l.floor_smoothed, floor, alpha);
+            skater::layers::apply_floor(layout.buffer, l.floor_smoothed, 0.01f, p.floor_strength, keep_of(10));
+        }
     } catch (...) {
     }
     SetLastError(error);
@@ -1127,6 +1175,12 @@ void play(std::optional<Play> clip) {
 void set_mask(std::shared_ptr<const std::vector<float>> keep) {
     if (plan_draft.mask == keep) return;
     plan_draft.mask = std::move(keep);
+    publish();
+}
+void set_floor_correction(float strength) {
+    const float value = std::clamp(strength, 0.0f, 1.0f);
+    if (plan_draft.floor_correction == value) return;
+    plan_draft.floor_correction = value;
     publish();
 }
 std::optional<float> play_time() {

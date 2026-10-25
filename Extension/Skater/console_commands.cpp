@@ -761,8 +761,8 @@ void register_movement_commands(Commands &registry) {
             }
             skater::set_pose_ik(strength);
             out(strength > 0.0f
-                    ? "Floor correction allowed: a clip that opted in (poseanim <file> ik) is placed on the "
-                      "game's floor before its takeoff and after its landing."
+                    ? "Floor correction allowed: a clip that opted in (poseanim <file> ik) has its limbs "
+                      "lifted clear of the floor the game planted."
                     : "Floor correction off for every clip: they are written as authored.");
             return;
         }

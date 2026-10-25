@@ -52,6 +52,11 @@ bool playing() noexcept; // a clip of play() has not finished
 // do. Empty (the default) is every body joint. It applies to the clip of play(), not to a
 // replacement, and does not restart or move the clip. Client thread.
 void set_mask(std::shared_ptr<const std::vector<float>> keep);
+// Our floor correction (poseanim's "ik"): lift a clip's limbs clear of the floor the game planted
+// them on. 0 off (the default); the strength scales the correction. It runs where the pose goes to
+// the renderer, against the game's own planted pose, and the legs scale by set_mask's value (a leg
+// the game keeps is already planted). Client thread.
+void set_floor_correction(float strength);
 // The clip of play(), moved to `seconds` (clamped to it), held there or playing on from it.
 void seek(float seconds);
 void pause(bool paused);
