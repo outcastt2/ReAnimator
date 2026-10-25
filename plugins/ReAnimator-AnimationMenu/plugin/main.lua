@@ -34,7 +34,7 @@ local BONES = {
 local COLS, PAD, GAP, HEADER = 4, 24, 14, 132
 -- "#RRGGBB" or "#RRGGBBAA", as the overlay reads a colour.
 local C_TEXT, C_DIM = "#FFFFFF", "#B0B0B0"
-local C_BG, C_TILE = "#141210E8", "#1E1C1A50"
+local C_BG, C_TILE = "#141210E8", "#1E1C1A90"
 local C_HOT, C_PIN, C_BONE = "#FFFFFF", "#FFC030", "#D8D8D8"
 
 local function settings_of(name)
@@ -63,11 +63,14 @@ local function play(name)
     return ok
 end
 
--- Three moments through the clip, cycled as a flipbook so a pose reads as movement rather than a
--- snapshot. Each is one frame read from the file, so this costs the same for a 50 MB clip as a small
--- one and nothing is held afterwards.
-local POSES = { 0.2, 0.5, 0.8 }
-local THUMB_FRAMES = 20          -- draw frames one pose holds
+-- Eight moments through the clip, cycled as a flipbook: three was too choppy to read. Each is one
+-- frame read from the file, so this costs the same for a 50 MB clip as a small one and nothing is held.
+local POSES = { 0.08, 0.20, 0.32, 0.44, 0.56, 0.68, 0.80, 0.92 }
+local THUMB_FRAMES = 6           -- draw frames one pose holds
+
+-- The figure's own left to right, from its shoulders (JOINTS 6 and 9), so a clip authored facing any
+-- direction reads the same way up and facing the viewer.
+local LEFT_SHOULDER, RIGHT_SHOULDER = 6, 9
 
 local function build_thumbnail(name)
     local poses = {}
@@ -79,20 +82,13 @@ local function build_thumbnail(name)
         end
         poses[#poses + 1] = points
     end
-    -- Front view (X across) unless the clip spreads more along Z, which reads better for a pose that is
-    -- turned side-on.
-    local lx, hx, lz, hz = math.huge, -math.huge, math.huge, -math.huge
-    for _, points in ipairs(poses) do
-        for _, p in ipairs(points) do
-            if p.x < lx then lx = p.x end
-            if p.x > hx then hx = p.x end
-            if p.z < lz then lz = p.z end
-            if p.z > hz then hz = p.z end
-        end
-    end
-    local use_z = (hz - lz) > (hx - lx)
-    local function across(p) return use_z and p.z or p.x end
-    -- One box for all three poses, so the figure does not jump between them.
+    -- Across the figure, from the shoulder line of the first pose; up is the world's up.
+    local right, left = poses[1][RIGHT_SHOULDER], poses[1][LEFT_SHOULDER]
+    local ax, az = left.x - right.x, left.z - right.z
+    local length = math.sqrt(ax * ax + az * az)
+    if length < 1e-4 then ax, az = 1.0, 0.0 else ax, az = ax / length, az / length end
+    local function across(p) return p.x * ax + p.z * az end
+    -- One box for all the poses, so the figure does not jump between them.
     local minx, maxx, miny, maxy = math.huge, -math.huge, math.huge, -math.huge
     for _, points in ipairs(poses) do
         for _, p in ipairs(points) do
@@ -254,7 +250,7 @@ reskate.on("draw", function(d)
             })
             local lines = thumbnail(name, tick)
             if lines then
-                local inner_w, inner_h = tile_w - 18, tile_h - 14
+                local inner_w, inner_h = tile_w - 26, tile_h - 22
                 for _, l in ipairs(lines) do
                     d:line(vector.create(x + 9 + l[1] * inner_w, y + 7 + l[2] * inner_h, 0),
                            vector.create(x + 9 + l[3] * inner_w, y + 7 + l[4] * inner_h, 0),
