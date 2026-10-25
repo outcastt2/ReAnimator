@@ -1,4 +1,4 @@
--- The animation grid: every .rska clip in <game>/CustomAnimations as a tile with a stick figure of its
+﻿-- The animation grid: every .rska clip in <game>/CustomAnimations as a tile with a stick figure of its
 -- pose and the name under it. Hovering previews a clip once the cursor rests on it; clicking pins it.
 --
 -- A grid needs the plugin to draw it, so this is a screen with panel = false -- the whole screen is ours
@@ -31,9 +31,10 @@ local BONES = {
 }
 
 local COLS, PAD, GAP, HEADER = 4, 24, 14, 132
-local C_TEXT, C_DIM = 0xFFFFFFFF, 0xFFB0B0B0
-local C_BG, C_TILE = 0xE8141210, 0x501E1C1A
-local C_HOT, C_PIN, C_BONE = 0xFFFFFFFF, 0xFF30C0FF, 0xFFD8D8D8
+-- "#RRGGBB" or "#RRGGBBAA", as the overlay reads a colour.
+local C_TEXT, C_DIM = "#FFFFFF", "#B0B0B0"
+local C_BG, C_TILE = "#141210E8", "#1E1C1A50"
+local C_HOT, C_PIN, C_BONE = "#FFFFFF", "#FFC030", "#D8D8D8"
 
 local function settings_of(name)
     local s = settings[name]
@@ -131,7 +132,7 @@ reskate.on("draw", function(d)
     local left = c and c.left or false
 
     d:rect(vector.create(0, 0, 0), vector.create(w, h, 0), { colour = C_BG, fill = true })
-    d:text(vector.create(PAD, 30, 0), "CUSTOM ANIMATIONS", { colour = C_TEXT, size = 34, font = 3 })
+    d:text(vector.create(PAD, 30, 0), "CUSTOM ANIMATIONS", { colour = C_TEXT, size = 34, font = "title" })
     d:text(vector.create(PAD, 78, 0), pinned and ("Playing " .. pinned) or "Nothing playing",
            { colour = pinned and C_PIN or C_DIM, size = 20 })
 
