@@ -62,14 +62,18 @@ local function play(name)
     return ok
 end
 
--- One representative pose, normalised into a 0..1 box with y down. Kept: a clip is read once.
-local function thumbnail(name)
-    local cached = thumbs[name]
-    if cached ~= nil then return cached or nil end
-    local ok, points = pcall(reskate.animation.world, "rska:" .. name, 0.35, JOINTS)
+-- One representative pose, normalised into a 0..1 box with y down.
+--
+-- A clip has to be read to sample it, and 45 of them at once overruns both the 50 ms a handler is
+-- allowed and the 48 MB of clips a plugin may hold, so this is called for one clip a frame and the
+-- clip is released again straight after: only the lines are kept.
+local function build_thumbnail(name)
+    local key = "rska:" .. name
+    local ok, points = pcall(reskate.animation.world, key, 0.35, JOINTS)
+    pcall(reskate.animation.forget, key)
     if not ok or type(points) ~= "table" or #points < #JOINTS then
         thumbs[name] = false
-        return nil
+        return
     end
     local minx, maxx, miny, maxy = math.huge, -math.huge, math.huge, -math.huge
     for _, p in ipairs(points) do
@@ -88,7 +92,13 @@ local function thumbnail(name)
         lines[#lines + 1] = { nx(a.x), ny(a.y), nx(c.x), ny(c.y) }
     end
     thumbs[name] = lines
-    return lines
+end
+
+-- What is known so far: a tile with no lines yet just draws empty until its turn comes.
+local function thumbnail(name)
+    local cached = thumbs[name]
+    if cached == nil or cached == false then return nil end
+    return cached
 end
 
 -- The way in: a page in the menu's PLUGINS section.
@@ -146,6 +156,15 @@ reskate.on("draw", function(d)
     if #names == 0 then
         d:text(vector.create(PAD, HEADER, 0), "No .rska files in CustomAnimations yet.", { colour = C_DIM, size = 22 })
         return
+    end
+
+    -- One clip read a frame for its thumbnail, then let go: the first pass fills the grid in a second
+    -- or so and the tiles draw empty until their turn comes.
+    for _, name in ipairs(names) do
+        if thumbs[name] == nil then
+            build_thumbnail(name)
+            break
+        end
     end
 
     local tile_w = (w - PAD * 2 - GAP * (COLS - 1)) / COLS
