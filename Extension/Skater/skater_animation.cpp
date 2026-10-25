@@ -118,6 +118,17 @@ const std::array<bool, skeleton_joints>& body_joints() {
     return mask;
 }
 
+// The engine's own helper clusters: 2..6 and 375..394 (ground, board and physics helpers). They are
+// not body joints -- the game's own clips never write them -- and they track the board and the
+// physics every frame. Writing them at render time, after the physics has moved them, stamps a stale
+// value over a live one: pose_layers calls it "floated the skater above the board", and it is the
+// hover and the jitter. The placement (0, 1) is left alone too, except for the room.
+constexpr std::uint32_t first_body_joint = 7, last_body_joint = 374;
+bool clip_writes(std::size_t joint) noexcept {
+    // The body, and the placement the room moves the skater with. Never 2..6 or 375..394.
+    return joint <= 1 || (joint >= first_body_joint && joint <= last_body_joint);
+}
+
 // ---- a clip on the floor (Play::floor; PR 297's anim_studio.cpp) ------------------------------------------
 // The board under the feet, as when riding. The game's clips leave the board where the animators had it,
 // and the game's foot placement puts the feet on it: before the pop and after the landing their feet
@@ -990,6 +1001,7 @@ void on_send(std::uintptr_t component, std::vector<multiplayer::Transform>& skat
         // build-dependent offset, and it jitters as the game's foot placement fights the clip.
         const auto* keep = sp.mask.get();
         for (std::uint32_t i = sp.first; i < sp.last; ++i) {
+            if (!clip_writes(i)) continue; // the engine's own helper cluster
             const float game = keep && i < keep->size() ? std::clamp((*keep)[i], 0.0f, 1.0f) : 0.0f;
             if (game >= 1.0f) continue;
             const auto& j = sp.joints[i - sp.first];
@@ -1105,7 +1117,9 @@ void on_render(std::uintptr_t animation_interface) noexcept {
             return keep && joint < keep->size() ? std::clamp((*keep)[joint], 0.0f, 1.0f) : 0.0f;
         };
         for (std::size_t i = 0; i < current.size(); ++i) {
-            const float game = keep_of(static_cast<std::size_t>(p.first) + i);
+            const auto joint = static_cast<std::size_t>(p.first) + i;
+            if (!clip_writes(joint)) continue; // the engine's own helper cluster
+            const float game = keep_of(joint);
             if (game >= 1.0f) continue; // the game keeps this joint: leave the planted one
             auto& c = current[i];
             const auto& b = p.bones[i];
