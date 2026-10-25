@@ -1180,10 +1180,11 @@ void on_skeleton(std::uintptr_t rig) noexcept {
     SetLastError(error);
 }
 
-// The local skater's pose handed to the renderer. The clip is written in on_skeleton as well, but that
-// write does not reach the buffer the renderer publishes from on 2.1.2, so it is written here too --
-// this is the point that reaches the screen. on_skeleton's write is what the physics and constraints
-// see, which is what makes them act on the clip instead of on the game's own pose.
+// The local skater's pose handed to the renderer. The clip is written in on_skeleton -- after the
+// game's own constraints, which is where this mod's player wrote it before 2.1.2 and where it worked on
+// every height. Nothing is written here: writing at the render publication fed the clip back into the
+// body physics, which is what thrashed the legs and shook the camera on a build the clip was not
+// authored on.
 void on_render(std::uintptr_t animation_interface) noexcept {
     auto& l = live();
     const auto component = l.component.load(std::memory_order_acquire);
@@ -1191,11 +1192,7 @@ void on_render(std::uintptr_t animation_interface) noexcept {
     const auto error = GetLastError();
     try {
         const auto holder = read<std::uintptr_t>(component + 0xa0);
-        if (!holder || !*holder || animation_interface != *holder + 0xc0) {
-            hide_in_room(animation_interface, true);
-        } else {
-            write_clip_pose(animation_interface);
-        }
+        if (!holder || !*holder || animation_interface != *holder + 0xc0) hide_in_room(animation_interface, true);
     } catch (...) {
     }
     SetLastError(error);
