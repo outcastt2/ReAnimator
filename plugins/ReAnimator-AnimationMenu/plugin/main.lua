@@ -72,10 +72,10 @@ local function thumbnail(name)
     end
     local minx, maxx, miny, maxy = math.huge, -math.huge, math.huge, -math.huge
     for _, p in ipairs(points) do
-        if p[1] < minx then minx = p[1] end
-        if p[1] > maxx then maxx = p[1] end
-        if p[2] < miny then miny = p[2] end
-        if p[2] > maxy then maxy = p[2] end
+        if p.x < minx then minx = p.x end
+        if p.x > maxx then maxx = p.x end
+        if p.y < miny then miny = p.y end
+        if p.y > maxy then maxy = p.y end
     end
     local span = math.max(maxx - minx, maxy - miny, 1e-3)
     local padx, pady = (1 - (maxx - minx) / span) * 0.5, (1 - (maxy - miny) / span) * 0.5
@@ -84,7 +84,7 @@ local function thumbnail(name)
     local lines = {}
     for _, b in ipairs(BONES) do
         local a, c = points[b[1]], points[b[2]]
-        lines[#lines + 1] = { nx(a[1]), ny(a[2]), nx(c[1]), ny(c[2]) }
+        lines[#lines + 1] = { nx(a.x), ny(a.y), nx(c.x), ny(c.y) }
     end
     thumbs[name] = lines
     return lines
@@ -123,11 +123,11 @@ end)
 reskate.on("draw", function(d)
     if not screen_open then return end
     local display = d:size()          -- a vector: the window's width and height
-    local w, h = display[1], display[2]
+    local w, h = display.x, display.y
     local names = reskate.animation.rska_list()
     local c = reskate.input.cursor()
-    local mx = c and c.position and c.position[1] or nil
-    local my = c and c.position and c.position[2] or nil
+    local mx = c and c.position and c.position.x or nil
+    local my = c and c.position and c.position.y or nil
     local left = c and c.left or false
 
     d:rect(vector.create(0, 0, 0), vector.create(w, h, 0), { colour = C_BG, fill = true })
