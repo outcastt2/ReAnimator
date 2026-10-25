@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <fstream>
 #include <format>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -155,6 +156,38 @@ bool load_rska(const std::filesystem::path& path, Clip& clip, std::string& error
             }
             dst[j] = joint;
         }
+    }
+    // Which joints the clip only turns, so their position stays the skater's own build. The game's
+    // own clips carry rotations, not positions: the build places every joint, which is why a gesture
+    // looks right on any height. A clip exported from one rig carries that rig's offsets, and forcing
+    // them onto a shorter skeleton makes the body physics fight the bone lengths -- the jitter other
+    // players see on a height that is not the one the clip was authored on. A joint whose position
+    // actually moves in the clip is one the clip really drives (the hips going down in a sit) and
+    // keeps its position; every other joint is only turned.
+    clip.turned_only.assign(joints, 1);
+    {
+        std::vector<float> low(static_cast<std::size_t>(joints) * 3, std::numeric_limits<float>::max());
+        std::vector<float> high(static_cast<std::size_t>(joints) * 3, std::numeric_limits<float>::lowest());
+        for (std::uint32_t f = 0; f < frame_count; ++f) {
+            const Joint* frame = clip.frames.data() + static_cast<std::size_t>(f) * joints;
+            for (std::uint32_t j = 0; j < joints; ++j)
+                for (std::size_t k = 0; k < 3; ++k) {
+                    const auto at = static_cast<std::size_t>(j) * 3 + k;
+                    low[at] = std::min(low[at], frame[j].position[k]);
+                    high[at] = std::max(high[at], frame[j].position[k]);
+                }
+        }
+        std::size_t turned = 0;
+        for (std::uint32_t j = 0; j < joints; ++j) {
+            bool moves = false;
+            for (std::size_t k = 0; k < 3; ++k)
+                if (high[static_cast<std::size_t>(j) * 3 + k] - low[static_cast<std::size_t>(j) * 3 + k] > 1e-4f) moves = true;
+            if (moves) clip.turned_only[j] = 0;
+            else ++turned;
+        }
+        logging::log(logging::Level::info, logging::Channel::skater,
+                     "Custom animation: {} of {} joints are only turned (the build places them); {} carry a position.",
+                     turned, joints, joints - turned);
     }
     return true;
 }

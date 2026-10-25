@@ -400,6 +400,9 @@ struct SentPose {
     std::uint32_t first{}, last{};
     std::vector<Joint> joints;
     double at{};
+    // set_mask(), as for the renderer: a joint the game keeps must not be stamped over the planted
+    // one that capture_skeleton read, or the others see an unplanted leg the local player never sees.
+    std::shared_ptr<const std::vector<float>> mask;
 };
 SentPose& sent_pose() {
     static auto* value = new SentPose;
@@ -893,6 +896,31 @@ void on_animation(std::uintptr_t component) noexcept {
                 p.floor_strength = clip ? snap->floor_correction : 0.0f;
             }
             if (clip) {
+                // poseanim's own line beside the probe above: the mask in force and how far the clip
+                // moved the hips and head in one update. A settled pose that still steps a centimetre
+                // a frame is oscillating; a smooth one steps a fraction of a millimetre.
+                {
+                    static double next_diag = 0;
+                    static float last_hips = 0, last_head = 0, max_hips = 0, max_head = 0;
+                    static bool have_last = false;
+                    const float hips_y = l.pose[hips_joint].position[1];
+                    const float head_y = l.pose[103].position[1];
+                    if (have_last) {
+                        max_hips = std::max(max_hips, std::abs(hips_y - last_hips));
+                        max_head = std::max(max_head, std::abs(head_y - last_head));
+                    }
+                    last_hips = hips_y;
+                    last_head = head_y;
+                    have_last = true;
+                    if (at >= next_diag) {
+                        next_diag = at + 2;
+                        const float keep = snap->mask && snap->mask->size() > 10 ? (*snap->mask)[10] : 0.0f;
+                        logging::log(Level::info, Channel::skater,
+                                     "Clip diag: mask {:.2f}, max hips step {:.4f} m, max head step {:.4f} m, t {:.3f}",
+                                     keep, max_hips, max_head, t);
+                        max_hips = max_head = 0;
+                    }
+                }
                 auto& pr = probe();
                 std::lock_guard probe_lock(pr.mutex);
                 ++pr.updates;
@@ -936,6 +964,7 @@ void on_animation(std::uintptr_t component) noexcept {
             sp.last = static_cast<std::uint32_t>(std::max(sent_to, sent_first));
             sp.joints.assign(sent.begin() + static_cast<std::ptrdiff_t>(sent_first), sent.begin() + static_cast<std::ptrdiff_t>(std::max(sent_to, sent_first)));
             sp.at = at;
+            sp.mask = clip && snap->play && clip == snap->play->clip.get() ? snap->mask : nullptr;
         }
         auto& pb = pending_board();
         std::lock_guard lock(pb.mutex);
@@ -955,10 +984,24 @@ void on_send(std::uintptr_t component, std::vector<multiplayer::Transform>& skat
         auto& sp = sent_pose();
         std::lock_guard lock(sp.mutex);
         if (component != sp.component || now_seconds() - sp.at > 0.15 || sp.last > skater.size()) return;
+        // The same mask as the renderer. A joint the game keeps is already in `skater` as the game
+        // planted it (capture_skeleton read the buffer); stamping the clip's animation-time value
+        // over it is what made the others see an unplanted leg the local player never sees -- a
+        // build-dependent offset, and it jitters as the game's foot placement fights the clip.
+        const auto* keep = sp.mask.get();
         for (std::uint32_t i = sp.first; i < sp.last; ++i) {
+            const float game = keep && i < keep->size() ? std::clamp((*keep)[i], 0.0f, 1.0f) : 0.0f;
+            if (game >= 1.0f) continue;
             const auto& j = sp.joints[i - sp.first];
-            skater[i].rotation = j.rotation;
-            skater[i].position = j.position;
+            auto& t = skater[i];
+            const float w = 1.0f - game;
+            if (w >= 1.0f) {
+                t.rotation = j.rotation;
+                t.position = j.position;
+                continue;
+            }
+            t.rotation = anim_studio::slerp(t.rotation, j.rotation, w);
+            for (std::size_t k = 0; k < 3; ++k) t.position[k] += (j.position[k] - t.position[k]) * w;
         }
     } catch (...) {
     }
