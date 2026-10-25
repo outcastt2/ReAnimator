@@ -14,6 +14,7 @@ local hovered = nil
 local hover_frames = 0
 local was_left = false
 local scroll = 0
+local tick = 0          -- draw frames, for the flipbook
 
 local settings = {}        -- [name] = { floor = 0..1, mask = "auto"|"full"|"legs" }
 local thumbs = {}          -- [name] = { {x1,y1,x2,y2}, ... } in a 0..1 box, or false when it failed
@@ -62,40 +63,67 @@ local function play(name)
     return ok
 end
 
--- One representative pose, normalised into a 0..1 box with y down.
---
--- A "rska:" clip is read as the single frame it needs, so this costs the same for a 50 MB clip as for a
--- small one and nothing is held afterwards. One a frame fills the grid in about a second.
+-- Three moments through the clip, cycled as a flipbook so a pose reads as movement rather than a
+-- snapshot. Each is one frame read from the file, so this costs the same for a 50 MB clip as a small
+-- one and nothing is held afterwards.
+local POSES = { 0.2, 0.5, 0.8 }
+local THUMB_FRAMES = 20          -- draw frames one pose holds
+
 local function build_thumbnail(name)
-    local ok, points = pcall(reskate.animation.world, "rska:" .. name, 0.35, JOINTS)
-    if not ok or type(points) ~= "table" or #points < #JOINTS then
-        thumbs[name] = false
-        return
+    local poses = {}
+    for _, at in ipairs(POSES) do
+        local ok, points = pcall(reskate.animation.world, "rska:" .. name, at, JOINTS)
+        if not ok or type(points) ~= "table" or #points < #JOINTS then
+            thumbs[name] = false
+            return
+        end
+        poses[#poses + 1] = points
     end
+    -- Front view (X across) unless the clip spreads more along Z, which reads better for a pose that is
+    -- turned side-on.
+    local lx, hx, lz, hz = math.huge, -math.huge, math.huge, -math.huge
+    for _, points in ipairs(poses) do
+        for _, p in ipairs(points) do
+            if p.x < lx then lx = p.x end
+            if p.x > hx then hx = p.x end
+            if p.z < lz then lz = p.z end
+            if p.z > hz then hz = p.z end
+        end
+    end
+    local use_z = (hz - lz) > (hx - lx)
+    local function across(p) return use_z and p.z or p.x end
+    -- One box for all three poses, so the figure does not jump between them.
     local minx, maxx, miny, maxy = math.huge, -math.huge, math.huge, -math.huge
-    for _, p in ipairs(points) do
-        if p.x < minx then minx = p.x end
-        if p.x > maxx then maxx = p.x end
-        if p.y < miny then miny = p.y end
-        if p.y > maxy then maxy = p.y end
+    for _, points in ipairs(poses) do
+        for _, p in ipairs(points) do
+            local a = across(p)
+            if a < minx then minx = a end
+            if a > maxx then maxx = a end
+            if p.y < miny then miny = p.y end
+            if p.y > maxy then maxy = p.y end
+        end
     end
     local span = math.max(maxx - minx, maxy - miny, 1e-3)
     local padx, pady = (1 - (maxx - minx) / span) * 0.5, (1 - (maxy - miny) / span) * 0.5
-    local function nx(x) return (x - minx) / span + padx end
-    local function ny(y) return 1 - ((y - miny) / span + pady) end
-    local lines = {}
-    for _, b in ipairs(BONES) do
-        local a, c = points[b[1]], points[b[2]]
-        lines[#lines + 1] = { nx(a.x), ny(a.y), nx(c.x), ny(c.y) }
+    local function nx(v) return (v - minx) / span + padx end
+    local function ny(v) return 1 - ((v - miny) / span + pady) end
+    local frames = {}
+    for _, points in ipairs(poses) do
+        local lines = {}
+        for _, b in ipairs(BONES) do
+            local a, c = points[b[1]], points[b[2]]
+            lines[#lines + 1] = { nx(across(a)), ny(a.y), nx(across(c)), ny(c.y) }
+        end
+        frames[#frames + 1] = lines
     end
-    thumbs[name] = lines
+    thumbs[name] = frames
 end
 
--- What is known so far: a tile with no lines yet just draws empty until its turn comes.
-local function thumbnail(name)
-    local cached = thumbs[name]
-    if cached == nil or cached == false then return nil end
-    return cached
+-- The pose to draw now: a tile with nothing yet draws empty until its turn comes.
+local function thumbnail(name, tick)
+    local frames = thumbs[name]
+    if frames == nil or frames == false then return nil end
+    return frames[math.floor(tick / THUMB_FRAMES) % #frames + 1]
 end
 
 -- The way in: a page in the menu's PLUGINS section, with the list and the settings. The grid is a
@@ -164,6 +192,7 @@ end)
 
 reskate.on("draw", function(d)
     if not screen_open then return end
+    tick = tick + 1
     local display = d:size()          -- a vector: the window's width and height
     local w, h = display.x, display.y
     local names = reskate.animation.rska_list()
@@ -223,7 +252,7 @@ reskate.on("draw", function(d)
                 colour = active and C_PIN or (hot and C_HOT or C_TILE),
                 fill = not (active or hot), thickness = 2, rounding = 6,
             })
-            local lines = thumbnail(name)
+            local lines = thumbnail(name, tick)
             if lines then
                 local inner_w, inner_h = tile_w - 18, tile_h - 14
                 for _, l in ipairs(lines) do
@@ -237,20 +266,9 @@ reskate.on("draw", function(d)
         end
     end
 
-    -- Hover previews after the cursor rests on a tile, so sweeping across the grid does not fire a play
-    -- for every tile passed (the animation system takes four a second).
-    if hover_now ~= hovered then
-        hovered, hover_frames = hover_now, 0
-    else
-        hover_frames = hover_frames + 1
-    end
-    if hovered and hovered ~= pinned and hover_frames == 10 then
-        if play(hovered) then previewing = hovered end
-    end
-    if not hovered and previewing then
-        if pinned then play(pinned) else reskate.animation.stop() end
-        previewing = nil
-    end
+    -- Hover only highlights. Playing is on the click: a preview that took over the skater as the cursor
+    -- passed was the wrong way round.
+    hovered = hover_now
 
     -- Click pins. The cursor reports the button held, so this is the edge.
     if left and not was_left and mx and my then

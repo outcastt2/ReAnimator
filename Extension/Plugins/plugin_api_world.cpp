@@ -835,13 +835,14 @@ struct WorldApi {
         if (name.starts_with("rska:")) {
             // A clip in <game>/CustomAnimations, by name: what the console's poseanim plays, so the
             // plugin menu and the console offer the same files.
+            //
+            // Deliberately not cached. The playing clip holds itself, so the cache buys nothing, and a
+            // cached clip counts against the 48 MB a plugin may hold -- one 52 MB clip could never play,
+            // and a few ordinary ones filled the budget and stopped the plugin with errors.
             std::string why;
             auto clip = game(plugin).rska_clip(std::string_view(name).substr(5), why);
             if (!clip) luaL_error(L, "the clip %s cannot be read: %s", name.c_str(), why.c_str());
-            if (pose_bytes(*clip) + plugin.clip_bytes_ > plugin.limits_.clip_bytes)
-                luaL_error(L, "a plugin's clips hold at most %d MB of poses", static_cast<int>(plugin.limits_.clip_bytes >> 20));
-            plugin.clip_bytes_ += pose_bytes(*clip);
-            return plugin.clips_.emplace(name, std::move(clip)).first->second;
+            return clip;
         }
         if (name.starts_with("rec:") || name.starts_with("clip:") || name.starts_with("edit:")) luaL_error(L, "there is no clip %s", name.c_str());
         std::string error, bytes;
