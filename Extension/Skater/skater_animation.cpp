@@ -908,31 +908,6 @@ void on_animation(std::uintptr_t component) noexcept {
                 p.floor_strength = clip ? snap->floor_correction : 0.0f;
             }
             if (clip) {
-                // poseanim's own line beside the probe above: the mask in force and how far the clip
-                // moved the hips and head in one update. A settled pose that still steps a centimetre
-                // a frame is oscillating; a smooth one steps a fraction of a millimetre.
-                {
-                    static double next_diag = 0;
-                    static float last_hips = 0, last_head = 0, max_hips = 0, max_head = 0;
-                    static bool have_last = false;
-                    const float hips_y = l.pose[hips_joint].position[1];
-                    const float head_y = l.pose[103].position[1];
-                    if (have_last) {
-                        max_hips = std::max(max_hips, std::abs(hips_y - last_hips));
-                        max_head = std::max(max_head, std::abs(head_y - last_head));
-                    }
-                    last_hips = hips_y;
-                    last_head = head_y;
-                    have_last = true;
-                    if (at >= next_diag) {
-                        next_diag = at + 2;
-                        const float keep = snap->mask && snap->mask->size() > 10 ? (*snap->mask)[10] : 0.0f;
-                        logging::log(Level::info, Channel::skater,
-                                     "Clip diag: mask {:.2f}, max hips step {:.4f} m, max head step {:.4f} m, t {:.3f}",
-                                     keep, max_hips, max_head, t);
-                        max_hips = max_head = 0;
-                    }
-                }
                 auto& pr = probe();
                 std::lock_guard probe_lock(pr.mutex);
                 ++pr.updates;
@@ -1415,14 +1390,19 @@ void tick(std::uintptr_t base, std::uintptr_t component, bool allowed) {
         publish();
     }
     {
+        // The clip probe's log line is off: it wrote two lines every two seconds while a clip played,
+        // which is noise for players. The probe itself still runs and resets (the counters are what
+        // `poseanim`'s trace reads); only the line is gated. Set this to true to have it back.
+        constexpr bool log_clip_probe = false;
         static double next_probe = 0;
         const double t = now_seconds();
         if (plan_draft.play && t >= next_probe) {
             next_probe = t + 2;
             auto& pr = probe();
             std::lock_guard probe_lock(pr.mutex);
-            if (pr.updates || pr.drawn || pr.stale || pr.moved)
-                logging::log(Level::info, Channel::skater,
+            if constexpr (log_clip_probe) {
+                if (pr.updates || pr.drawn || pr.stale || pr.moved)
+                    logging::log(Level::info, Channel::skater,
                              "Clip pose (2 s): {} updates, {} renders drew it, {} stale, {} on another buffer, {} room hides; root scale {:.4f}..{:.4f}, "
                              "placement {:.4f}..{:.4f}, hips {:.4f}..{:.4f} at height {:.3f}..{:.3f}; clip time {:.3f}..{:.3f}; head to foot {:.3f}..{:.3f} m; "
                              "most in one update: hips {:.3f} m, head to foot {:.3f} m; most changed coming in {}, written {}; live placement {:.3f}..{:.3f} m above the ground, hips {:.3f}..{:.3f} m above it{}",
@@ -1431,6 +1411,7 @@ void tick(std::uintptr_t base, std::uintptr_t component, bool allowed) {
                              pr.size[0], pr.size[1], pr.hips_step, pr.size_step, Probe::worst(pr.in_turn, pr.in_move),
                              Probe::worst(pr.out_turn, pr.out_move), pr.place_above[0], pr.place_above[1], pr.hips_above[0], pr.hips_above[1],
                              room_shown.load(std::memory_order_acquire) ? " (in the room)" : "");
+            }
             pr.reset();
         }
     }
