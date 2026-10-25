@@ -101,7 +101,9 @@ local function thumbnail(name)
     return cached
 end
 
--- The way in: a page in the menu's PLUGINS section.
+-- The way in: a page in the menu's PLUGINS section, with the list and the settings. The grid is a
+-- screen of its own -- the widget system is a vertical list with no grid, and a plugin-drawn screen is
+-- always full-screen -- so the page keeps the quick list and offers the grid for browsing.
 reskate.menu.page("Animations", function(ui)
     ui:heading("Custom animations")
     local names = reskate.animation.rska_list()
@@ -110,8 +112,7 @@ reskate.menu.page("Animations", function(ui)
         reskate.ui.open(screen_title)
         screen_open = true
     end
-    ui:note("A tile for every clip, with a stick figure of its pose.")
-    ui:note("Hover to preview, click to play. Wheel scrolls.")
+
     if pinned then
         local s = settings_of(pinned)
         ui:card("SETTINGS", pinned)
@@ -120,6 +121,26 @@ reskate.menu.page("Animations", function(ui)
         s.floor = corrected and 1 or 0
         local tab = ui:tabs("mask", { "AUTO", "FULL", "LEGS" }, mask_index(s.mask))
         s.mask = masks[tab] or "auto"
+        reskate.animation.floor(s.floor)
+        reskate.animation.mask(s.mask)
+        if ui:button("stop", "STOP", false) then
+            reskate.animation.stop()
+            pinned, previewing = nil, nil
+        end
+    end
+
+    if #names == 0 then
+        ui:note("No .rska files in CustomAnimations yet.")
+        ui:note("Put them in the game folder's CustomAnimations folder.")
+        return
+    end
+
+    ui:card("CLIPS", string.format("%d clip%s", #names, #names == 1 and "" or "s"))
+    for _, name in ipairs(names) do
+        local playing = (name == pinned)
+        if ui:button("p" .. name, (playing and "> " or "   ") .. name, playing) then
+            if play(name) then pinned, previewing = name, nil end
+        end
     end
 end)
 
