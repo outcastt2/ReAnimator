@@ -1080,7 +1080,12 @@ void on_render(std::uintptr_t animation_interface) noexcept {
             return;
         }
         const auto layout = multiplayer::read_native_pose_layout(peek, l.base.load(std::memory_order_acquire), *holder, 512);
-        if (layout.buffer != p.buffer || layout.count != skeleton_joints || p.last > layout.count || p.first >= p.last) {
+        // The buffer address is deliberately not compared: the skeleton streams, and a buffer that
+        // moved is still this skater's (the holder above is the same), so the pose is written into the
+        // new one. Skipping those frames drew the game's own pose instead, which is invisible on the
+        // height the clip was authored on and a visible jitter on any other -- the pose alternated
+        // between the clip and the game's every time the buffer moved.
+        if (layout.count != skeleton_joints || p.last > layout.count || p.first >= p.last) {
             count(&Probe::moved);
             SetLastError(error);
             return;
