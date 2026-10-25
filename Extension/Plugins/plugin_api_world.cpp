@@ -974,6 +974,32 @@ struct WorldApi {
         lua_pushnumber(L, game(plugin).animation_floor(strength));
         return 1;
     }
+    // world(clip, seconds, joints): the world position of each of `joints` at `seconds` into the clip,
+    // for drawing a thumbnail of the pose. At most 64 joints, at most 4 calls a second.
+    static int animation_world(lua_State* L) {
+        auto& plugin = animating(L, "reskate.animation.world");
+        auto clip = clip_at(L, plugin, 1);
+        const double seconds = luaL_checknumber(L, 2);
+        luaL_checktype(L, 3, LUA_TTABLE);
+        const int count = static_cast<int>(lua_objlen(L, 3));
+        if (count <= 0 || count > 64) luaL_argerror(L, 3, "1 to 64 joints");
+        thread_local std::vector<anim_studio::Joint> pose;
+        pose.assign(clip->joints, anim_studio::Joint{});
+        clip->sample(static_cast<float>(std::clamp(seconds, 0.0, static_cast<double>(clip->duration()))),
+                     std::span<anim_studio::Joint>(pose.data(), pose.size()));
+        const std::span<const anim_studio::Joint> whole(pose.data(), pose.size());
+        lua_createtable(L, count, 0);
+        for (int i = 1; i <= count; ++i) {
+            lua_rawgeti(L, 3, i);
+            const auto joint = static_cast<int>(luaL_checkinteger(L, -1));
+            lua_pop(L, 1);
+            if (joint < 0 || joint >= static_cast<int>(clip->joints)) luaL_error(L, "joint %d is not in the clip", joint);
+            const auto placed = anim_studio::world(whole, static_cast<std::uint16_t>(joint));
+            lua_pushvector(L, placed.position[0], placed.position[1], placed.position[2]);
+            lua_rawseti(L, -2, i);
+        }
+        return 1;
+    }
     static int animation_stop(lua_State* L) {
         auto& plugin = animating(L, "reskate.animation.stop");
         game(plugin).stop_clip(plugin.id());
@@ -2973,6 +2999,7 @@ void WorldApi::install(Plugin& plugin, lua_State* L) {
                                    {"save", animation_save}, {"game_clips", animation_game_clips},
                                    {"rska_list", animation_rska_list},
                                    {"mask", animation_mask}, {"floor", animation_floor},
+                                   {"world", animation_world},
                                    {"mirror", animation_mirror}});
     add_functions(L, "outfit", {{"set", outfit_set}, {"clear", outfit_clear}, {"find", outfit_find}, {"slots", outfit_slots}, {"status", outfit_status}});
     add_functions(L, "audio", {{"play", audio_play}, {"set", audio_set}, {"stop", audio_stop}, {"playing", audio_playing}});

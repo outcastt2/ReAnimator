@@ -1,26 +1,44 @@
--- The animation menu: the .rska clips in <game>/CustomAnimations, played on your skater.
+-- The animation grid: every .rska clip in <game>/CustomAnimations as a tile with a stick figure of its
+-- pose and the name under it. Hovering previews a clip once the cursor rests on it; clicking pins it.
 --
--- Each clip keeps two settings while the game runs: the floor correction ("ik") and which joints the
--- clip drives (the mask). A clip that sits right with the correction is often one whose legs go
--- bow-legged with it, so they are per clip rather than global.
---
--- They are set explicitly on every play. The animation system's correction and mask are global state
--- that `poseanim` also writes, so without this the menu would inherit whatever the console last left
--- behind -- which is why every clip used to start corrected.
---
--- reskate.animation.play("rska:<name>") is the same clip the console's `poseanim <name>` plays.
+-- A grid needs the plugin to draw it, so this is a screen with panel = false -- the whole screen is ours
+-- and reskate.input.cursor() gives the mouse for hover, clicks and the wheel. The menu page is the way
+-- in, because the PLUGINS section is where players look.
 
-local current = nil    -- the clip this page started, while it is still playing
-local failure = ""     -- the last play that did not start
-local settings = {}    -- [name] = { floor = 0..1, mask = "auto" | "full" | "legs" }
+local screen_title = "Animations"
+local screen_open = false
+
+local pinned = nil         -- the clip the player clicked
+local previewing = nil     -- the clip a hover started, while it is only a preview
+local hovered = nil
+local hover_frames = 0
+local was_left = false
+local scroll = 0
+
+local settings = {}        -- [name] = { floor = 0..1, mask = "auto"|"full"|"legs" }
+local thumbs = {}          -- [name] = { {x1,y1,x2,y2}, ... } in a 0..1 box, or false when it failed
 
 local masks = { "auto", "full", "legs" }
+
+-- The joints a thumbnail draws, and the bones between them (indices into that list).
+local JOINTS = { 7, 42, 44, 101, 103, 275, 277, 278, 46, 48, 49, 341, 342, 343, 344, 8, 9, 10, 11 }
+local BONES = {
+    { 1, 2 }, { 2, 3 }, { 3, 4 }, { 4, 5 },             -- hips, lower back, chest, neck, head
+    { 3, 6 }, { 6, 7 }, { 7, 8 },                       -- left shoulder, elbow, hand
+    { 3, 9 }, { 9, 10 }, { 10, 11 },                    -- right shoulder, elbow, hand
+    { 1, 12 }, { 12, 13 }, { 13, 14 }, { 14, 15 },      -- left leg, knee, foot, toes
+    { 1, 16 }, { 16, 17 }, { 17, 18 }, { 18, 19 },      -- right leg, knee, foot, toes
+}
+
+local COLS, PAD, GAP, HEADER = 4, 24, 14, 132
+local C_TEXT, C_DIM = 0xFFFFFFFF, 0xFFB0B0B0
+local C_BG, C_TILE = 0xE8141210, 0x501E1C1A
+local C_HOT, C_PIN, C_BONE = 0xFFFFFFFF, 0xFF30C0FF, 0xFFD8D8D8
 
 local function settings_of(name)
     local s = settings[name]
     if not s then
-        -- Off, and automatic: what `poseanim <file>` does with no argument.
-        s = { floor = 0, mask = "auto" }
+        s = { floor = 0, mask = "auto" }   -- what `poseanim <file>` does with no argument
         settings[name] = s
     end
     return s
@@ -35,61 +53,163 @@ end
 
 local function play(name)
     local s = settings_of(name)
-    -- Before it starts, so the first frame is already the one asked for.
+    -- Explicitly, or the clip inherits whatever the console last left in the animation system.
     reskate.animation.floor(s.floor)
     reskate.animation.mask(s.mask)
     local ok, why = reskate.animation.play("rska:" .. name, { loop = true })
-    if not ok then
-        failure = tostring(why)
-        return false
-    end
-    failure = ""
-    return true
+    if not ok then reskate.log("animation menu: " .. tostring(why)) end
+    return ok
 end
 
-reskate.menu.page("Animations", function(ui)
-    if current and not reskate.animation.playing() then current = nil end
+-- One representative pose, normalised into a 0..1 box with y down. Kept: a clip is read once.
+local function thumbnail(name)
+    local cached = thumbs[name]
+    if cached ~= nil then return cached or nil end
+    local ok, points = pcall(reskate.animation.world, "rska:" .. name, 0.35, JOINTS)
+    if not ok or type(points) ~= "table" or #points < #JOINTS then
+        thumbs[name] = false
+        return nil
+    end
+    local minx, maxx, miny, maxy = math.huge, -math.huge, math.huge, -math.huge
+    for _, p in ipairs(points) do
+        if p[1] < minx then minx = p[1] end
+        if p[1] > maxx then maxx = p[1] end
+        if p[2] < miny then miny = p[2] end
+        if p[2] > maxy then maxy = p[2] end
+    end
+    local span = math.max(maxx - minx, maxy - miny, 1e-3)
+    local padx, pady = (1 - (maxx - minx) / span) * 0.5, (1 - (maxy - miny) / span) * 0.5
+    local function nx(x) return (x - minx) / span + padx end
+    local function ny(y) return 1 - ((y - miny) / span + pady) end
+    local lines = {}
+    for _, b in ipairs(BONES) do
+        local a, c = points[b[1]], points[b[2]]
+        lines[#lines + 1] = { nx(a[1]), ny(a[2]), nx(c[1]), ny(c[2]) }
+    end
+    thumbs[name] = lines
+    return lines
+end
 
+-- The way in: a page in the menu's PLUGINS section.
+reskate.menu.page("Animations", function(ui)
     ui:heading("Custom animations")
     local names = reskate.animation.rska_list()
-    if #names == 0 then
-        ui:note("No .rska files in CustomAnimations yet.")
-        ui:note("Put them in the game folder's CustomAnimations folder.")
-        return
+    ui:info("Clips", tostring(#names))
+    if ui:button("open", "OPEN THE GRID", true) then
+        reskate.ui.open(screen_title)
+        screen_open = true
     end
-
-    if current then
-        local s = settings_of(current)
-        local at = reskate.animation.time()
-        ui:info("Playing", at and string.format("%s   %.2f s", current, at) or current)
-
-        ui:card("SETTINGS", "For " .. current)
+    ui:note("A tile for every clip, with a stick figure of its pose.")
+    ui:note("Hover to preview, click to play. Wheel scrolls.")
+    if pinned then
+        local s = settings_of(pinned)
+        ui:card("SETTINGS", pinned)
         local corrected = ui:toggle("ik", "Floor correction (ik)", s.floor > 0,
-            "Lifts the clip's limbs clear of the floor the game planted. Off is what poseanim does by default.")
+            "Lifts the clip's limbs clear of the floor the game planted.")
         s.floor = corrected and 1 or 0
         local tab = ui:tabs("mask", { "AUTO", "FULL", "LEGS" }, mask_index(s.mask))
         s.mask = masks[tab] or "auto"
-        ui:note("auto: the game keeps the legs while you ride. full: the clip drives everything. legs: always the game's.")
-        -- Apply as they are changed, not only on the next play.
-        reskate.animation.floor(s.floor)
-        reskate.animation.mask(s.mask)
+    end
+end)
 
-        if ui:button("stop", "STOP", false) then
-            reskate.animation.stop()
-            current = nil
+reskate.ui.screen(screen_title, function() end, { panel = false })
+
+reskate.on("screen_closed", function(title)
+    if title ~= screen_title then return end
+    screen_open = false
+    hovered, previewing, hover_frames = nil, nil, 0
+end)
+
+reskate.on("draw", function(d)
+    if not screen_open then return end
+    local w, h = d:size()
+    local names = reskate.animation.rska_list()
+    local c = reskate.input.cursor()
+    local mx = c and c.position and c.position[1] or nil
+    local my = c and c.position and c.position[2] or nil
+    local left = c and c.left or false
+
+    d:rect(vector.create(0, 0, 0), vector.create(w, h, 0), { colour = C_BG, fill = true })
+    d:text(vector.create(PAD, 30, 0), "CUSTOM ANIMATIONS", { colour = C_TEXT, size = 34, font = 3 })
+    d:text(vector.create(PAD, 78, 0), pinned and ("Playing " .. pinned) or "Nothing playing",
+           { colour = pinned and C_PIN or C_DIM, size = 20 })
+
+    -- STOP, top right.
+    local stop_x, stop_y, stop_w, stop_h = w - PAD - 120, 34, 120, 40
+    local over_stop = mx and mx >= stop_x and mx <= stop_x + stop_w and my >= stop_y and my <= stop_y + stop_h
+    d:rect(vector.create(stop_x, stop_y, 0), vector.create(stop_x + stop_w, stop_y + stop_h, 0),
+           { colour = over_stop and C_HOT or C_DIM, thickness = 2, rounding = 6 })
+    d:text(vector.create(stop_x + 40, stop_y + 9, 0), "STOP", { colour = over_stop and C_HOT or C_TEXT, size = 20 })
+
+    if #names == 0 then
+        d:text(vector.create(PAD, HEADER, 0), "No .rska files in CustomAnimations yet.", { colour = C_DIM, size = 22 })
+        return
+    end
+
+    local tile_w = (w - PAD * 2 - GAP * (COLS - 1)) / COLS
+    local tile_h = tile_w * 0.78
+    local cell_h = tile_h + 32
+    local row_h = cell_h + GAP
+    local rows = math.ceil(#names / COLS)
+    local visible = math.max(1, math.floor((h - HEADER - PAD) / row_h))
+
+    if c and c.wheel and c.wheel ~= 0 then
+        scroll = math.max(0, math.min(math.max(0, rows - visible) * row_h, scroll - c.wheel * 60))
+    end
+
+    local hover_now = nil
+    for i, name in ipairs(names) do
+        local col = (i - 1) % COLS
+        local row = math.floor((i - 1) / COLS)
+        local x = PAD + col * (tile_w + GAP)
+        local y = HEADER + row * row_h - scroll
+        if y + cell_h >= HEADER and y <= h then
+            local hot = mx and mx >= x and mx <= x + tile_w and my >= y and my <= y + tile_h
+            if hot then hover_now = name end
+            local active = (name == pinned)
+            d:rect(vector.create(x, y, 0), vector.create(x + tile_w, y + tile_h, 0), {
+                colour = active and C_PIN or (hot and C_HOT or C_TILE),
+                fill = not (active or hot), thickness = 2, rounding = 6,
+            })
+            local lines = thumbnail(name)
+            if lines then
+                local inner_w, inner_h = tile_w - 18, tile_h - 14
+                for _, l in ipairs(lines) do
+                    d:line(vector.create(x + 9 + l[1] * inner_w, y + 7 + l[2] * inner_h, 0),
+                           vector.create(x + 9 + l[3] * inner_w, y + 7 + l[4] * inner_h, 0),
+                           { colour = active and C_PIN or C_BONE, thickness = 2 })
+                end
+            end
+            d:text(vector.create(x + 2, y + tile_h + 8, 0), name,
+                   { colour = active and C_PIN or C_TEXT, size = 17 })
         end
+    end
+
+    -- Hover previews after the cursor rests on a tile, so sweeping across the grid does not fire a play
+    -- for every tile passed (the animation system takes four a second).
+    if hover_now ~= hovered then
+        hovered, hover_frames = hover_now, 0
     else
-        ui:note("Pick a clip to play it on your skater.")
+        hover_frames = hover_frames + 1
+    end
+    if hovered and hovered ~= pinned and hover_frames == 10 then
+        if play(hovered) then previewing = hovered end
+    end
+    if not hovered and previewing then
+        if pinned then play(pinned) else reskate.animation.stop() end
+        previewing = nil
     end
 
-    if failure ~= "" then ui:warn(failure) end
-
-    ui:card("CLIPS", string.format("%d clip%s", #names, #names == 1 and "" or "s"))
-    for _, name in ipairs(names) do
-        local playing = (name == current)
-        -- "> " marks it as well as the button's own emphasis: the fonts are ASCII, so no arrows.
-        if ui:button(name, (playing and "> " or "   ") .. name, playing) then
-            if play(name) then current = name end
+    -- Click pins. The cursor reports the button held, so this is the edge.
+    if left and not was_left and mx and my then
+        if over_stop then
+            reskate.animation.stop()
+            pinned, previewing = nil, nil
+        elseif hovered then
+            if play(hovered) then
+                pinned, previewing = hovered, nil
+            end
         end
     end
+    was_left = left
 end)
