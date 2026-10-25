@@ -1,4 +1,4 @@
-﻿-- The animation grid: every .rska clip in <game>/CustomAnimations as a tile with a stick figure of its
+-- The animation grid: every .rska clip in <game>/CustomAnimations as a tile with a stick figure of its
 -- pose and the name under it. Hovering previews a clip once the cursor rests on it; clicking pins it.
 --
 -- A grid needs the plugin to draw it, so this is a screen with panel = false -- the whole screen is ours
