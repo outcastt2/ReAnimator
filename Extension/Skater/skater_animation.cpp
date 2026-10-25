@@ -1,5 +1,6 @@
 ﻿#include "skater_animation.h"
 #include "pose_layers.h"
+#include "Extension/Skater/no_bail.h"
 #include "Engine/Core/Log/logging.h"
 #include "Engine/Game/Build/20260929/no_bail.h"
 #include "Engine/Game/Build/20260929/skater_state.h"
@@ -892,13 +893,6 @@ void on_animation(std::uintptr_t component) noexcept {
                 l.room_written = joint_of(l.bones[placement_joint]);
                 l.room_written_valid = true;
             }
-            // Written here, at animation time, the way this mod's player always did. The game's own
-            // foot placement and body physics run between this point and the renderer, and that is what
-            // adapts a clip to the skater's build. skater_animation writes at render time instead,
-            // which lands after that step: the raw clip then goes to the renderer and only sits right on
-            // the build it was authored on -- the height-dependent jitter.
-            (void)poke(layout.buffer + first * sizeof(NativeBone), l.bones.data() + first,
-                       (last - first) * sizeof(NativeBone));
             // Written when the pose goes to the renderer (on_render): the body physics rebuild this
             // buffer after the animation update.
             {
@@ -1072,9 +1066,10 @@ void hide_in_room(std::uintptr_t animation_interface, bool skater) noexcept {
     }
 }
 
-// The local skater's pose handed to the renderer: the clip's pose goes in now, over whatever the
-// body physics left there, each joint's own lanes only (each bone's 4th lane stays).
-void on_render(std::uintptr_t animation_interface) noexcept {
+// The clip pose into the buffer. This is the write this mod's player always did, at the point the
+// game's own constraints have finished with the pose (see on_skeleton below) -- not at the render
+// publication, and not in the animation update, where the body physics would replace it again.
+void write_clip_pose(std::uintptr_t animation_interface) noexcept {
     auto& l = live();
     const auto component = l.component.load(std::memory_order_acquire);
     if (!component) return;
@@ -1132,6 +1127,45 @@ void on_render(std::uintptr_t animation_interface) noexcept {
             l.floor_smoothed = skater::layers::smooth_floor(l.floor_smoothed, floor, alpha);
             skater::layers::apply_floor(layout.buffer, l.floor_smoothed, 0.01f, p.floor_strength, keep_of(10));
         }
+    } catch (...) {
+    }
+    SetLastError(error);
+}
+
+// The pose after the game's own constraints (foot placement, body physics): this is where the clip is
+// written, which is where this mod's player always wrote it, and its recording comment says why --
+// "after the engine's constraints ... the pose that was actually rendered (feet on the board and all)".
+// The renderer publishes the buffer after this, so the clip is drawn exactly as written, and the
+// physics has already had its say instead of replacing the body again.
+void on_skeleton(std::uintptr_t rig) noexcept {
+    auto& l = live();
+    const auto component = l.component.load(std::memory_order_acquire);
+    if (!rig || !component) return;
+    const auto error = GetLastError();
+    try {
+        // The rig handed here is the physics rig: its 0x4630 slot is the skater's core.
+        const auto core = read<std::uintptr_t>(component + 0x70);
+        if (!core || read<std::uintptr_t>(rig + 0x4630).value_or(0) != *core) {
+            SetLastError(error);
+            return;
+        }
+        const auto holder = read<std::uintptr_t>(component + 0xa0);
+        if (holder && *holder) write_clip_pose(*holder + 0xc0);
+    } catch (...) {
+    }
+    SetLastError(error);
+}
+
+// The local skater's pose handed to the renderer. The clip is written in on_skeleton, so this only
+// hides the room's own skater while ours is drawn there.
+void on_render(std::uintptr_t animation_interface) noexcept {
+    auto& l = live();
+    const auto component = l.component.load(std::memory_order_acquire);
+    if (!component) return;
+    const auto error = GetLastError();
+    try {
+        const auto holder = read<std::uintptr_t>(component + 0xa0);
+        if (!holder || !*holder || animation_interface != *holder + 0xc0) hide_in_room(animation_interface, true);
     } catch (...) {
     }
     SetLastError(error);
@@ -1390,6 +1424,8 @@ void tick(std::uintptr_t base, std::uintptr_t component, bool allowed) {
             multiplayer::set_pose_override_render_listener(&on_render);
             multiplayer::set_pose_override_board_listener(&on_board_render);
             multiplayer::set_local_pose_filter(&on_send);
+            // The pose is written after the game's own constraints, as this mod's player always did.
+            dingosdk::set_skeleton_responded_listener(&on_skeleton);
             hooked = true;
             logging::write(Level::info, Channel::skater, "Plugin animation: listening to the skater's animation.");
         } else failure = "the animation hook is unavailable: " + detail;
