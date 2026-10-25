@@ -537,4 +537,54 @@ std::shared_ptr<const anim_studio::Clip> load_rska_clip(std::string_view name, s
     return {};
 }
 
+bool load_rska_frame(std::string_view name, float seconds, std::vector<anim_studio::Joint>& out, std::string& error) {
+    try {
+        const auto path = resolve_clip_path(name, false);
+        std::ifstream in(path, std::ios::binary);
+        if (!in) { error = "cannot open " + path.string(); return false; }
+        std::array<char, 20> header{};
+        in.read(header.data(), header.size());
+        if (in.gcount() != static_cast<std::streamsize>(header.size()) || std::memcmp(header.data(), "RSKA", 4) != 0) {
+            error = "not an .rska clip: " + path.string();
+            return false;
+        }
+        std::uint32_t version{}, joints{}, frame_count{};
+        float fps{};
+        std::memcpy(&version, header.data() + 4, 4);
+        std::memcpy(&joints, header.data() + 8, 4);
+        std::memcpy(&frame_count, header.data() + 12, 4);
+        std::memcpy(&fps, header.data() + 16, 4);
+        if (version != 1 || frame_count == 0 || joints != anim_studio::skeleton_joints || !(fps > 0.0f && fps <= 240.0f)) {
+            error = "unsupported clip header in " + path.string();
+            return false;
+        }
+        // One frame only: the header and 40 bytes a joint, wherever in the file it is.
+        const auto frame = static_cast<std::uint32_t>(std::clamp(seconds, 0.0f, static_cast<float>(frame_count - 1) / fps) * fps);
+        const auto at = static_cast<std::streamoff>(20) + static_cast<std::streamoff>(frame) *
+                                                             static_cast<std::streamoff>(joints) *
+                                                             static_cast<std::streamoff>(floats_per_joint * sizeof(float));
+        in.seekg(at);
+        std::vector<float> row(static_cast<std::size_t>(joints) * floats_per_joint);
+        in.read(reinterpret_cast<char*>(row.data()), static_cast<std::streamsize>(row.size() * sizeof(float)));
+        if (in.gcount() != static_cast<std::streamsize>(row.size() * sizeof(float))) {
+            error = "the clip is shorter than its header says: " + path.string();
+            return false;
+        }
+        out.assign(joints, anim_studio::Joint{});
+        for (std::uint32_t j = 0; j < joints; ++j) {
+            const float* src = row.data() + static_cast<std::size_t>(j) * floats_per_joint;
+            auto& joint = out[j];
+            joint.scale = {src[0], src[1], src[2]};
+            joint.rotation = {src[3], src[4], src[5], src[6]};
+            joint.position = {src[7], src[8], src[9]};
+        }
+        return true;
+    } catch (const std::exception& e) {
+        error = e.what();
+    } catch (...) {
+        error = "the clip could not be read";
+    }
+    return false;
+}
+
 } // namespace dingosdk::skater

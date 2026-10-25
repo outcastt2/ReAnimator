@@ -1,13 +1,10 @@
 #pragma once
+#include "Extension/AnimationStudio/anim_core.h"
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
-
-namespace dingosdk::anim_studio {
-struct Clip;
-}
 
 // Custom animation playback ("poseanim"): .rska clips on the local skater, through the game's own
 // animation system (Extension/Skater/skater_animation.h, Animation Studio's pose override).
@@ -71,5 +68,9 @@ std::vector<std::string> rska_clips();
 // One of them as Animation Studio's Clip, for reskate.animation.play("rska:<name>"). Null with `error`
 // set when it cannot be read (a missing file, a bad header, a joint count that is not the skater's).
 std::shared_ptr<const anim_studio::Clip> load_rska_clip(std::string_view name, std::string& error);
+
+// One frame of a .rska clip, for a thumbnail: the header and that one frame only, so a 50 MB clip
+// costs the same as a small one. `out` is resized to the clip's joints.
+bool load_rska_frame(std::string_view name, float seconds, std::vector<anim_studio::Joint>& out, std::string& error);
 
 } // namespace dingosdk::skater

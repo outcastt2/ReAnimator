@@ -64,13 +64,10 @@ end
 
 -- One representative pose, normalised into a 0..1 box with y down.
 --
--- A clip has to be read to sample it, and 45 of them at once overruns both the 50 ms a handler is
--- allowed and the 48 MB of clips a plugin may hold, so this is called for one clip a frame and the
--- clip is released again straight after: only the lines are kept.
+-- A "rska:" clip is read as the single frame it needs, so this costs the same for a 50 MB clip as for a
+-- small one and nothing is held afterwards. One a frame fills the grid in about a second.
 local function build_thumbnail(name)
-    local key = "rska:" .. name
-    local ok, points = pcall(reskate.animation.world, key, 0.35, JOINTS)
-    pcall(reskate.animation.forget, key)
+    local ok, points = pcall(reskate.animation.world, "rska:" .. name, 0.35, JOINTS)
     if not ok or type(points) ~= "table" or #points < #JOINTS then
         thumbs[name] = false
         return

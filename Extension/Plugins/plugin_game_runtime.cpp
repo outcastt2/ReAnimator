@@ -961,6 +961,9 @@ public:
     }
     std::vector<std::string> rska_clip_names() override { return skater::rska_clips(); }
     ClipRef rska_clip(std::string_view name, std::string& why) override { return skater::load_rska_clip(name, why); }
+    bool rska_frame(std::string_view name, float seconds, std::vector<anim_studio::Joint>& out, std::string& why) override {
+        return skater::load_rska_frame(name, seconds, out, why);
+    }
     std::string animation_mask(std::string_view mode) override {
         if (!mode.empty())
             skater::set_pose_mask(mode == "full" ? skater::PoseMask::full

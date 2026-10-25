@@ -975,25 +975,35 @@ struct WorldApi {
         return 1;
     }
     // world(clip, seconds, joints): the world position of each of `joints` at `seconds` into the clip,
-    // for drawing a thumbnail of the pose. At most 64 joints, at most 4 calls a second.
+    // for drawing a thumbnail of the pose. At most 64 joints. A "rska:" clip is read as the one frame
+    // it needs, so a large file costs the same as a small one and nothing is held.
     static int animation_world(lua_State* L) {
         auto& plugin = animating(L, "reskate.animation.world");
-        auto clip = clip_at(L, plugin, 1);
+        const auto name = checked_text(L, 1, 200, "a clip");
         const double seconds = luaL_checknumber(L, 2);
         luaL_checktype(L, 3, LUA_TTABLE);
         const int count = static_cast<int>(lua_objlen(L, 3));
         if (count <= 0 || count > 64) luaL_argerror(L, 3, "1 to 64 joints");
         thread_local std::vector<anim_studio::Joint> pose;
-        pose.assign(clip->joints, anim_studio::Joint{});
-        clip->sample(static_cast<float>(std::clamp(seconds, 0.0, static_cast<double>(clip->duration()))),
-                     std::span<anim_studio::Joint>(pose.data(), pose.size()));
+        if (std::string_view(name).starts_with("rska:")) {
+            std::string why;
+            if (!game(plugin).rska_frame(std::string_view(name).substr(5), static_cast<float>(seconds), pose, why))
+                luaL_error(L, "the clip %s cannot be read: %s", name.c_str(), why.c_str());
+        } else {
+            lua_pushvalue(L, 1);
+            auto clip = clip_at(L, plugin, lua_gettop(L));
+            lua_pop(L, 1);
+            pose.assign(clip->joints, anim_studio::Joint{});
+            clip->sample(static_cast<float>(std::clamp(seconds, 0.0, static_cast<double>(clip->duration()))),
+                         std::span<anim_studio::Joint>(pose.data(), pose.size()));
+        }
         const std::span<const anim_studio::Joint> whole(pose.data(), pose.size());
         lua_createtable(L, count, 0);
         for (int i = 1; i <= count; ++i) {
             lua_rawgeti(L, 3, i);
             const auto joint = static_cast<int>(luaL_checkinteger(L, -1));
             lua_pop(L, 1);
-            if (joint < 0 || joint >= static_cast<int>(clip->joints)) luaL_error(L, "joint %d is not in the clip", joint);
+            if (joint < 0 || joint >= static_cast<int>(whole.size())) luaL_error(L, "joint %d is not in the clip", joint);
             const auto placed = anim_studio::world(whole, static_cast<std::uint16_t>(joint));
             lua_pushvector(L, placed.position[0], placed.position[1], placed.position[2]);
             lua_rawseti(L, -2, i);

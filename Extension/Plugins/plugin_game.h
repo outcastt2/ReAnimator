@@ -683,6 +683,12 @@ public:
         why = unavailable;
         return nullptr;
     }
+    // One frame of one of them, for a thumbnail: the header and that frame only, so a large clip costs
+    // the same as a small one and nothing is held. False and why where there is no skater.
+    virtual bool rska_frame(std::string_view /*name*/, float /*seconds*/, std::vector<anim_studio::Joint>& /*out*/, std::string& why) {
+        why = unavailable;
+        return false;
+    }
     // The joints a clip drives ("auto" keeps the game's legs while riding, "full", "legs"), and the
     // floor correction 0..1. A value sets it and returns what is in force; empty / negative reports.
     // Empty and -1 where there is no skater.
