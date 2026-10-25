@@ -82,21 +82,32 @@ local function build_thumbnail(name)
         end
         poses[#poses + 1] = points
     end
-    -- Across the figure, from the shoulder line of the first pose; up is the world's up.
+    -- The figure's own frame, taken from the first pose: up runs from the hips to the neck, across from
+    -- the shoulders with the up part taken out. World up is wrong for a clip whose root is tilted, which
+    -- is why some read as seen from above or below; in the body's own frame every figure is upright and
+    -- facing the viewer, however the clip was authored.
+    local HIPS, NECK = 1, 4   -- indices into JOINTS: joints 7 and 101
+    local hips, neck = poses[1][HIPS], poses[1][NECK]
+    local ux, uy, uz = neck.x - hips.x, neck.y - hips.y, neck.z - hips.z
+    local up_length = math.sqrt(ux * ux + uy * uy + uz * uz)
+    if up_length < 1e-4 then ux, uy, uz = 0.0, 1.0, 0.0 else ux, uy, uz = ux / up_length, uy / up_length, uz / up_length end
     local right, left = poses[1][RIGHT_SHOULDER], poses[1][LEFT_SHOULDER]
-    local ax, az = left.x - right.x, left.z - right.z
-    local length = math.sqrt(ax * ax + az * az)
-    if length < 1e-4 then ax, az = 1.0, 0.0 else ax, az = ax / length, az / length end
-    local function across(p) return p.x * ax + p.z * az end
+    local sx, sy, sz = left.x - right.x, left.y - right.y, left.z - right.z
+    local along = sx * ux + sy * uy + sz * uz
+    sx, sy, sz = sx - ux * along, sy - uy * along, sz - uz * along
+    local across_length = math.sqrt(sx * sx + sy * sy + sz * sz)
+    if across_length < 1e-4 then sx, sy, sz = 1.0, 0.0, 0.0 else sx, sy, sz = sx / across_length, sy / across_length, sz / across_length end
+    local function across(p) return p.x * sx + p.y * sy + p.z * sz end
+    local function upright(p) return p.x * ux + p.y * uy + p.z * uz end
     -- One box for all the poses, so the figure does not jump between them.
     local minx, maxx, miny, maxy = math.huge, -math.huge, math.huge, -math.huge
     for _, points in ipairs(poses) do
         for _, p in ipairs(points) do
-            local a = across(p)
+            local a, b = across(p), upright(p)
             if a < minx then minx = a end
             if a > maxx then maxx = a end
-            if p.y < miny then miny = p.y end
-            if p.y > maxy then maxy = p.y end
+            if b < miny then miny = b end
+            if b > maxy then maxy = b end
         end
     end
     local span = math.max(maxx - minx, maxy - miny, 1e-3)
@@ -108,7 +119,7 @@ local function build_thumbnail(name)
         local lines = {}
         for _, b in ipairs(BONES) do
             local a, c = points[b[1]], points[b[2]]
-            lines[#lines + 1] = { nx(across(a)), ny(a.y), nx(across(c)), ny(c.y) }
+            lines[#lines + 1] = { nx(across(a)), ny(upright(a)), nx(across(c)), ny(upright(c)) }
         end
         frames[#frames + 1] = lines
     end
