@@ -3,6 +3,6 @@
   "author": "ReAnimator",
   "version_number": "1.0.0",
   "website_url": "",
-  "description": "A page in the menu's PLUGINS section listing the .rska clips in CustomAnimations: scroll to one and click it to play it on your skater, with the one playing kept highlighted.",
+  "description": "Play your .rska clips from the menu: a list in the PLUGINS section with per-clip ik and mask settings, and Ctrl+K for a grid of every clip with a stick figure of its pose.",
   "dependencies": []
 }
