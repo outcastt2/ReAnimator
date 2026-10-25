@@ -706,6 +706,12 @@ public:
                                   bool /*floor*/) {
         return unavailable;
     }
+    // The same for one of the .rska clips, by name, loaded on the runtime's own tick: reading a large
+    // .rska takes longer than a plugin's handler is allowed, and one over-budget call stops the plugin.
+    virtual std::string play_rska(std::string_view /*plugin*/, std::string_view /*name*/, float /*speed*/, float /*blend*/, bool /*loop*/,
+                                  float /*at*/, bool /*paused*/) {
+        return unavailable;
+    }
     virtual void stop_clip(std::string_view /*plugin*/) {}
     virtual void seek_clip(std::string_view /*plugin*/, float /*seconds*/) {}
     virtual void pause_clip(std::string_view /*plugin*/, bool /*paused*/) {}

@@ -982,6 +982,15 @@ public:
         skater_animation::play(skater_animation::Play{std::move(clip), speed, blend, loop, at, paused, floor});
         return {};
     }
+    std::string play_rska(std::string_view plugin, std::string_view name, float speed, float blend, bool loop, float at, bool paused) override {
+        if (multiplayer::local_throwdown_active()) return "not while a throwdown runs";
+        if (!player_.empty() && player_ != plugin && skater_animation::playing()) return player_ + " is playing a clip";
+        player_ = plugin;
+        // Read on the next tick: a large .rska takes longer than the handler that asked for it may run,
+        // and one over-budget call stops the plugin.
+        pending_rska_ = PendingRska{std::string(plugin), std::string(name), speed, blend, at, loop, paused};
+        return {};
+    }
     void seek_clip(std::string_view plugin, float seconds) override {
         if (player_ == plugin) skater_animation::seek(seconds);
     }
@@ -1186,6 +1195,21 @@ public:
     }
     std::string current_trick() override { return skater_animation::current_trick(); }
     void tick_animation(std::uintptr_t base, std::uintptr_t client) {
+        // A .rska clip asked for last frame: read it here, where nothing is timing us, and start it.
+        if (pending_rska_) {
+            auto pending = std::move(*pending_rska_);
+            pending_rska_.reset();
+            std::string why;
+            auto clip = skater::load_rska_clip(pending.name, why);
+            if (!clip) {
+                logging::log(logging::Level::warning, logging::Channel::skater, "Plugin animation: the clip \"{}\" cannot be read: {}.",
+                             pending.name, why);
+                if (player_ == pending.plugin) player_.clear();
+            } else if (player_ == pending.plugin) {
+                skater_animation::play(skater_animation::Play{std::move(clip), pending.speed, pending.blend,
+                                                              pending.loop, pending.at, pending.paused, false});
+            }
+        }
         xray::tick();
         hud_corner::tick();
         game_speed::tick();
@@ -1699,6 +1723,14 @@ private:
         skater_animation::set_replacements(std::move(list));
     }
     std::string player_, recorder_, thrower_, capturer_;
+    // A .rska clip asked for by play_rska, read on the next tick (a large one takes longer than a
+    // plugin's handler is allowed).
+    struct PendingRska {
+        std::string plugin, name;
+        float speed{}, blend{}, at{};
+        bool loop{}, paused{};
+    };
+    std::optional<PendingRska> pending_rska_;
     std::string keys_owner_; // the plugin whose keys the game does not see
     std::string buttons_owner_, free_camera_owner_, pad_flight_owner_, competition_owner_, hold_owner_;
     std::uint64_t capture_until_{}, flight_read_at_{};

@@ -915,11 +915,18 @@ struct WorldApi {
     // (with floor: on the floor where he stands, its board's lowest point on it).
     static int animation_play(lua_State* L) {
         auto& plugin = animating(L, "reskate.animation.play");
-        auto clip = clip_at(L, plugin, 1);
+        const auto name = checked_text(L, 1, 200, "a clip");
         const float speed = number_field(L, 2, "speed", 1, 0.1f, 4), blend = number_field(L, 2, "blend", 0.15f, 0, 2);
         const bool loop = flag_field(L, 2, "loop"), paused = flag_field(L, 2, "paused"), floor = flag_field(L, 2, "floor");
-        const float at = number_field(L, 2, "at", 0, 0, clip->duration());
         if (!within(plugin.services_.now_ms(), plugin.control_second_, plugin.controls_, 4)) return result(L, "asked more than 4 times in a second");
+        if (std::string_view(name).starts_with("rska:")) {
+            // Read on the runtime's next tick: reading a large .rska takes longer than this handler may
+            // run, and one over-budget call stops the plugin.
+            const float at = number_field(L, 2, "at", 0, 0, 3600);
+            return result(L, game(plugin).play_rska(plugin.id(), std::string_view(name).substr(5), speed, blend, loop, at, paused));
+        }
+        auto clip = clip_at(L, plugin, 1);
+        const float at = number_field(L, 2, "at", 0, 0, clip->duration());
         return result(L, game(plugin).play_clip(plugin.id(), std::move(clip), speed, blend, loop, at, paused, floor));
     }
     // game_clips(containing): the names of the game's own animations that contain it (all with none), at
