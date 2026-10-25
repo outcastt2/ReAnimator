@@ -1,0 +1,8 @@
+{
+  "name": "AnimationMenu",
+  "author": "ReAnimator",
+  "version_number": "1.0.0",
+  "website_url": "",
+  "description": "A page in the menu's PLUGINS section listing the .rska clips in CustomAnimations: scroll to one and click it to play it on your skater, with the one playing kept highlighted.",
+  "dependencies": []
+}

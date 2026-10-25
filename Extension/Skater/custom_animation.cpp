@@ -500,4 +500,34 @@ void tick_pose_playback(std::uintptr_t base, std::uintptr_t client) noexcept {
     } catch (...) {}
 }
 
+std::vector<std::string> rska_clips() {
+    std::vector<std::string> names;
+    try {
+        const auto directory = game_directory() / L"CustomAnimations";
+        std::error_code error;
+        for (const auto& entry : std::filesystem::directory_iterator(directory, error)) {
+            if (!entry.is_regular_file(error)) continue;
+            if (entry.path().extension() != L".rska") continue;
+            names.push_back(entry.path().stem().string());
+        }
+    } catch (...) {
+    }
+    std::sort(names.begin(), names.end());
+    names.erase(std::unique(names.begin(), names.end()), names.end());
+    return names;
+}
+
+std::shared_ptr<const anim_studio::Clip> load_rska_clip(std::string_view name, std::string& error) {
+    try {
+        anim_studio::Clip loaded;
+        if (!load_rska(resolve_clip_path(name, false), loaded, error)) return {};
+        return std::make_shared<const anim_studio::Clip>(std::move(loaded));
+    } catch (const std::exception& e) {
+        error = e.what();
+    } catch (...) {
+        error = "the clip could not be read";
+    }
+    return {};
+}
+
 } // namespace dingosdk::skater

@@ -675,6 +675,14 @@ public:
         why = unavailable;
         return nullptr;
     }
+    // The .rska clips in <game>/CustomAnimations, sorted, without the extension: what the console's
+    // poseanim and the plugin menu both offer by name. Empty where there is no skater.
+    virtual std::vector<std::string> rska_clip_names() { return {}; }
+    // One of them read as a clip, or empty and why (a missing file, a bad header, another joint count).
+    virtual ClipRef rska_clip(std::string_view /*name*/, std::string& why) {
+        why = unavailable;
+        return nullptr;
+    }
     // The stance a clip of the skater stands in at its first frame (true: goofy), from the skeleton the
     // game's clips are read with; empty when it cannot be told, or before the game's animations are read.
     virtual std::optional<bool> clip_goofy(const ClipRef&) { return std::nullopt; }

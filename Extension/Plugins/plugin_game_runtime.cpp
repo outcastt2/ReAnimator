@@ -12,6 +12,7 @@
 #include "Extension/Multiplayer/Hud/game_ui_state.h"
 #include "Extension/Multiplayer/Hud/native_party.h"
 #include "Extension/Skater/client_source_spawn.h"
+#include "Extension/Skater/custom_animation.h"
 #include "Extension/Skater/skater_animation.h"
 #include "Extension/AnimationStudio/game_clips.h"
 #include "Extension/Plugins/plugin_joystick.h"
@@ -958,6 +959,8 @@ public:
             return nullptr;
         }
     }
+    std::vector<std::string> rska_clip_names() override { return skater::rska_clips(); }
+    ClipRef rska_clip(std::string_view name, std::string& why) override { return skater::load_rska_clip(name, why); }
     std::string play_clip(std::string_view plugin, ClipRef clip, float speed, float blend, bool loop, float at, bool paused, bool floor) override {
         if (multiplayer::local_throwdown_active()) return "not while a throwdown runs";
         if (!player_.empty() && player_ != plugin && skater_animation::playing()) return player_ + " is playing a clip";

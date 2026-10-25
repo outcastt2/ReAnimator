@@ -1,4 +1,4 @@
-#include "plugin_api.h"
+﻿#include "plugin_api.h"
 #include "plugin_game.h"
 #include "plugin_bodies.h"
 #include "lua.h"
@@ -832,6 +832,17 @@ struct WorldApi {
     static Game::ClipRef clip_at(lua_State* L, Plugin& plugin, int index) {
         const auto name = checked_text(L, index, 200, "a clip");
         if (const auto found = plugin.clips_.find(name); found != plugin.clips_.end()) return found->second;
+        if (name.starts_with("rska:")) {
+            // A clip in <game>/CustomAnimations, by name: what the console's poseanim plays, so the
+            // plugin menu and the console offer the same files.
+            std::string why;
+            auto clip = game(plugin).rska_clip(std::string_view(name).substr(5), why);
+            if (!clip) luaL_error(L, "the clip %s cannot be read: %s", name.c_str(), why.c_str());
+            if (pose_bytes(*clip) + plugin.clip_bytes_ > plugin.limits_.clip_bytes)
+                luaL_error(L, "a plugin's clips hold at most %d MB of poses", static_cast<int>(plugin.limits_.clip_bytes >> 20));
+            plugin.clip_bytes_ += pose_bytes(*clip);
+            return plugin.clips_.emplace(name, std::move(clip)).first->second;
+        }
         if (name.starts_with("rec:") || name.starts_with("clip:") || name.starts_with("edit:")) luaL_error(L, "there is no clip %s", name.c_str());
         std::string error, bytes;
         // The game's own: read out of its data, not a file.
@@ -922,6 +933,17 @@ struct WorldApi {
             lua_pushlstring(L, why.data(), why.size());
             return 2;
         }
+        lua_createtable(L, static_cast<int>(names.size()), 0);
+        for (std::size_t i = 0; i < names.size(); ++i) {
+            lua_pushlstring(L, names[i].data(), names[i].size());
+            lua_rawseti(L, -2, static_cast<int>(i + 1));
+        }
+        return 1;
+    }
+    // rska_list(): the .rska clips in <game>/CustomAnimations, sorted, each played as "rska:<name>".
+    static int animation_rska_list(lua_State* L) {
+        auto& plugin = animating(L, "reskate.animation.rska_list");
+        const auto names = game(plugin).rska_clip_names();
         lua_createtable(L, static_cast<int>(names.size()), 0);
         for (std::size_t i = 0; i < names.size(); ++i) {
             lua_pushlstring(L, names[i].data(), names[i].size());
@@ -2926,6 +2948,7 @@ void WorldApi::install(Plugin& plugin, lua_State* L) {
                                    {"seek", animation_seek}, {"pause", animation_pause}, {"time", animation_time}, {"info", animation_info},
                                    {"sample", animation_sample}, {"joints", animation_joints}, {"trim", animation_trim}, {"edit", animation_edit},
                                    {"save", animation_save}, {"game_clips", animation_game_clips},
+                                   {"rska_list", animation_rska_list},
                                    {"mirror", animation_mirror}});
     add_functions(L, "outfit", {{"set", outfit_set}, {"clear", outfit_clear}, {"find", outfit_find}, {"slots", outfit_slots}, {"status", outfit_status}});
     add_functions(L, "audio", {{"play", audio_play}, {"set", audio_set}, {"stop", audio_stop}, {"playing", audio_playing}});
