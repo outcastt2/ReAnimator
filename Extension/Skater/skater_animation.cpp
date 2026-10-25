@@ -1430,8 +1430,6 @@ void tick(std::uintptr_t base, std::uintptr_t component, bool allowed) {
             multiplayer::set_pose_override_render_listener(&on_render);
             multiplayer::set_pose_override_board_listener(&on_board_render);
             multiplayer::set_local_pose_filter(&on_send);
-            // The pose is written after the game's own constraints, as this mod's player always did.
-            dingosdk::set_skeleton_responded_listener(&on_skeleton);
             hooked = true;
             logging::write(Level::info, Channel::skater, "Plugin animation: listening to the skater's animation.");
         } else failure = "the animation hook is unavailable: " + detail;
