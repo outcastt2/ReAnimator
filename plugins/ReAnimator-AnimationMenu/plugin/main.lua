@@ -122,7 +122,8 @@ end)
 
 reskate.on("draw", function(d)
     if not screen_open then return end
-    local w, h = d:size()
+    local display = d:size()          -- a vector: the window's width and height
+    local w, h = display[1], display[2]
     local names = reskate.animation.rska_list()
     local c = reskate.input.cursor()
     local mx = c and c.position and c.position[1] or nil
