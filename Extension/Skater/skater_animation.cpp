@@ -1105,16 +1105,40 @@ void write_clip_pose(std::uintptr_t animation_interface) noexcept {
             return;
         }
         count(&Probe::drawn);
-        // The clip is written at animation time (on_animation), so the game's own foot placement and
-        // body physics retarget it to the skater's build before the renderer sees it. Writing it here
-        // instead, after that step, replaced the retargeted pose with the raw clip. Only the opt-in
-        // floor correction still runs here, on the pose the game produced.
+        thread_local std::vector<NativeBone> current;
+        current.resize(p.last - p.first);
+        if (!peek(layout.buffer + p.first * sizeof(NativeBone), current.data(), current.size() * sizeof(NativeBone))) {
+            SetLastError(error);
+            return;
+        }
+        // The game's own pose here is the planted one: sample its floor before replacing it.
         skater::layers::FloorSample floor{};
         const bool have_floor = p.floor_strength > 0.0f && skater::layers::sample_floors(layout.buffer, floor);
         const auto* keep = p.mask.get();
         const auto keep_of = [keep](std::size_t joint) {
             return keep && joint < keep->size() ? std::clamp((*keep)[joint], 0.0f, 1.0f) : 0.0f;
         };
+        for (std::size_t i = 0; i < current.size(); ++i) {
+            const auto joint = static_cast<std::size_t>(p.first) + i;
+            if (!clip_writes(joint)) continue; // the engine's own helper cluster
+            const float game = keep_of(joint);
+            if (game >= 1.0f) continue; // the game keeps this joint: leave the planted one
+            auto& c = current[i];
+            const auto& b = p.bones[i];
+            const float w = 1.0f - game;
+            if (w >= 1.0f) {
+                std::memcpy(c.scale.data(), b.scale.data(), 12);
+                c.rotation = b.rotation;
+                std::memcpy(c.position.data(), b.position.data(), 12);
+                continue;
+            }
+            c.rotation = anim_studio::slerp(c.rotation, b.rotation, w);
+            for (std::size_t k = 0; k < 3; ++k) {
+                c.scale[k] += (b.scale[k] - c.scale[k]) * w;
+                c.position[k] += (b.position[k] - c.position[k]) * w;
+            }
+        }
+        (void)poke(layout.buffer + p.first * sizeof(NativeBone), current.data(), current.size() * sizeof(NativeBone));
         // poseanim's ik: lift what the clip drove clear of the floor the game planted it on. The legs
         // scale by the mask (a leg the game keeps is already planted).
         if (have_floor) {
@@ -1430,6 +1454,9 @@ void tick(std::uintptr_t base, std::uintptr_t component, bool allowed) {
             multiplayer::set_pose_override_render_listener(&on_render);
             multiplayer::set_pose_override_board_listener(&on_board_render);
             multiplayer::set_local_pose_filter(&on_send);
+            // Also written after the game's own constraints: the physics and the constraints see the
+            // clip, and the render write still draws it if this one does not reach the buffer.
+            dingosdk::set_skeleton_responded_listener(&on_skeleton);
             hooked = true;
             logging::write(Level::info, Channel::skater, "Plugin animation: listening to the skater's animation.");
         } else failure = "the animation hook is unavailable: " + detail;
