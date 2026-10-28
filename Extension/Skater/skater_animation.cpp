@@ -1235,11 +1235,15 @@ void on_skeleton(std::uintptr_t rig) noexcept {
     SetLastError(error);
 }
 
-// The local skater's pose handed to the renderer. The clip is written in on_skeleton -- after the
-// game's own constraints, which is where this mod's player wrote it before 2.1.2 and where it worked on
-// every height. Nothing is written here: writing at the render publication fed the clip back into the
-// body physics, which is what thrashed the legs and shook the camera on a build the clip was not
-// authored on.
+// The local skater's pose handed to the renderer: the clip goes in here.
+//
+// It used to be written after the game's constraints instead (on_skeleton), because writing at the
+// render publication fed the clip back into the body physics -- the buffer was read again next frame,
+// the legs were re-solved against a pose they disagreed with, and the camera shook on any build the clip
+// was not authored on. 2.1.3 changed that: on_drawn puts the game's own pose back once the renderer has
+// copied it, so the write is no longer fed to the physics. Writing here again is what makes the drawn
+// pose the clip; on 2.1.3 something between the constraints and the render changed the buffer, and the
+// renderer copied that instead.
 void on_render(std::uintptr_t animation_interface) noexcept {
     auto& l = live();
     const auto component = l.component.load(std::memory_order_acquire);
@@ -1247,7 +1251,11 @@ void on_render(std::uintptr_t animation_interface) noexcept {
     const auto error = GetLastError();
     try {
         const auto holder = read<std::uintptr_t>(component + 0xa0);
-        if (!holder || !*holder || animation_interface != *holder + 0xc0) hide_in_room(animation_interface, true);
+        if (!holder || !*holder || animation_interface != *holder + 0xc0) {
+            hide_in_room(animation_interface, true);
+        } else {
+            write_clip_pose(animation_interface);
+        }
     } catch (...) {
     }
     SetLastError(error);
@@ -1537,9 +1545,9 @@ void tick(std::uintptr_t base, std::uintptr_t component, bool allowed) {
             multiplayer::set_pose_override_drawn_listener(&on_drawn);
             multiplayer::set_pose_override_board_listener(&on_board_render);
             multiplayer::set_local_pose_filter(&on_send);
-            // Also written after the game's own constraints: the physics and the constraints see the
-            // clip, and the render write still draws it if this one does not reach the buffer.
-            dingosdk::set_skeleton_responded_listener(&on_skeleton);
+            // on_skeleton is not registered: writing after the constraints is not enough on 2.1.3, since
+            // something between there and the render changes the buffer again. The render write is safe
+            // now that on_drawn restores the game's own pose once the renderer has copied it.
             hooked = true;
             logging::write(Level::info, Channel::skater, "Plugin animation: listening to the skater's animation.");
         } else failure = "the animation hook is unavailable: " + detail;
