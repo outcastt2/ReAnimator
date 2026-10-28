@@ -1,5 +1,6 @@
 ﻿#include "skater_animation.h"
 #include "pose_layers.h"
+#include "Extension/Skater/pose_place.h"
 #include "Extension/Skater/no_bail.h"
 #include "Engine/Core/Log/logging.h"
 #include "Engine/Game/Build/20260929/no_bail.h"
@@ -1161,10 +1162,18 @@ void write_clip_pose(std::uintptr_t animation_interface) noexcept {
         } else {
             p.game.clear();
         }
-        // poseanim's ik: lift what the clip drove clear of the floor the game planted it on. The legs
-        // scale by the mask (a leg the game keeps is already planted). Written after the poke, so the
-        // renderer sees it; on_drawn restores what the buffer held before the whole write.
-        if (have_floor) {
+        // poseanim's ik, the simple way: lift the whole body so the lowest foot of the clip reaches the
+        // floor the game planted, instead of rotating the legs to meet it.
+        //
+        // The analytic two-bone solve this replaces bent the legs into shapes the clip never had --
+        // bow-legged, or worse -- wherever the floor it aimed at was not the one the clip was authored
+        // against. A lift moves nothing relative to the body, so the pose stays the pose. The cost is
+        // that a clip whose two feet are at different heights is lifted by the lower one rather than
+        // each foot meeting its own ground; that is the honest trade for not deforming the clip.
+        //
+        // pose_place::apply does the maths: the hips are set to a world position, and their children
+        // (the whole body) come with them, since their own values are parent-local and unchanged.
+        if (have_floor && keep_of(10) < 1.0f) {
             const auto now = GetTickCount64();
             const auto elapsed = l.floor_smoothed_at ? static_cast<std::uint64_t>(now - l.floor_smoothed_at) : 1000;
             l.floor_smoothed_at = now;
@@ -1172,7 +1181,30 @@ void write_clip_pose(std::uintptr_t animation_interface) noexcept {
             const float alpha = elapsed >= 1000 ? 1.0f
                                                 : static_cast<float>(1.0 - std::exp(-static_cast<double>(elapsed) / tau));
             l.floor_smoothed = skater::layers::smooth_floor(l.floor_smoothed, floor, alpha);
-            skater::layers::apply_floor(layout.buffer, l.floor_smoothed, 0.01f, p.floor_strength, keep_of(10));
+            if (l.floor_smoothed.valid) {
+                const std::uint32_t left_chain[] = {1, 7, 8, 9, 10};
+                const std::uint32_t right_chain[] = {1, 7, 341, 342, 343};
+                float left[3]{}, right[3]{};
+                if (skater::layers::world_position(layout.buffer, left_chain, 5, left) &&
+                    skater::layers::world_position(layout.buffer, right_chain, 5, right)) {
+                    const float lift = l.floor_smoothed.floor_y - std::min(left[1], right[1]);
+                    if (std::abs(lift) > 1e-4f) {
+                        thread_local std::vector<anim_studio::Joint> pose;
+                        pose.resize(layout.count);
+                        for (std::size_t i = 0; i < layout.count; ++i) pose[i] = joint_of(l.bones[i]);
+                        const auto hips = anim_studio::world(pose, hips_joint);
+                        pose_place::Place place;
+                        place.frame = pose_place::Frame::world;
+                        place.position = {hips.position[0], hips.position[1] + lift, hips.position[2]};
+                        pose_place::apply(pose, hips_joint, place, p.floor_strength);
+                        NativeBone bone{};
+                        std::memcpy(bone.scale.data(), pose[hips_joint].scale.data(), 12);
+                        bone.rotation = pose[hips_joint].rotation;
+                        std::memcpy(bone.position.data(), pose[hips_joint].position.data(), 12);
+                        (void)poke(layout.buffer + hips_joint * sizeof(NativeBone), &bone, sizeof(NativeBone));
+                    }
+                }
+            }
         }
     } catch (...) {
     }

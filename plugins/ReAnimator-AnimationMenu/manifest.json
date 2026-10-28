@@ -1,8 +1,8 @@
 {
   "name": "AnimationMenu",
   "author": "ReAnimator",
-  "version_number": "1.0.0",
+  "version_number": "1.1.0",
   "website_url": "",
-  "description": "Play your .rska clips from the menu: a list in the PLUGINS section with per-clip ik and mask settings, and Ctrl+K for a grid of every clip with a stick figure of its pose.",
+  "description": "Play your .rska clips from the menu: a list in the PLUGINS section with per-clip ik and mask settings, and Ctrl+K for a grid of every clip with a stick figure of its pose. Needs ReSkate 2.1.3-reanim1 or later (the ReAnimator build): it uses plugin bindings that stock ReSkate does not have.",
   "dependencies": []
 }
